@@ -1,17 +1,30 @@
 import os
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from db import get_conn, init_db, list_claims, save_claim, save_file
 from gemini import assess_damage, extract_fields
 from rules import build_estimate, run_rules
+
+import whatsapp as wa
+from whatsapp import (
+    download_media,
+    get_session,
+    process_session,
+    remember_message,
+    send_text,
+    subscribe_app,
+    verify,
+)
 
 try:
     from forensics import check_duplicates, run_deep_forensics
@@ -79,27 +92,8 @@ def demo_reset():
     return {"cleared": True}
 
 
-@app.post("/api/analyze")
-async def analyze(
-    documents: List[UploadFile] = File(default=[]),
-    photos: List[UploadFile] = File(default=[]),
-):
-    claim_id = "CLM-" + uuid.uuid4().hex[:8].upper()
-    claim_dir = os.path.join(UPLOAD_DIR, claim_id)
-    os.makedirs(claim_dir, exist_ok=True)
-
-    doc_paths, photo_paths = [], []
-    for upload, kind, bucket in (
-        [(u, "document", doc_paths) for u in documents]
-        + [(u, "photo", photo_paths) for u in photos]
-    ):
-        filename = os.path.basename(upload.filename or "unnamed")
-        dest = os.path.join(claim_dir, filename)
-        with open(dest, "wb") as fh:
-            fh.write(await upload.read())
-        save_file(claim_id, filename, kind, dest)
-        bucket.append(dest)
-
+async def analyse_claim(claim_id, doc_paths, photo_paths):
+    """Staged pipeline shared by the HTTP upload route and the WhatsApp webhook."""
     started = time.perf_counter()
 
     timings = []
@@ -172,6 +166,159 @@ async def analyze(
                                    vehicle_description=description))
     finally:
         conn.close()
+
+
+@app.post("/api/analyze")
+async def analyze(
+    documents: List[UploadFile] = File(default=[]),
+    photos: List[UploadFile] = File(default=[]),
+):
+    claim_id = "CLM-" + uuid.uuid4().hex[:8].upper()
+    claim_dir = os.path.join(UPLOAD_DIR, claim_id)
+    os.makedirs(claim_dir, exist_ok=True)
+
+    doc_paths, photo_paths = [], []
+    for upload, kind, bucket in (
+        [(u, "document", doc_paths) for u in documents]
+        + [(u, "photo", photo_paths) for u in photos]
+    ):
+        filename = os.path.basename(upload.filename or "unnamed")
+        dest = os.path.join(claim_dir, filename)
+        with open(dest, "wb") as fh:
+            fh.write(await upload.read())
+        save_file(claim_id, filename, kind, dest)
+        bucket.append(dest)
+
+    return await analyse_claim(claim_id, doc_paths, photo_paths)
+
+
+async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".jpg"):
+    data = await download_media(media_obj)
+    if not data:
+        await send_text(wa_id, "I could not download that file. Please send it again.")
+        return
+
+    folder = os.path.join(UPLOAD_DIR, f"wa_{wa_id}")
+    os.makedirs(folder, exist_ok=True)
+    ext = os.path.splitext(str(media_obj.get("filename") or ""))[1] or fallback_ext
+    dest = os.path.join(folder, f"{message_id}{ext}")
+    with open(dest, "wb") as fh:
+        fh.write(data)
+
+    session = get_session(wa_id)
+    session[bucket].append(dest)
+    session["updated"] = time.time()
+
+    if bucket == "photos":
+        await send_text(
+            wa_id,
+            f"Photo received ({len(session['photos'])} total). Send any message when you are done.",
+        )
+    else:
+        await send_text(
+            wa_id,
+            f"Document received ({len(session['docs'])} total). Send any message when you are done.",
+        )
+
+
+async def handle_wa_message(message):
+    """Runs in the background so the webhook can answer immediately."""
+    try:
+        wa_id = message.get("from")
+        if not wa_id:
+            return
+        message_id = message.get("id")
+        message_type = message.get("type")
+
+        if message_type == "image":
+            await _store_wa_media(wa_id, message_id, message.get("image") or {}, "photos")
+        elif message_type == "document":
+            document = message.get("document") or {}
+            if str(document.get("mime_type") or "").startswith("image/"):
+                await _store_wa_media(wa_id, message_id, document, "photos")
+            else:
+                await _store_wa_media(wa_id, message_id, document, "docs", fallback_ext=".bin")
+        elif message_type == "text":
+            session = get_session(wa_id)
+            if session["photos"] or session["docs"]:
+                await process_session(wa_id)
+            else:
+                await send_text(
+                    wa_id,
+                    "Send a photo of the damaged vehicle to start a claim. "
+                    "You can also attach the claim form, RC or driving licence. "
+                    "Send any message when you are done and I will analyse it.",
+                )
+        else:
+            await send_text(wa_id, "Please send a photo of the damaged vehicle to start a claim.")
+    except Exception:
+        print("[whatsapp] handle_wa_message failed:", flush=True)
+        traceback.print_exc()
+
+
+@app.get("/webhook")
+def webhook_verify(request: Request):
+    params = request.query_params
+    challenge = verify(
+        params.get("hub.mode"), params.get("hub.verify_token"), params.get("hub.challenge")
+    )
+    if challenge is not None:
+        return PlainTextResponse(challenge, status_code=200)
+    return PlainTextResponse("Forbidden", status_code=403)
+
+
+@app.post("/webhook")
+async def webhook_receive(request: Request, background: BackgroundTasks):
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    try:
+        value = body["entry"][0]["changes"][0]["value"]
+        messages = value.get("messages")
+        if not messages:
+            return {"ok": True}
+
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if not remember_message(message.get("id")):
+                print(f"[whatsapp] skipping already-processed {message.get('id')}", flush=True)
+                continue
+            background.add_task(handle_wa_message, message)
+    except Exception:
+        print("[whatsapp] webhook parse failed:", flush=True)
+        traceback.print_exc()
+
+    return {"ok": True}
+
+
+@app.post("/api/whatsapp/subscribe")
+async def whatsapp_subscribe():
+    return await subscribe_app()
+
+
+@app.get("/api/whatsapp/status")
+def whatsapp_status():
+    return {
+        "whatsapp_token_configured": bool(wa.WHATSAPP_TOKEN),
+        "phone_number_id_configured": bool(wa.WHATSAPP_PHONE_NUMBER_ID),
+        "waba_id_configured": bool(wa.WHATSAPP_WABA_ID),
+        "verify_token_configured": bool(wa.WHATSAPP_VERIFY_TOKEN),
+        "graph_api_version_configured": bool(wa.GRAPH_API_VERSION),
+        "base_url": wa.BASE,
+        "sessions": [
+            {
+                "wa_id": key,
+                "photos": len(value.get("photos") or []),
+                "documents": len(value.get("docs") or []),
+                "updated": value.get("updated"),
+            }
+            for key, value in wa.SESSIONS.items()
+        ],
+        "processed_message_ids": len(wa.PROCESSED),
+    }
 
 
 os.makedirs(STATIC_DIR, exist_ok=True)

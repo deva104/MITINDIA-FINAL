@@ -3,52 +3,103 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ClaimPilot</title>
-  <style>
-    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-           background: #f6f7f9; color: #1a1d21; margin: 0; padding: 48px 24px; }
-    .wrap { max-width: 640px; margin: 0 auto; }
-    h1 { font-size: 22px; margin: 0 0 6px; }
-    p { color: #5a6169; margin: 0 0 24px; }
-    button { background: #2563eb; color: #fff; border: 0; border-radius: 6px;
-             padding: 10px 18px; font-size: 14px; cursor: pointer; }
-    button:hover { background: #1d4ed8; }
-    button:disabled { background: #9ca3af; cursor: default; }
-    #status { margin-left: 12px; font-size: 14px; }
-    .ok { color: #15803d; }
-    .err { color: #b91c1c; }
-  </style>
+  <title>ClaimPilot AI — Independent staged verification</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            ink: '#07080b',
+            raised: '#12141a',
+            line: '#2a2e28',
+            acid: '#e8f86a',
+            warm: '#f4f1ea',
+            mute: '#b8b3a8',
+          },
+          fontFamily: {
+            sans: ['IBM Plex Sans', 'Segoe UI', 'system-ui', 'sans-serif'],
+            mono: ['IBM Plex Mono', 'ui-monospace', 'monospace'],
+          },
+        },
+      },
+    };
+  </script>
+  <link rel="stylesheet" href="/styles.css">
 </head>
-<body>
-  <div class="wrap">
-    <h1>ClaimPilot API is running.</h1>
-    <p>Clearing the demo wipes all stored claims and file records, including the
-       perceptual hashes that cause repeat photos to be rejected as duplicates.</p>
-    <button id="resetBtn" onclick="resetDemo()">Reset demo</button>
-    <span id="status"></span>
+<body class="bg-ink text-warm font-sans antialiased">
+  <div id="banner-error" class="hidden px-6 py-3 bg-[#3a1612] text-[#ffb4a8] text-base border-b border-[#5c2a22]" role="alert"></div>
+
+  <header class="flex items-center justify-between gap-6 px-6 py-4 border-b border-line">
+    <div class="flex items-baseline gap-4 min-w-0">
+      <h1 class="text-2xl font-semibold tracking-tight m-0">ClaimPilot AI</h1>
+      <p class="text-mute text-sm uppercase tracking-[0.18em] m-0 truncate">Independent staged verification · not an oracle</p>
+    </div>
+    <div class="flex items-center gap-5 shrink-0">
+      <span class="font-mono text-xs uppercase tracking-widest text-mute">MIT India · PSE14</span>
+      <div id="health" class="flex items-center gap-2 font-mono text-sm">
+        <span class="pulse-dot pulse-dot--off"></span>
+        <span id="health-label">Checking API…</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <div>
+          <div class="kicker">01 · Live claim feed</div>
+          <h2>Incoming claims</h2>
+        </div>
+        <span class="live-pill"><span class="pulse-dot"></span> Polling 3s</span>
+      </div>
+      <p class="sidebar-hint">WhatsApp photos from a phone land here. New cards highlight, then settle.</p>
+      <div id="feed-error" class="hidden error-inline" role="alert"></div>
+      <div id="feed" class="feed" aria-live="polite"></div>
+
+      <div class="upload-block">
+        <div class="kicker">07 · Submit a claim</div>
+        <form id="upload-form" class="space-y-3">
+          <div class="dropzone" data-zone="documents">
+            <input id="input-docs" type="file" name="documents" multiple accept=".pdf,image/*">
+            <div class="dropzone-label">Claim documents</div>
+            <p>RC, licence, policy, claim form — drop or browse</p>
+            <div class="thumbs" id="thumbs-docs"></div>
+          </div>
+          <div class="dropzone" data-zone="photos">
+            <input id="input-photos" type="file" name="photos" multiple accept="image/*">
+            <div class="dropzone-label">Damage photos</div>
+            <p>Scene and vehicle stills — drop or browse</p>
+            <div class="thumbs" id="thumbs-photos"></div>
+          </div>
+          <button type="submit" id="btn-analyze" class="btn-primary">Analyse claim</button>
+          <p id="upload-error" class="hidden error-inline" role="alert"></p>
+        </form>
+        <button type="button" id="btn-reset" class="btn-ghost">Reset demo</button>
+      </div>
+    </aside>
+
+    <main class="detail">
+      <div id="analyzing" class="hidden analyzing">
+        <div class="kicker">Running independent checks</div>
+        <h2 class="analyzing-title">Nothing is trusted until every stage has spoken.</h2>
+        <p class="analyzing-copy">Assessment typically takes 20–30 seconds. The AI stage is slow on purpose — cheaper checks run first so a duplicate never buys a model call.</p>
+        <ol id="analyze-steps" class="analyze-steps"></ol>
+      </div>
+
+      <div id="detail-empty" class="empty-state">
+        <div class="kicker">Awaiting evidence</div>
+        <h2>No claim selected</h2>
+        <p>Upload documents and photos on the left, or send a damage photo over WhatsApp. The live feed will pick it up within three seconds.</p>
+      </div>
+
+      <div id="detail" class="hidden detail-body"></div>
+    </main>
   </div>
 
-  <script>
-    async function resetDemo() {
-      if (!confirm('Delete all claims and file records? This cannot be undone.')) return;
-      const btn = document.getElementById('resetBtn');
-      const status = document.getElementById('status');
-      btn.disabled = true;
-      status.textContent = 'Clearing...';
-      status.className = '';
-      try {
-        const res = await fetch('/api/demo/reset', { method: 'POST' });
-        const data = await res.json();
-        if (!res.ok || !data.cleared) throw new Error('HTTP ' + res.status);
-        status.textContent = 'Demo data cleared.';
-        status.className = 'ok';
-      } catch (e) {
-        status.textContent = 'Reset failed: ' + e.message;
-        status.className = 'err';
-      } finally {
-        btn.disabled = false;
-      }
-    }
-  </script>
+  <script src="/app.js"></script>
 </body>
 </html>

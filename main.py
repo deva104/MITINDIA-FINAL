@@ -102,16 +102,22 @@ async def analyze(
 
     started = time.perf_counter()
 
-    def stage_done(name, since):
-        print(f"[analyze] {claim_id} {name}: {time.perf_counter() - since:.2f}s", flush=True)
+    timings = []
 
-    def make_payload(status, stopped_at, fields=None, damage=None,
-                     forensics=None, flags=None, estimate=None):
+    def stage_done(name, since):
+        elapsed = round(time.perf_counter() - since, 2)
+        timings.append({"stage": name, "seconds": elapsed})
+        print(f"[analyze] {claim_id} {name}: {elapsed:.2f}s", flush=True)
+
+    def make_payload(status, stopped_at, fields=None, damage=None, forensics=None,
+                     flags=None, estimate=None, vehicle_description=""):
         return {
             "claim_id": claim_id,
             "created_at": datetime.now().isoformat(),
             "status": status,
             "stopped_at": stopped_at,
+            "vehicle_description": vehicle_description,
+            "timings": list(timings),
             "fields": fields or [],
             "damage": damage or [],
             "forensics": forensics or [],
@@ -140,10 +146,13 @@ async def analyze(
         result = assess_damage(photo_paths)
         stage_done("stage1_gemini", mark)
 
+        description = result.get("vehicle_description") or ""
         if result.get("error"):
-            return finish(make_payload("error", "ai_unavailable", fields=fields, forensics=dup))
+            return finish(make_payload("error", "ai_unavailable", fields=fields, forensics=dup,
+                                       vehicle_description=description))
         if result.get("is_vehicle") is False:
-            return finish(make_payload("rejected", "not_a_vehicle", fields=fields, forensics=dup))
+            return finish(make_payload("rejected", "not_a_vehicle", fields=fields, forensics=dup,
+                                       vehicle_description=description))
         damage = result.get("damage") or []
 
         # Stage 2 - ELA + EXIF
@@ -159,7 +168,8 @@ async def analyze(
         stage_done("stage3_rules", mark)
 
         return finish(make_payload("analysed", None, fields=fields, damage=damage,
-                                   forensics=dup + deep, flags=flags, estimate=estimate))
+                                   forensics=dup + deep, flags=flags, estimate=estimate,
+                                   vehicle_description=description))
     finally:
         conn.close()
 

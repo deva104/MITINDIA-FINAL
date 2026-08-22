@@ -150,19 +150,20 @@ def check_duplicate(image, path, conn):
     phash = str(imagehash.phash(image))
 
     rows = conn.execute(
-        "SELECT filename, path, phash FROM files WHERE phash IS NOT NULL AND path != ?",
+        "SELECT filename, path, phash, claim_id FROM files WHERE phash IS NOT NULL AND path != ?",
         (path,),
     ).fetchall()
 
     match = None
     for row in rows:
         stored_name, stored_path, stored_hash = row[0], row[1], row[2]
+        stored_claim = row[3]
         try:
             distance = imagehash.hex_to_hash(phash) - imagehash.hex_to_hash(stored_hash)
         except Exception:
             continue
         if distance <= DUPLICATE_DISTANCE:
-            match = (stored_name, distance)
+            match = (stored_name, distance, stored_claim)
             break
 
     conn.execute("UPDATE files SET phash = ? WHERE path = ?", (phash, path))
@@ -174,33 +175,42 @@ def check_duplicate(image, path, conn):
 def check_duplicates(photo_paths, conn):
     """Stage 0: perceptual-hash duplicate detection only."""
     results = []
+
+    def add(verdict, detail, path):
+        # photo_path lets callers map a result back to its photo without
+        # relying on list order.
+        entry = _result("duplicate", verdict, detail)
+        entry["photo_path"] = os.path.abspath(path) if path else None
+        results.append(entry)
+
     try:
         for path in photo_paths or []:
             name = os.path.basename(path)
             try:
                 _, image, _ = _open_image(path)
             except Exception as e:
-                results.append(_result("duplicate", "fail", f"{name}: could not open image - {e}"))
+                add("fail", f"{name}: could not open image - {e}", path)
                 continue
 
             try:
                 phash, match, compared = check_duplicate(image, path, conn)
                 if match:
-                    results.append(_result(
-                        "duplicate",
-                        "suspicious",
-                        f"{name}: matches previously uploaded photo '{match[0]}' (hash distance {match[1]})",
-                    ))
+                    stored_name, distance, stored_claim = match
+                    # The stored filename is an upload blob name, meaningless to a
+                    # user - name the earlier claim instead where we can.
+                    if stored_claim:
+                        detail = (f"{name}: matches a photo already submitted in claim "
+                                  f"{stored_claim} (hash distance {distance})")
+                    else:
+                        detail = (f"{name}: matches previously uploaded photo "
+                                  f"'{stored_name}' (hash distance {distance})")
+                    add("suspicious", detail, path)
                 else:
-                    results.append(_result(
-                        "duplicate",
-                        "clean",
-                        f"{name}: phash {phash}, no match among {compared} stored photo(s)",
-                    ))
+                    add("clean", f"{name}: phash {phash}, no match among {compared} stored photo(s)", path)
             except Exception as e:
-                results.append(_result("duplicate", "fail", f"{name}: duplicate check failed - {e}"))
+                add("fail", f"{name}: duplicate check failed - {e}", path)
     except Exception as e:
-        results.append(_result("duplicate", "fail", f"duplicate stage aborted - {e}"))
+        add("fail", f"duplicate stage aborted - {e}", None)
     return results
 
 

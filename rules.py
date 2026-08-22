@@ -122,7 +122,49 @@ def _part_group(part):
     return None
 
 
-def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None):
+VEHICLE_MATCH_RATIO = 0.7
+
+
+def _differs(a, b, fuzzy=False):
+    """Nulls never count as a difference - only two stated values can disagree."""
+    x, y = _norm_name(a), _norm_name(b)
+    if not x or not y:
+        return False
+    if fuzzy:
+        return SequenceMatcher(None, x, y).ratio() < VEHICLE_MATCH_RATIO
+    return x != y
+
+
+def _vehicle_mismatch(photos):
+    entries = [p for p in (photos or [])
+               if isinstance(p, dict) and p.get("is_vehicle") is True]
+    if len(entries) < 2:
+        return None
+
+    for key, label, fuzzy in (
+        ("colour", "colour", False),
+        ("body_type", "body type", False),
+        ("make_model", "make and model", True),
+    ):
+        for i in range(len(entries)):
+            for j in range(i + 1, len(entries)):
+                a, b = entries[i], entries[j]
+                if not _differs(a.get(key), b.get(key), fuzzy):
+                    continue
+                evidence = [p.get("source_photo") for p in (a, b) if p.get("source_photo")]
+                return {
+                    "rule": "vehicle_mismatch",
+                    "severity": "HIGH",
+                    "message": (
+                        f"Photos appear to show different vehicles: {label} "
+                        f"'{a.get(key)}' vs '{b.get(key)}'. A claim covers a single vehicle."
+                    ),
+                    "evidence": evidence,
+                }
+    return None
+
+
+def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None):
     flags = []
     damage = damage or []
 
@@ -247,6 +289,12 @@ def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None):
             ),
             "evidence": [],
         })
+
+    # 8. vehicle_mismatch - one claim covers one vehicle, so photos of two
+    #    different cars mean the bundle is mixed.
+    mismatch = _vehicle_mismatch(photos)
+    if mismatch:
+        flags.append(mismatch)
 
     return flags
 

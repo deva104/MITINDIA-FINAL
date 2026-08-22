@@ -107,8 +107,13 @@ CRITICAL: if a field is not visible in any document, return it with
 value null and confidence 0. Never guess or infer a value."""
 
 DAMAGE_PROMPT = """You are a motor insurance damage assessor. For each visible damaged part
-return JSON: {"is_vehicle":true,"vehicle_description":"<one short sentence>","damage":[{"part","damage_type","severity","confidence","reasoning","source_photo"}]}
+return JSON: {"is_vehicle":true,"vehicle_description":"<one short sentence>","photos":[{"source_photo","is_vehicle","make_model","colour","body_type","description"}],"damage":[{"part","damage_type","severity","confidence","reasoning","source_photo"}]}
 is_vehicle: false if the image does not show a motor vehicle (car, van, SUV, truck, two-wheeler). If false return empty damage.
+For EVERY photo provided, identify the vehicle separately: make and model if legible, dominant
+body colour as a simple word (white, black, silver, red, blue, grey), and body type (hatchback,
+sedan, SUV, van, truck, two-wheeler). Use null where you cannot tell. Report one entry per photo
+even if a photo shows no damage.
+source_photo MUST be the filename given for that photo.
 part MUST be one of: front_bumper, rear_bumper, bonnet, boot,
   front_left_door, front_right_door, rear_left_door, rear_right_door,
   front_left_fender, front_right_fender, rear_left_quarter,
@@ -178,9 +183,59 @@ def _normalise_damage(items):
     return cleaned
 
 
+NULL_WORDS = ("null", "none", "n/a", "na", "unknown", "not visible", "not legible")
+
+
+def _clean_text(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text and text.lower() not in NULL_WORDS else None
+
+
+def _clean_word(value):
+    text = _clean_text(value)
+    return text.lower() if text else None
+
+
+def _normalise_photos(items, photo_paths):
+    """Exactly one entry per input photo, whatever shape the model returned.
+
+    Matched on source_photo where the model echoed a filename back, falling
+    back to input order for anything it renamed or omitted.
+    """
+    pool = [i for i in (items if isinstance(items, list) else []) if isinstance(i, dict)]
+    matched = {}
+    for index, path in enumerate(photo_paths):
+        name = os.path.basename(path).lower()
+        for item in pool:
+            if os.path.basename(str(item.get("source_photo") or "")).strip().lower() == name:
+                matched[index] = item
+                pool.remove(item)
+                break
+
+    photos = []
+    for index, path in enumerate(photo_paths):
+        item = matched.get(index)
+        if item is None and pool:
+            item = pool.pop(0)
+        item = item or {}
+        is_vehicle = item.get("is_vehicle")
+        photos.append({
+            "source_photo": os.path.basename(path),
+            "is_vehicle": is_vehicle if isinstance(is_vehicle, bool) else None,
+            "make_model": _clean_text(item.get("make_model")),
+            "colour": _clean_word(item.get("colour")),
+            "body_type": _clean_word(item.get("body_type")),
+            "description": _clean_text(item.get("description")) or "",
+        })
+    return photos
+
+
 def assess_damage(photo_paths):
     if not photo_paths:
-        return {"is_vehicle": None, "vehicle_description": "", "damage": [], "error": None}
+        return {"is_vehicle": None, "vehicle_description": "", "photos": [],
+                "damage": [], "error": None}
     try:
         parts = []
         for p in photo_paths:
@@ -200,6 +255,7 @@ def assess_damage(photo_paths):
         return {
             "is_vehicle": is_vehicle,
             "vehicle_description": str(data.get("vehicle_description") or ""),
+            "photos": _normalise_photos(data.get("photos"), photo_paths),
             "damage": _normalise_damage(damage),
             "error": None,
         }
@@ -207,4 +263,5 @@ def assess_damage(photo_paths):
         print("[gemini] assess_damage failed:", flush=True)
         traceback.print_exc()
         # is_vehicle stays None so a failure is never read as a clean result.
-        return {"is_vehicle": None, "vehicle_description": "", "damage": [], "error": str(e)}
+        return {"is_vehicle": None, "vehicle_description": "", "photos": [],
+                "damage": [], "error": str(e)}

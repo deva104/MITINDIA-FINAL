@@ -97,6 +97,7 @@ async def analyse_claim(claim_id, doc_paths, photo_paths):
     started = time.perf_counter()
 
     timings = []
+    excluded_photos = []
 
     def stage_done(name, since):
         elapsed = round(time.perf_counter() - since, 2)
@@ -104,14 +105,16 @@ async def analyse_claim(claim_id, doc_paths, photo_paths):
         print(f"[analyze] {claim_id} {name}: {elapsed:.2f}s", flush=True)
 
     def make_payload(status, stopped_at, fields=None, damage=None, forensics=None,
-                     flags=None, estimate=None, vehicle_description=""):
+                     flags=None, estimate=None, vehicle_description="", photos=None):
         return {
             "claim_id": claim_id,
             "created_at": datetime.now().isoformat(),
             "status": status,
             "stopped_at": stopped_at,
             "vehicle_description": vehicle_description,
+            "photos": photos or [],
             "timings": list(timings),
+            "excluded_photos": list(excluded_photos),
             "fields": fields or [],
             "damage": damage or [],
             "forensics": forensics or [],
@@ -131,39 +134,65 @@ async def analyse_claim(claim_id, doc_paths, photo_paths):
         mark = time.perf_counter()
         dup = check_duplicates(photo_paths, conn)
         stage_done("stage0_duplicate", mark)
-        if any(d.get("verdict") == "suspicious" for d in dup):
+
+        flagged = {d["photo_path"] for d in dup
+                   if d.get("verdict") == "suspicious" and d.get("photo_path")}
+        dup_paths = [p for p in photo_paths if os.path.abspath(p) in flagged]
+        clean_paths = [p for p in photo_paths if os.path.abspath(p) not in flagged]
+        excluded_photos = [os.path.basename(p) for p in dup_paths]
+
+        # Only a bundle with nothing left to assess is rejected outright. A claim
+        # with at least one fresh photo is still worth analysing.
+        if dup_paths and not clean_paths:
             return finish(make_payload("rejected", "duplicate", forensics=dup))
+
+        bundle_flags = []
+        if dup_paths:
+            bundle_flags.append({
+                "rule": "duplicate_photo_in_bundle",
+                "severity": "HIGH",
+                "message": (
+                    f"{len(dup_paths)} of {len(photo_paths)} submitted photos were already "
+                    "used in an earlier claim and have been excluded from this assessment."
+                ),
+                "evidence": list(excluded_photos),
+            })
+            print(f"[analyze] {claim_id} excluding {len(dup_paths)} duplicate photo(s): "
+                  f"{', '.join(excluded_photos)}", flush=True)
 
         # Stage 1 - Gemini extraction and damage assessment
         mark = time.perf_counter()
         fields = extract_fields(doc_paths) if doc_paths else []
-        result = assess_damage(photo_paths)
+        result = assess_damage(clean_paths)
         stage_done("stage1_gemini", mark)
 
         description = result.get("vehicle_description") or ""
+        photos = result.get("photos") or []
         if result.get("error"):
             return finish(make_payload("error", "ai_unavailable", fields=fields, forensics=dup,
-                                       vehicle_description=description))
+                                       flags=bundle_flags, vehicle_description=description,
+                                       photos=photos))
         if result.get("is_vehicle") is False:
             return finish(make_payload("rejected", "not_a_vehicle", fields=fields, forensics=dup,
-                                       vehicle_description=description))
+                                       flags=bundle_flags, vehicle_description=description,
+                                       photos=photos))
         damage = result.get("damage") or []
 
         # Stage 2 - ELA + EXIF
         mark = time.perf_counter()
-        deep = run_deep_forensics(photo_paths, conn)
+        deep = run_deep_forensics(clean_paths, conn)
         stage_done("stage2_deep_forensics", mark)
 
         # Stage 3 - rules and estimate
         mark = time.perf_counter()
-        flags = run_rules(fields, damage, photo_count=len(photo_paths),
-                          is_vehicle=result.get("is_vehicle"))
+        flags = bundle_flags + run_rules(fields, damage, photo_count=len(clean_paths),
+                                         is_vehicle=result.get("is_vehicle"), photos=photos)
         estimate = build_estimate(damage)
         stage_done("stage3_rules", mark)
 
         return finish(make_payload("analysed", None, fields=fields, damage=damage,
                                    forensics=dup + deep, flags=flags, estimate=estimate,
-                                   vehicle_description=description))
+                                   vehicle_description=description, photos=photos))
     finally:
         conn.close()
 

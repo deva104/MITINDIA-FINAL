@@ -72,16 +72,23 @@ def _generate(parts, label):
     cfg = types.GenerateContentConfig(
         response_mime_type="application/json", temperature=TEMPERATURE
     )
-    started = time.perf_counter()
-    try:
-        resp = client.models.generate_content(model=MODEL, contents=parts, config=cfg)
-        elapsed = time.perf_counter() - started
-        print(f"[gemini] {label}: {elapsed:.2f}s via {MODEL}", flush=True)
-        return json.loads(_strip_fences(resp.text))
-    except Exception as e:
-        elapsed = time.perf_counter() - started
-        print(f"[gemini] {label}: {MODEL} failed after {elapsed:.2f}s -> {e}", flush=True)
-        raise
+    delays = (2, 4)
+    attempts = len(delays) + 1
+    for attempt in range(1, attempts + 1):
+        started = time.perf_counter()
+        try:
+            resp = client.models.generate_content(model=MODEL, contents=parts, config=cfg)
+            elapsed = time.perf_counter() - started
+            print(f"[gemini] {label}: {elapsed:.2f}s via {MODEL} "
+                  f"(attempt {attempt}/{attempts})", flush=True)
+            return json.loads(_strip_fences(resp.text))
+        except Exception as e:
+            elapsed = time.perf_counter() - started
+            print(f"[gemini] {label}: attempt {attempt}/{attempts} failed after "
+                  f"{elapsed:.2f}s -> {e}", flush=True)
+            if attempt == attempts:
+                raise
+            time.sleep(delays[attempt - 1])
 
 
 EXTRACT_PROMPT = """You are reading Indian motor insurance claim documents (claim form,

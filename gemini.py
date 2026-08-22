@@ -1,3 +1,4 @@
+import io
 import json
 import mimetypes
 import os
@@ -8,11 +9,15 @@ from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from PIL import Image
 
 load_dotenv()
 
 MODEL = "gemini-3.6-flash"
 TEMPERATURE = 0.1
+
+MAX_EDGE = 1568
+JPEG_QUALITY = 85
 
 _client = None
 
@@ -26,7 +31,30 @@ def _get_client():
 
 def _image_part(path):
     mime = mimetypes.guess_type(path)[0] or "image/jpeg"
-    return types.Part.from_bytes(data=Path(path).read_bytes(), mime_type=mime)
+    data = Path(path).read_bytes()
+
+    # Anything past MAX_EDGE is downsampled by the model anyway - shrinking it here
+    # cuts upload time without losing detail. The file on disk is untouched.
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            width, height = image.size
+            if max(width, height) > MAX_EDGE:
+                scale = MAX_EDGE / max(width, height)
+                resized = image.convert("RGB").resize(
+                    (max(1, round(width * scale)), max(1, round(height * scale))),
+                    Image.LANCZOS,
+                )
+                buffer = io.BytesIO()
+                resized.save(buffer, format="JPEG", quality=JPEG_QUALITY)
+                shrunk = buffer.getvalue()
+                print(f"[gemini] {os.path.basename(path)}: {width}x{height} "
+                      f"{len(data) // 1024}KB -> {resized.width}x{resized.height} "
+                      f"{len(shrunk) // 1024}KB", flush=True)
+                data, mime = shrunk, "image/jpeg"
+    except Exception as e:
+        print(f"[gemini] resize skipped for {os.path.basename(path)}: {e}", flush=True)
+
+    return types.Part.from_bytes(data=data, mime_type=mime)
 
 
 def _strip_fences(text):

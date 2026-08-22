@@ -1,105 +1,137 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ClaimPilot AI — Independent staged verification</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&display=swap" rel="stylesheet">
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      theme: {
-        extend: {
-          colors: {
-            ink: '#07080b',
-            raised: '#12141a',
-            line: '#2a2e28',
-            acid: '#e8f86a',
-            warm: '#f4f1ea',
-            mute: '#b8b3a8',
-          },
-          fontFamily: {
-            sans: ['IBM Plex Sans', 'Segoe UI', 'system-ui', 'sans-serif'],
-            mono: ['IBM Plex Mono', 'ui-monospace', 'monospace'],
-          },
-        },
-      },
-    };
-  </script>
-  <link rel="stylesheet" href="/styles.css">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ClaimPilot AI — Motor Claim Assessment</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
 </head>
-<body class="bg-ink text-warm font-sans antialiased">
-  <div id="banner-error" class="hidden px-6 py-3 bg-[#3a1612] text-[#ffb4a8] text-base border-b border-[#5c2a22]" role="alert"></div>
+<body>
 
-  <header class="flex items-center justify-between gap-6 px-6 py-4 border-b border-line">
-    <div class="flex items-baseline gap-4 min-w-0">
-      <h1 class="text-2xl font-semibold tracking-tight m-0">ClaimPilot AI</h1>
-      <p class="text-mute text-sm uppercase tracking-[0.18em] m-0 truncate">Independent staged verification · not an oracle</p>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">CP</span>
+      <span class="brand-name">ClaimPilot<span class="brand-ai">AI</span></span>
+      <span class="brand-tag">Motor claim assessment</span>
     </div>
-    <div class="flex items-center gap-5 shrink-0">
-      <span class="font-mono text-xs uppercase tracking-widest text-mute">MIT India · PSE14</span>
-      <div id="health" class="flex items-center gap-2 font-mono text-sm">
-        <span class="pulse-dot pulse-dot--off"></span>
-        <span id="health-label">Checking API…</span>
-      </div>
+    <div class="topbar-actions">
+      <span class="health" id="health"><i></i><span>Checking</span></span>
+      <button class="btn btn-ghost" id="btnNew">New claim</button>
+      <button class="btn btn-outline" id="btnReset">Reset demo</button>
     </div>
   </header>
 
-  <div class="app-shell">
-    <aside class="sidebar">
-      <div class="sidebar-head">
-        <div>
-          <div class="kicker">01 · Live claim feed</div>
-          <h2>Incoming claims</h2>
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <span class="label">Live claim feed</span>
+      <span class="count" id="claimCount">0</span>
+    </div>
+    <div class="feed" id="feed">
+      <div class="feed-empty">No claims yet. Upload a bundle or send one over WhatsApp.</div>
+    </div>
+  </aside>
+
+  <main class="main" id="main">
+
+    <!-- UPLOAD VIEW -->
+    <section class="view" id="viewUpload">
+      <div class="upload-wrap">
+        <h1 class="upload-title">Assess a motor claim</h1>
+        <p class="upload-sub">Every value we return cites the document or photograph it came from.</p>
+
+        <div class="drops">
+          <div class="drop" id="dropDocs" data-kind="documents">
+            <span class="label">Claim documents</span>
+            <p class="drop-hint">Claim form, RC book, driving licence, policy schedule</p>
+            <button class="btn btn-outline btn-sm" type="button">Choose files</button>
+            <input type="file" multiple accept="image/*,.pdf" hidden>
+            <div class="thumbs"></div>
+          </div>
+          <div class="drop" id="dropPhotos" data-kind="photos">
+            <span class="label">Damage photos</span>
+            <p class="drop-hint">Send as files to preserve capture time and location</p>
+            <button class="btn btn-outline btn-sm" type="button">Choose files</button>
+            <input type="file" multiple accept="image/*" hidden>
+            <div class="thumbs"></div>
+          </div>
         </div>
-        <span class="live-pill"><span class="pulse-dot"></span> Polling 3s</span>
-      </div>
-      <p class="sidebar-hint">WhatsApp photos from a phone land here. New cards highlight, then settle.</p>
-      <div id="feed-error" class="hidden error-inline" role="alert"></div>
-      <div id="feed" class="feed" aria-live="polite"></div>
 
-      <div class="upload-block">
-        <div class="kicker">07 · Submit a claim</div>
-        <form id="upload-form" class="space-y-3">
-          <div class="dropzone" data-zone="documents">
-            <input id="input-docs" type="file" name="documents" multiple accept=".pdf,image/*">
-            <div class="dropzone-label">Claim documents</div>
-            <p>RC, licence, policy, claim form — drop or browse</p>
-            <div class="thumbs" id="thumbs-docs"></div>
+        <button class="btn btn-primary btn-lg" id="btnAnalyse" disabled>Analyse claim</button>
+        <p class="upload-note" id="uploadNote">Add at least one document or photo.</p>
+      </div>
+    </section>
+
+    <!-- WORKING VIEW -->
+    <section class="view hidden" id="viewWorking">
+      <div class="working">
+        <span class="label">Analysing</span>
+        <h2 class="working-title">Running staged assessment</h2>
+        <ol class="working-stages" id="workingStages"></ol>
+        <p class="working-note">Independent checks run in sequence. Cheap checks run first so a rejected claim never reaches the AI.</p>
+      </div>
+    </section>
+
+    <!-- CLAIM VIEW -->
+    <section class="view hidden" id="viewClaim">
+      <div class="verdict" id="verdict">
+        <span class="verdict-id" id="verdictId"></span>
+        <h1 class="verdict-title" id="verdictTitle"></h1>
+        <p class="verdict-sub" id="verdictSub"></p>
+      </div>
+
+      <div class="gutter">
+        <div class="card pipeline">
+          <span class="label">Pipeline trace</span>
+          <div class="bars" id="bars"></div>
+          <p class="pipeline-callout hidden" id="pipelineCallout"></p>
+        </div>
+
+        <div class="grid">
+          <div class="col-left">
+            <div class="card">
+              <span class="label">Source evidence</span>
+              <div class="imgswitch hidden" id="imgSwitch">
+                <button class="btn btn-sm btn-outline is-active" data-mode="original">Original</button>
+                <button class="btn btn-sm btn-outline" data-mode="heatmap">ELA heatmap</button>
+              </div>
+              <div class="evidence" id="evidence"></div>
+            </div>
+            <div class="card">
+              <span class="label">Image forensics</span>
+              <div class="stack" id="forensics"></div>
+            </div>
           </div>
-          <div class="dropzone" data-zone="photos">
-            <input id="input-photos" type="file" name="photos" multiple accept="image/*">
-            <div class="dropzone-label">Damage photos</div>
-            <p>Scene and vehicle stills — drop or browse</p>
-            <div class="thumbs" id="thumbs-photos"></div>
+
+          <div class="col-right">
+            <div class="card">
+              <span class="label">Inconsistency flags</span>
+              <div class="stack" id="flags"></div>
+            </div>
+            <div class="card">
+              <span class="label">Extracted fields</span>
+              <div class="fields" id="fields"></div>
+            </div>
+            <div class="card">
+              <span class="label">Damage assessment</span>
+              <div class="stack" id="damage"></div>
+            </div>
+            <div class="card">
+              <span class="label">Settlement estimate</span>
+              <div id="estimate"></div>
+            </div>
           </div>
-          <button type="submit" id="btn-analyze" class="btn-primary">Analyse claim</button>
-          <p id="upload-error" class="hidden error-inline" role="alert"></p>
-        </form>
-        <button type="button" id="btn-reset" class="btn-ghost">Reset demo</button>
+        </div>
       </div>
-    </aside>
+    </section>
 
-    <main class="detail">
-      <div id="analyzing" class="hidden analyzing">
-        <div class="kicker">Running independent checks</div>
-        <h2 class="analyzing-title">Nothing is trusted until every stage has spoken.</h2>
-        <p class="analyzing-copy">Assessment typically takes 20–30 seconds. The AI stage is slow on purpose — cheaper checks run first so a duplicate never buys a model call.</p>
-        <ol id="analyze-steps" class="analyze-steps"></ol>
-      </div>
+  </main>
+</div>
 
-      <div id="detail-empty" class="empty-state">
-        <div class="kicker">Awaiting evidence</div>
-        <h2>No claim selected</h2>
-        <p>Upload documents and photos on the left, or send a damage photo over WhatsApp. The live feed will pick it up within three seconds.</p>
-      </div>
-
-      <div id="detail" class="hidden detail-body"></div>
-    </main>
-  </div>
-
-  <script src="/app.js"></script>
+<script src="app.js"></script>
 </body>
 </html>

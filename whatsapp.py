@@ -19,6 +19,7 @@ BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 HTTP_TIMEOUT = 30.0
 MAX_PROCESSED = 500
+PENDING_CHOICE_TIMEOUT = 30 * 60
 
 SESSIONS = {}
 PROCESSED = set()
@@ -42,8 +43,19 @@ def verify(mode, token, challenge):
 
 def get_session(wa_id):
     session = SESSIONS.get(wa_id)
+    now = time.time()
+    if (session is not None
+            and session.get("pending_choice")
+            and now - session.get("updated", 0) > PENDING_CHOICE_TIMEOUT):
+        SESSIONS.pop(wa_id, None)
+        session = None
     if session is None:
-        session = {"photos": [], "docs": [], "updated": time.time()}
+        session = {
+            "photos": [],
+            "docs": [],
+            "pending_choice": None,
+            "updated": now,
+        }
         SESSIONS[wa_id] = session
     return session
 
@@ -156,43 +168,178 @@ def _stage_seconds(payload, stage):
     return None
 
 
+def _estimate_range(estimate):
+    estimate = estimate or {}
+    return (
+        f"{_rupees(estimate.get('total_low'))} "
+        f"– {_rupees(estimate.get('total_high'))}"
+    )
+
+
+def _single_vehicle_reply(claim_id, vehicle, excluded_count=0, total_photos=None):
+    estimate = vehicle.get("estimate") or {}
+    line_items = estimate.get("line_items") or []
+    lines = []
+
+    if excluded_count:
+        total = total_photos if total_photos is not None else len(vehicle.get("photos") or [])
+        remaining = max(0, total - excluded_count)
+        submitted_verb = "was" if excluded_count == 1 else "were"
+        excluded_verb = "has" if excluded_count == 1 else "have"
+        remaining_word = "photo" if remaining == 1 else "photos"
+        lines += [
+            (
+                f"{excluded_count} of your {total} photos {submitted_verb} already submitted "
+                f"in an earlier claim and {excluded_verb} been excluded. The assessment "
+                f"below uses the "
+                f"remaining {remaining} {remaining_word}."
+            ),
+            "",
+        ]
+
+    lines += [
+        f"*Claim {claim_id} · {vehicle.get('label') or 'Vehicle'}*",
+        "",
+        "Damage found:",
+    ]
+    for item in line_items:
+        lines.append(
+            f"- {_pretty(item.get('part'))} — "
+            f"{str(item.get('damage_type') or 'damage').replace('_', ' ')} "
+            f"({item.get('severity')}): {_rupees(item.get('low'))} "
+            f"– {_rupees(item.get('high'))}"
+        )
+
+    unpriced = estimate.get("unpriced") or []
+    for item in unpriced:
+        lines.append(f"- {_pretty(item.get('part'))} — manual pricing required")
+
+    if not line_items and not unpriced:
+        lines.append("- Damage detected — manual pricing required")
+
+    lines += ["", f"*Estimate: {_estimate_range(estimate)}*"]
+    if excluded_count:
+        lines += ["", "Flagged for manual review."]
+    return "\n".join(lines)
+
+
+def _vehicle_summary(vehicle):
+    damage_items = vehicle.get("damage") or []
+    first = damage_items[0] if damage_items else {}
+    part = str(first.get("part") or "damage").replace("_", " ")
+    damage_type = str(first.get("damage_type") or "detected").replace("_", " ")
+    return f"{part} {damage_type}, {_estimate_range(vehicle.get('estimate'))}"
+
+
+def _number_word(number, title=False):
+    words = {
+        1: "one",
+        2: "two",
+        3: "three",
+        4: "four",
+        5: "five",
+        6: "six",
+        7: "seven",
+        8: "eight",
+        9: "nine",
+        10: "ten",
+    }
+    value = words.get(number, str(number))
+    return value.title() if title else value
+
+
+def _selection_reply(claim_id, vehicles):
+    count = len(vehicles)
+    lines = [
+        f"*{_number_word(count, title=True)} different vehicles in one claim*",
+        "",
+        (
+            f"Your photos show {_number_word(count)} vehicles. A claim covers one vehicle, "
+            "so please choose:"
+        ),
+        "",
+    ]
+    for index, vehicle in enumerate(vehicles, 1):
+        lines.append(
+            f"*{index} · {vehicle.get('label') or f'Vehicle {index}'}* "
+            f"— {_vehicle_summary(vehicle)}"
+        )
+    choices = " or ".join(f"*{index}*" for index in range(1, count + 1))
+    lines += ["", f"Reply {choices} to continue with that vehicle."]
+    return "\n".join(lines)
+
+
+def _not_vehicle_reply(payload):
+    photos = {
+        os.path.basename(str(photo.get("source_photo") or "")).lower(): photo
+        for photo in (payload.get("photos") or [])
+        if isinstance(photo, dict)
+    }
+    descriptions = []
+    for vehicle in payload.get("vehicles") or []:
+        if vehicle.get("status") != "not_vehicle":
+            continue
+        text = next(
+            (
+                photos.get(os.path.basename(str(name)).lower(), {}).get("description")
+                for name in vehicle.get("photos") or []
+                if photos.get(os.path.basename(str(name)).lower(), {}).get("description")
+            ),
+            None,
+        )
+        if text:
+            descriptions.append((vehicle.get("label"), text))
+
+    fallback = payload.get("vehicle_description") or ""
+    lines = ["*Cannot process this image*", ""]
+    if len(descriptions) == 1:
+        lines.append(f"What I saw: {descriptions[0][1]}")
+    elif descriptions:
+        for label, description in descriptions:
+            lines.append(f"What I saw in {label or 'this photo'}: {description}")
+    elif fallback:
+        lines.append(f"What I saw: {fallback}")
+    else:
+        lines.append("This photo does not appear to show a motor vehicle.")
+    lines += ["", "Please send a clear photo of the *damaged vehicle* to start your claim."]
+    return "\n".join(lines)
+
+
+def _duplicate_reply(payload):
+    claim_id = payload.get("claim_id", "unknown")
+    match = ""
+    for entry in payload.get("forensics") or []:
+        if entry.get("check") == "duplicate" and entry.get("verdict") == "suspicious":
+            match = entry.get("detail") or ""
+            break
+    seconds = _stage_seconds(payload, "stage0_duplicate")
+    lines = [
+        "*Claim rejected - duplicate photo*",
+        "",
+        "This photo has already been submitted with an earlier claim.",
+    ]
+    if match:
+        lines.append(f"Match: {match}")
+    lines += [
+        f"Reference: *{claim_id}*",
+        "",
+        "Your claim has been sent for *manual review*.",
+    ]
+    if seconds is not None:
+        lines.append(f"Detected at stage 0 in {seconds}s - no AI analysis was run.")
+    return "\n".join(lines)
+
+
 def format_reply(payload):
     status = payload.get("status")
     stopped_at = payload.get("stopped_at")
     claim_id = payload.get("claim_id", "unknown")
 
     if status == "rejected" and stopped_at == "duplicate":
-        match = ""
-        for entry in payload.get("forensics") or []:
-            if entry.get("check") == "duplicate" and entry.get("verdict") == "suspicious":
-                match = entry.get("detail") or ""
-                break
-        seconds = _stage_seconds(payload, "stage0_duplicate")
-        lines = [
-            "*Claim rejected - duplicate photo*",
-            "",
-            "This photo has already been submitted with an earlier claim.",
-        ]
-        if match:
-            lines.append(f"Match: {match}")
-        lines += [
-            f"Reference: *{claim_id}*",
-            "",
-            "Your claim has been sent for *manual review*.",
-        ]
-        if seconds is not None:
-            lines.append(f"Detected at stage 0 in {seconds}s - no AI analysis was run.")
-        return "\n".join(lines)
+        return _duplicate_reply(payload)
 
     if status == "rejected" and stopped_at == "not_a_vehicle":
-        description = payload.get("vehicle_description") or ""
-        lines = ["*Cannot process this image*", ""]
-        if description:
-            lines.append(f"What I saw: {description}")
-        else:
-            lines.append("This photo does not appear to show a motor vehicle.")
-        lines += ["", "Please send a clear photo of the *damaged vehicle* to start your claim."]
-        return "\n".join(lines)
+        return _not_vehicle_reply(payload)
 
     if status == "error" and stopped_at == "ai_unavailable":
         return "\n".join([
@@ -205,49 +352,156 @@ def format_reply(payload):
         ])
 
     if status == "analysed":
-        estimate = payload.get("estimate") or {}
-        line_items = estimate.get("line_items") or []
-        lines = [f"*Claim {claim_id}*"]
-        description = payload.get("vehicle_description") or ""
-        if description:
-            lines.append(description)
-        lines.append("")
-
-        if line_items:
-            lines.append("*Damage found:*")
-            for item in line_items:
-                lines.append(
-                    f"- *{_pretty(item.get('part'))}* - {str(item.get('damage_type') or 'damage').replace('_', ' ')}"
-                    f" ({item.get('severity')}): {_rupees(item.get('low'))} - {_rupees(item.get('high'))}"
-                )
-        else:
-            lines.append("*No priced damage was identified.*")
-
-        unpriced = estimate.get("unpriced") or []
-        if unpriced:
-            names = ", ".join(_pretty(u.get("part")) for u in unpriced)
-            lines.append(f"- {names}: needs manual pricing")
-
-        lines += [
-            "",
-            f"*Total estimate:* {_rupees(estimate.get('total_low'))} - {_rupees(estimate.get('total_high'))}",
+        vehicles = [
+            vehicle for vehicle in (payload.get("vehicles") or [])
+            if isinstance(vehicle, dict)
+        ]
+        claimable = [
+            vehicle for vehicle in vehicles if vehicle.get("status") == "claimable"
+        ]
+        claimable_count = payload.get("claimable_count")
+        if not isinstance(claimable_count, int):
+            claimable_count = len(claimable)
+        duplicate = [
+            vehicle for vehicle in vehicles if vehicle.get("status") == "all_duplicate"
+        ]
+        no_damage = [
+            vehicle for vehicle in vehicles if vehicle.get("status") == "no_damage"
+        ]
+        not_vehicle = [
+            vehicle for vehicle in vehicles if vehicle.get("status") == "not_vehicle"
         ]
 
-        flags = payload.get("flags") or []
-        if any(str(f.get("severity", "")).upper() == "HIGH" for f in flags):
-            lines += ["", "*Flags:*"]
-            for flag in flags:
-                lines.append(f"- {flag.get('message')}")
+        if claimable_count > 1:
+            return _selection_reply(claim_id, claimable)
 
-        if estimate.get("requires_survey"):
-            lines += ["", f"*Survey required:* {estimate.get('survey_reason')}"]
+        if claimable_count == 1 and duplicate:
+            lines = ["*One vehicle cannot be claimed*", ""]
+            for vehicle in duplicate:
+                lines.append(
+                    f"*{vehicle.get('label') or 'Vehicle'}* — the photos of this vehicle "
+                    "were already submitted in an earlier claim. It cannot be claimed again."
+                )
+            vehicle = claimable[0]
+            lines += [
+                "",
+                (
+                    f"*{vehicle.get('label') or 'Vehicle'}* — assessed and claimable, "
+                    f"{_estimate_range(vehicle.get('estimate'))}."
+                ),
+                "",
+                (
+                    f"Reply *YES* to continue with the "
+                    f"{vehicle.get('label') or 'vehicle'}, or send fresh photos."
+                ),
+            ]
+            return "\n".join(lines)
 
-        return "\n".join(lines)
+        if claimable_count == 1:
+            excluded_count = len(payload.get("excluded_photos") or [])
+            total_photos = len(payload.get("photos") or []) + excluded_count
+            reply = _single_vehicle_reply(
+                claim_id,
+                claimable[0],
+                excluded_count=excluded_count,
+                total_photos=total_photos,
+            )
+            notes = []
+            for vehicle in no_damage:
+                count = len(vehicle.get("photos") or [])
+                if count == 1:
+                    notes.append(
+                        f"Note: your photo of the {vehicle.get('label')} shows no visible "
+                        "damage, so it has not been included."
+                    )
+                else:
+                    notes.append(
+                        f"Note: your photos of the {vehicle.get('label')} show no visible "
+                        "damage, so they have not been included."
+                    )
+            return reply + (("\n\n" + "\n".join(notes)) if notes else "")
+
+        statuses = [vehicle.get("status") for vehicle in vehicles]
+        if vehicles and all(value == "no_damage" for value in statuses):
+            photo_count = sum(len(vehicle.get("photos") or []) for vehicle in vehicles)
+            target = "either vehicle" if len(vehicles) == 2 else "any vehicle"
+            return "\n".join([
+                "*No visible damage found*",
+                "",
+                (
+                    f"We examined {photo_count} photos and could not identify damage "
+                    f"on {target}."
+                ),
+                (
+                    "Send clearer photos showing the damaged area, or reply HELP "
+                    "to speak to an assessor."
+                ),
+            ])
+
+        if vehicles and all(value == "all_duplicate" for value in statuses):
+            return _duplicate_reply(payload)
+
+        if vehicles and all(value == "not_vehicle" for value in statuses):
+            return _not_vehicle_reply(payload)
+
+        if not_vehicle and not claimable:
+            return _not_vehicle_reply(payload)
 
     return f"*Claim {claim_id}*\nStatus: {status}"
 
 
+async def handle_pending_choice(wa_id, text):
+    """Handle a numeric/YES response, returning True when a choice was pending."""
+    session = get_session(wa_id)
+    pending = session.get("pending_choice")
+    if not pending:
+        return False
+
+    vehicles = [
+        vehicle for vehicle in (pending.get("vehicles") or [])
+        if isinstance(vehicle, dict)
+    ]
+    answer = str(text or "").strip()
+    selected = None
+    try:
+        number = int(answer)
+    except (TypeError, ValueError):
+        number = None
+    if number is not None and 1 <= number <= len(vehicles):
+        selected = vehicles[number - 1]
+    elif answer.upper() in ("YES", "Y") and len(vehicles) == 1:
+        selected = vehicles[0]
+
+    if selected is not None:
+        reply = _single_vehicle_reply(
+            pending.get("claim_id", "unknown"),
+            selected,
+            excluded_count=len(selected.get("excluded_photos") or []),
+            total_photos=len(selected.get("photos") or []),
+        )
+        await send_text(wa_id, reply)
+        session["pending_choice"] = None
+        SESSIONS.pop(wa_id, None)
+        return True
+
+    session["updated"] = time.time()
+    prompt = session.get("pending_prompt")
+    if not prompt:
+        prompt = (
+            _selection_reply(pending.get("claim_id", "unknown"), vehicles)
+            if len(vehicles) > 1
+            else (
+                f"Reply *YES* to continue with the "
+                f"{vehicles[0].get('label') if vehicles else 'vehicle'}, "
+                "or send fresh photos."
+            )
+        )
+    await send_text(wa_id, prompt)
+    return True
+
+
 async def process_session(wa_id):
+    keep_session = False
     try:
         await send_text(wa_id, "Analysing your claim. This takes about 30 seconds.")
 
@@ -268,10 +522,35 @@ async def process_session(wa_id):
         from main import analyse_claim  # deferred: main imports this module at startup
 
         payload = await analyse_claim(claim_id, doc_paths, photo_paths)
-        await send_text(wa_id, format_reply(payload))
+        reply = format_reply(payload)
+        vehicles = [
+            vehicle for vehicle in (payload.get("vehicles") or [])
+            if isinstance(vehicle, dict) and vehicle.get("status") == "claimable"
+        ]
+        has_duplicate_group = any(
+            isinstance(vehicle, dict) and vehicle.get("status") == "all_duplicate"
+            for vehicle in (payload.get("vehicles") or [])
+        )
+        needs_choice = (
+            payload.get("status") == "analysed"
+            and (
+                payload.get("claimable_count", len(vehicles)) > 1
+                or (len(vehicles) == 1 and has_duplicate_group)
+            )
+        )
+        if needs_choice:
+            session["pending_choice"] = {
+                "claim_id": payload.get("claim_id", claim_id),
+                "vehicles": vehicles,
+            }
+            session["pending_prompt"] = reply
+            session["updated"] = time.time()
+            keep_session = True
+        await send_text(wa_id, reply)
     except Exception:
         print("[whatsapp] process_session failed:", flush=True)
         traceback.print_exc()
         await send_text(wa_id, "Something went wrong processing your claim. Please try again.")
     finally:
-        SESSIONS.pop(wa_id, None)
+        if not keep_session:
+            SESSIONS.pop(wa_id, None)

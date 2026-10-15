@@ -392,6 +392,9 @@ async def handle_wa_message(message):
             else:
                 await _store_wa_media(wa_id, message_id, document, "docs", fallback_ext=".bin")
         elif message_type == "text":
+            text = (message.get("text") or {}).get("body") or ""
+            if await wa.handle_pending_choice(wa_id, text):
+                return
             session = get_session(wa_id)
             if session["photos"] or session["docs"]:
                 await process_session(wa_id)

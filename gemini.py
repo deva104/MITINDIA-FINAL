@@ -3,18 +3,17 @@ import os
 import traceback
 from pathlib import Path
 
-from dotenv import load_dotenv
+import fitz
 from PIL import Image
 from vision import generate_json
 
-load_dotenv()
-
 MAX_EDGE = 1568
 JPEG_QUALITY = 85
+MAX_PDF_PAGES = 8
+PDF_DPI = 150
 
-def _image_part(path):
-    data = Path(path).read_bytes()
 
+def _jpeg_image_part(data, path, page_number=None):
     # Anything past MAX_EDGE is downsampled by the model anyway - shrinking it here
     # cuts upload time without losing detail. The file on disk is untouched.
     with Image.open(io.BytesIO(data)) as image:
@@ -30,11 +29,36 @@ def _image_part(path):
         converted.save(buffer, format="JPEG", quality=JPEG_QUALITY)
         jpeg_bytes = buffer.getvalue()
         if converted.size != (width, height):
-            print(f"[gemini] {os.path.basename(path)}: {width}x{height} "
+            page_label = f" page {page_number}" if page_number is not None else ""
+            print(f"[gemini] {os.path.basename(path)}{page_label}: {width}x{height} "
                   f"{len(data) // 1024}KB -> {converted.width}x{converted.height} "
                   f"{len(jpeg_bytes) // 1024}KB", flush=True)
 
     return ("image", jpeg_bytes, "image/jpeg")
+
+
+def _image_part(path):
+    if Path(path).suffix.lower() == ".pdf":
+        image_parts = []
+        with fitz.open(path) as document:
+            page_count = document.page_count
+            if page_count > MAX_PDF_PAGES:
+                print(
+                    f"[gemini] {os.path.basename(path)}: {page_count} pages, "
+                    f"truncating to {MAX_PDF_PAGES}",
+                    flush=True,
+                )
+            for index in range(min(page_count, MAX_PDF_PAGES)):
+                png_bytes = document.load_page(index).get_pixmap(
+                    dpi=PDF_DPI,
+                    alpha=False,
+                ).tobytes("png")
+                image_parts.append(
+                    _jpeg_image_part(png_bytes, path, page_number=index + 1)
+                )
+        return image_parts
+
+    return _jpeg_image_part(Path(path).read_bytes(), path)
 
 
 def _generate(parts, label):
@@ -43,7 +67,7 @@ def _generate(parts, label):
 
 EXTRACT_PROMPT = """You are reading Indian motor insurance claim documents (claim form,
 Registration Certificate, Driving Licence, policy schedule).
-Extract these fields. Return JSON: {"fields":[{"name","value","source_doc","confidence"}]}
+Extract these fields. Return JSON: {"fields":[{"name","value","source_doc","confidence","status"}]}
 Field names to extract, exactly these keys:
   insured_name_claim_form, owner_name_rc, holder_name_dl,
   registration_number_claim_form, registration_number_rc,
@@ -53,6 +77,9 @@ Field names to extract, exactly these keys:
   accident_date, accident_time, accident_location, accident_description
 Dates in ISO format YYYY-MM-DD. source_doc = the filename it came from.
 confidence = 0.0 to 1.0.
+If a field's label appears on the document but the value is blank, illegible or cut off,
+return status 'unreadable'. If the field does not appear on this document type at all,
+return 'not_present'. Only use 'found' when you read an actual value.
 CRITICAL: if a field is not visible in any document, return it with
 value null and confidence 0. Never guess or infer a value."""
 
@@ -89,12 +116,44 @@ def extract_fields(doc_paths):
     try:
         parts = []
         for p in doc_paths:
-            parts.append(("text", f"Filename: {os.path.basename(p)}"))
-            parts.append(_image_part(p))
+            image_parts = _image_part(p)
+            if isinstance(image_parts, list):
+                with fitz.open(p) as document:
+                    page_count = document.page_count
+                for index, image_part in enumerate(image_parts, 1):
+                    parts.append((
+                        "text",
+                        (
+                            f"Filename: {os.path.basename(p)} "
+                            f"(page {index} of {page_count})"
+                        ),
+                    ))
+                    parts.append(image_part)
+            else:
+                parts.append(("text", f"Filename: {os.path.basename(p)}"))
+                parts.append(image_parts)
         parts.append(("text", EXTRACT_PROMPT))
         data = _generate(parts, f"extract_fields({len(doc_paths)} docs)")
         fields = data.get("fields", []) if isinstance(data, dict) else []
-        return fields if isinstance(fields, list) else []
+        if not isinstance(fields, list):
+            return []
+        normalised = []
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            entry = dict(field)
+            value = entry.get("value")
+            has_value = value is not None and str(value).strip().lower() not in NULL_WORDS
+            status = str(entry.get("status") or "").strip().lower()
+            if has_value:
+                entry["status"] = "found"
+            elif status in ("not_present", "unreadable"):
+                entry["status"] = status
+            else:
+                # If a provider omits status, do not claim the label was absent.
+                entry["status"] = "unreadable"
+            normalised.append(entry)
+        return normalised
     except Exception:
         print("[gemini] extract_fields failed:", flush=True)
         traceback.print_exc()

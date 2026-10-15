@@ -1,10 +1,13 @@
 import hashlib
 import io
 import os
+import re
+from datetime import datetime
 from pathlib import Path
 
 import imagehash
 from PIL import ExifTags, Image, ImageChops, ImageEnhance
+from rules import parse_date
 
 try:
     from pillow_heif import register_heif_opener
@@ -28,6 +31,10 @@ DUPLICATE_DISTANCE = 5
 EDITING_TOOLS = ["photoshop", "gimp", "lightroom", "snapseed", "picsart", "canva"]
 JPEG_EXTENSIONS = (".jpg", ".jpeg")
 NOT_APPLICABLE_DETAIL = "ELA requires JPEG input - PNG has no compression history to analyse"
+MISSING_EXIF_DETAIL = (
+    "capture time and location unavailable — image was re-encoded in transit "
+    "(normal for WhatsApp photos)"
+)
 
 
 def _result(check, verdict, detail, heatmap_url=None):
@@ -103,7 +110,7 @@ def extract_exif(image):
         raw_exif = None
 
     if not raw_exif:
-        return exif_data, ["No EXIF metadata found - could indicate a screenshot, re-saved, or scraped image"], None, None
+        return exif_data, [MISSING_EXIF_DETAIL], None, None
 
     # getexif() exposes only IFD0; the Exif sub-IFD (0x8769) holds capture tags
     # such as DateTimeOriginal, and GPS lives in its own sub-IFD (0x8825).
@@ -143,6 +150,41 @@ def extract_exif(image):
         notes.append("No GPS location embedded in image")
 
     return exif_data, notes, lat, lon
+
+
+def _field_value(fields, name):
+    for field in fields or []:
+        if isinstance(field, dict) and field.get("name") == name:
+            value = field.get("value")
+            return str(value).strip() if value is not None else None
+    return None
+
+
+def _capture_date(exif_data):
+    for key in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
+        value = exif_data.get(key)
+        if not value:
+            continue
+        try:
+            return datetime.strptime(value[:19], "%Y:%m:%d %H:%M:%S").date()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _claim_coordinates(value):
+    if not value:
+        return None
+    matches = re.findall(r"-?\d+(?:\.\d+)?", str(value))
+    if len(matches) < 2:
+        return None
+    try:
+        lat, lon = float(matches[0]), float(matches[1])
+    except ValueError:
+        return None
+    if -90 <= lat <= 90 and -180 <= lon <= 180:
+        return lat, lon
+    return None
 
 
 def check_duplicate(image, path, conn):
@@ -214,7 +256,7 @@ def check_duplicates(photo_paths, conn):
     return results
 
 
-def run_deep_forensics(photo_paths, conn=None):
+def run_deep_forensics(photo_paths, conn=None, fields=None):
     """ELA + EXIF. No duplicate check."""
     results = []
     try:
@@ -256,12 +298,44 @@ def run_deep_forensics(photo_paths, conn=None):
             # 2. EXIF
             try:
                 exif_data, notes, lat, lon = extract_exif(image)
-                segments = list(notes)
-                if lat is not None and lon is not None:
-                    segments.append(f"GPS {lat}, {lon}")
-                if not segments:
-                    segments = [f"{len(exif_data)} EXIF tags present, no editing software"]
-                entry = _result("exif", "suspicious" if notes else "clean", f"{name}: " + "; ".join(segments))
+                if not exif_data:
+                    verdict = "unverifiable"
+                    detail = MISSING_EXIF_DETAIL
+                else:
+                    accident_date, _ = parse_date(_field_value(fields, "accident_date"))
+                    capture_date = _capture_date(exif_data)
+                    if accident_date and capture_date and capture_date != accident_date:
+                        notes.append(
+                            f"Capture date {capture_date.isoformat()} conflicts with "
+                            f"claim accident date {accident_date.isoformat()}"
+                        )
+
+                    claim_coordinates = _claim_coordinates(
+                        _field_value(fields, "accident_location")
+                    )
+                    if (lat is not None and lon is not None and claim_coordinates
+                            and (abs(lat - claim_coordinates[0]) > 0.01
+                                 or abs(lon - claim_coordinates[1]) > 0.01)):
+                        notes.append(
+                            f"GPS {lat}, {lon} conflicts with claim location "
+                            f"{claim_coordinates[0]}, {claim_coordinates[1]}"
+                        )
+
+                    suspicious_notes = [
+                        note for note in notes
+                        if note.startswith("Editing software detected")
+                        or "conflicts with claim" in note
+                    ]
+                    verdict = "suspicious" if suspicious_notes else "clean"
+                    segments = list(notes)
+                    if lat is not None and lon is not None:
+                        segments.append(f"GPS {lat}, {lon}")
+                    if not segments:
+                        segments = [
+                            f"{len(exif_data)} EXIF tags present, no editing software"
+                        ]
+                    detail = f"{name}: " + "; ".join(segments)
+                entry = _result("exif", verdict, detail)
                 entry["lat"] = lat
                 entry["lon"] = lon
                 results.append(entry)

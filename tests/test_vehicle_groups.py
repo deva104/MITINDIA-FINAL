@@ -36,7 +36,7 @@ class VehicleGroupingTests(unittest.TestCase):
             get_conn=lambda: FakeConnection(),
             check_duplicates=lambda paths, conn: [],
             assess_damage=lambda paths: result,
-            run_deep_forensics=lambda paths, conn: [],
+            run_deep_forensics=lambda paths, conn, fields=None: [],
             save_claim=lambda claim_id, payload: None,
         ):
             return asyncio.run(

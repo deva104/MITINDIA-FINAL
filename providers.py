@@ -9,7 +9,7 @@ from google.genai import types
 from openai import OpenAI
 
 
-TEMPERATURE = 0.1
+TEMPERATURE = 0.0
 
 _groq_client = None
 _gemini_client = None

@@ -17,6 +17,10 @@ MODEL_ENV = {
     "groq": ("GROQ_VISION_MODEL", "qwen/qwen3.8-27b"),
     "gemini": ("GEMINI_VISION_MODEL", "gemini-3.6-flash"),
 }
+PROVIDER_MAX_IMAGES = {
+    "groq": 3,
+    "gemini": 16,
+}
 
 
 def _configured_providers():
@@ -30,6 +34,10 @@ def _configured_providers():
 def generate_json(parts, label) -> dict:
     providers = _configured_providers()
     last_error = None
+    image_count = sum(
+        isinstance(part, tuple) and len(part) == 3 and part[0] == "image"
+        for part in parts
+    )
 
     # Separate providers mean separate quota pools, so a 429 on one does not
     # affect the other.
@@ -38,16 +46,27 @@ def generate_json(parts, label) -> dict:
             call = PROVIDER_CALLS[provider]
             model_env, default_model = MODEL_ENV[provider]
             model = os.getenv(model_env, default_model)
+            max_images = PROVIDER_MAX_IMAGES[provider]
         except KeyError:
             last_error = ValueError(f"unsupported vision provider: {provider}")
         else:
-            for attempt in range(2):
-                try:
-                    return call(parts, model, label)
-                except Exception as error:
-                    last_error = error
-                    if attempt == 0:
-                        time.sleep(2)
+            if image_count > max_images:
+                last_error = ValueError(
+                    f"{provider} supports at most {max_images} images, got {image_count}"
+                )
+                print(
+                    f"[vision] {label}: skipping {provider}, {image_count} images "
+                    f"exceeds limit {max_images}",
+                    flush=True,
+                )
+            else:
+                for attempt in range(2):
+                    try:
+                        return call(parts, model, label)
+                    except Exception as error:
+                        last_error = error
+                        if attempt == 0:
+                            time.sleep(2)
 
         if provider_index + 1 < len(providers):
             next_provider = providers[provider_index + 1]

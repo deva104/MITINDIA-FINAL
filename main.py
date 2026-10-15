@@ -32,7 +32,7 @@ except ImportError:
     def check_duplicates(photo_paths, conn):
         return []
 
-    def run_deep_forensics(photo_paths, conn=None):
+    def run_deep_forensics(photo_paths, conn=None, fields=None):
         return []
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -292,7 +292,7 @@ async def analyse_claim(claim_id, doc_paths, photo_paths):
 
         # Stage 2 - ELA + EXIF
         mark = time.perf_counter()
-        deep = run_deep_forensics(clean_paths, conn)
+        deep = run_deep_forensics(clean_paths, conn, fields)
         stage_done("stage2_deep_forensics", mark)
 
         # Stage 3 - rules and estimate

@@ -1,7 +1,5 @@
 import re
-import string
 from datetime import date
-from difflib import SequenceMatcher
 
 # Seeded from published market service rates.
 # In production an insurer plugs in their own network rates.
@@ -51,6 +49,13 @@ SURVEY_REASON = (
 )
 
 NAME_FIELDS = ("insured_name_claim_form", "owner_name_rc", "holder_name_dl")
+HONORIFICS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR"}
+DATE_FIELDS = (
+    "dl_expiry_date",
+    "accident_date",
+    "policy_start_date",
+    "policy_end_date",
+)
 
 NARRATIVE_GROUPS = (
     (("front", "head-on", "head on", "frontal"),
@@ -72,25 +77,68 @@ def get_field(fields, name):
 
 
 def _norm_name(v):
-    v = (v or "").lower()
-    v = v.translate(str.maketrans("", "", string.punctuation))
-    return re.sub(r"\s+", " ", v).strip()
+    text = re.sub(r"[^A-Z0-9\s]", " ", str(v or "").upper())
+    tokens = [token for token in text.split() if token not in HONORIFICS]
+    return " ".join(tokens)
+
+
+def _token_compatible(a, b):
+    return a == b or (
+        (len(a) == 1 and b.startswith(a))
+        or (len(b) == 1 and a.startswith(b))
+    )
+
+
+def _names_match(a, b):
+    left = _norm_name(a).split()
+    right = _norm_name(b).split()
+    if not left or not right or left[-1] != right[-1]:
+        return False
+
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    available = list(longer[:-1])
+    for token in shorter[:-1]:
+        match = next(
+            (index for index, candidate in enumerate(available)
+             if _token_compatible(token, candidate)),
+            None,
+        )
+        if match is None:
+            return False
+        available.pop(match)
+    return True
 
 
 def _norm_reg(v):
     return re.sub(r"[\s\-]", "", (v or "")).upper()
 
 
-def _parse_date(v):
-    if not v:
-        return None
-    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", str(v).strip())
-    if not m:
-        return None
-    try:
-        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    except ValueError:
-        return None
+def parse_date(value):
+    if not value:
+        return None, False
+    text = str(value).strip()
+    formats = (
+        (r"^(\d{4})-(\d{2})-(\d{2})$", "ymd"),
+        (r"^(\d{2})-(\d{2})-(\d{4})$", "dmy"),
+        (r"^(\d{2})/(\d{2})/(\d{4})$", "dmy"),
+        (r"^(\d{4})/(\d{2})/(\d{2})$", "ymd"),
+    )
+    for pattern, order in formats:
+        match = re.match(pattern, text)
+        if not match:
+            continue
+        first, second, third = (int(part) for part in match.groups())
+        if order == "ymd":
+            year, month, day = first, second, third
+            ambiguous = False
+        else:
+            day, month, year = first, second, third
+            ambiguous = day <= 12 and month <= 12
+        try:
+            return date(year, month, day), ambiguous
+        except ValueError:
+            return None, False
+    return None, False
 
 
 def _part_group(part):
@@ -129,26 +177,34 @@ def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None
 
     # 1. name_mismatch
     names = {n: get_field(fields, n) for n in NAME_FIELDS}
-    if all(names[n] for n in NAME_FIELDS):
-        worst_ratio = 1.0
-        worst_pair = None
-        keys = list(NAME_FIELDS)
-        for i in range(len(keys)):
-            for j in range(i + 1, len(keys)):
-                r = SequenceMatcher(None, _norm_name(names[keys[i]]), _norm_name(names[keys[j]])).ratio()
-                if r < worst_ratio:
-                    worst_ratio = r
-                    worst_pair = (keys[i], keys[j])
-        if worst_ratio < 0.85:
-            a, b = worst_pair
+    present_names = [(name, value) for name, value in names.items() if value]
+    for index, (a, a_value) in enumerate(present_names):
+        for b, b_value in present_names[index + 1:]:
+            if not _names_match(a_value, b_value):
+                flags.append({
+                    "rule": "name_mismatch",
+                    "severity": "HIGH",
+                    "message": (
+                        f"Name on {a} ('{a_value}') does not match "
+                        f"{b} ('{b_value}')."
+                    ),
+                    "evidence": [a, b],
+                })
+
+    date_values = {name: get_field(fields, name) for name in DATE_FIELDS}
+    parsed_dates = {}
+    for field_name, raw_value in date_values.items():
+        parsed, _ = parse_date(raw_value)
+        parsed_dates[field_name] = parsed
+        if raw_value is not None and parsed is None:
             flags.append({
-                "rule": "name_mismatch",
-                "severity": "HIGH",
+                "rule": "date_undetermined",
+                "severity": "MEDIUM",
                 "message": (
-                    f"Name on {a} ('{names[a]}') does not match {b} ('{names[b]}') "
-                    f"- similarity {worst_ratio:.2f}, below the 0.85 threshold."
+                    f"Could not parse {field_name} value '{raw_value}'; "
+                    "date-dependent checks are undetermined."
                 ),
-                "evidence": list(NAME_FIELDS),
+                "evidence": [field_name],
             })
 
     # 2. registration_mismatch
@@ -166,8 +222,8 @@ def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None
         })
 
     # 3. dl_expired_at_loss
-    dl_exp = _parse_date(get_field(fields, "dl_expiry_date"))
-    acc_date = _parse_date(get_field(fields, "accident_date"))
+    dl_exp = parsed_dates["dl_expiry_date"]
+    acc_date = parsed_dates["accident_date"]
     if dl_exp and acc_date and dl_exp < acc_date:
         flags.append({
             "rule": "dl_expired_at_loss",
@@ -180,8 +236,8 @@ def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None
         })
 
     # 4. policy_not_active
-    p_start = _parse_date(get_field(fields, "policy_start_date"))
-    p_end = _parse_date(get_field(fields, "policy_end_date"))
+    p_start = parsed_dates["policy_start_date"]
+    p_end = parsed_dates["policy_end_date"]
     if acc_date and (p_start or p_end):
         if (p_start and acc_date < p_start) or (p_end and acc_date > p_end):
             flags.append({
@@ -281,12 +337,33 @@ def build_estimate(damage):
     if not isinstance(damage, list):
         damage = []
 
+    severity_order = {"minor": 1, "moderate": 2, "severe": 3}
+    by_part = {}
     for d in damage:
         if not isinstance(d, dict):
             continue
+        by_part.setdefault(d.get("part"), []).append(d)
+
+    # A panel is repaired or replaced once, regardless of how many damage types
+    # appear on it.
+    for part, reports in by_part.items():
+        d = max(
+            reports,
+            key=lambda item: severity_order.get(
+                str(item.get("severity") or "").strip().lower(),
+                0,
+            ),
+        )
         part = d.get("part")
         damage_type = d.get("damage_type")
         severity = d.get("severity")
+        also_reported = []
+        for report in reports:
+            if report is d:
+                continue
+            other_type = report.get("damage_type")
+            if other_type and other_type != damage_type and other_type not in also_reported:
+                also_reported.append(other_type)
         try:
             group = _part_group(str(part) if part is not None else "")
             sev = str(severity).strip().lower() if severity is not None else ""
@@ -298,6 +375,7 @@ def build_estimate(damage):
                 "part": part,
                 "damage_type": damage_type,
                 "severity": severity,
+                "also_reported": also_reported,
                 "reason": "no rate card entry",
             })
             continue
@@ -306,6 +384,7 @@ def build_estimate(damage):
             "part": part,
             "damage_type": damage_type,
             "severity": severity,
+            "also_reported": also_reported,
             "low": low,
             "high": high,
         })

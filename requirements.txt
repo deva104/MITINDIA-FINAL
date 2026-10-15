@@ -6,4 +6,5 @@ openai
 pillow
 pillow-heif
 imagehash
+pymupdf
 python-multipart

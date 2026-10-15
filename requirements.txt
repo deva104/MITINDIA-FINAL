@@ -2,6 +2,7 @@ fastapi
 uvicorn
 python-dotenv
 google-genai
+openai
 pillow
 pillow-heif
 imagehash

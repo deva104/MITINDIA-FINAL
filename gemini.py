@@ -57,12 +57,18 @@ CRITICAL: if a field is not visible in any document, return it with
 value null and confidence 0. Never guess or infer a value."""
 
 DAMAGE_PROMPT = """You are a motor insurance damage assessor. For each visible damaged part
-return JSON: {"is_vehicle":true,"vehicle_description":"<one short sentence>","photos":[{"source_photo","is_vehicle","make_model","colour","body_type","description"}],"damage":[{"part","damage_type","severity","confidence","reasoning","source_photo"}]}
+return JSON: {"is_vehicle":true,"vehicle_description":"<one short sentence>","photos":[{"source_photo","is_vehicle","vehicle_group","make_model","colour","body_type","description"}],"damage":[{"part","damage_type","severity","confidence","reasoning","source_photo"}]}
+Return ONE top-level JSON object in this shape, never an array or one object per vehicle.
+Put every vehicle group in the same photos array and every damage item in the same damage array.
 is_vehicle: false if the image does not show a motor vehicle (car, van, SUV, truck, two-wheeler). If false return empty damage.
 For EVERY photo provided, identify the vehicle separately: make and model if legible, dominant
 body colour as a simple word (white, black, silver, red, blue, grey), and body type (hatchback,
 sedan, SUV, van, truck, two-wheeler). Use null where you cannot tell. Report one entry per photo
 even if a photo shows no damage.
+Group the photos by vehicle. Photos of the SAME physical vehicle share a vehicle_group number,
+starting at 0. A different vehicle gets the next number. Judge by colour, body type, model,
+number plate and visible damage together — the same car photographed from two angles is ONE
+group. Photos that are not vehicles get vehicle_group null.
 source_photo MUST be the filename given for that photo.
 part MUST be one of: front_bumper, rear_bumper, bonnet, boot,
   front_left_door, front_right_door, rear_left_door, rear_right_door,
@@ -172,6 +178,12 @@ def _normalise_damage(items):
             if isinstance(value, str):
                 entry[key] = value.strip().lower()
         entry["part"] = _normalise_part(entry.get("part"))
+        source_photo = entry.get("source_photo")
+        entry["source_photo"] = (
+            os.path.basename(source_photo.strip())
+            if isinstance(source_photo, str) and source_photo.strip()
+            else None
+        )
         cleaned.append(entry)
     return cleaned
 
@@ -189,6 +201,18 @@ def _clean_text(value):
 def _clean_word(value):
     text = _clean_text(value)
     return text.lower() if text else None
+
+
+def _clean_vehicle_group(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        group = int(value)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    return group if group >= 0 else None
 
 
 def _normalise_photos(items, photo_paths):
@@ -214,9 +238,15 @@ def _normalise_photos(items, photo_paths):
             item = pool.pop(0)
         item = item or {}
         is_vehicle = item.get("is_vehicle")
+        is_vehicle = is_vehicle if isinstance(is_vehicle, bool) else None
         photos.append({
             "source_photo": os.path.basename(path),
-            "is_vehicle": is_vehicle if isinstance(is_vehicle, bool) else None,
+            "is_vehicle": is_vehicle,
+            "vehicle_group": (
+                _clean_vehicle_group(item.get("vehicle_group"))
+                if is_vehicle is not False
+                else None
+            ),
             "make_model": _clean_text(item.get("make_model")),
             "colour": _clean_word(item.get("colour")),
             "body_type": _clean_word(item.get("body_type")),
@@ -242,13 +272,16 @@ def assess_damage(photo_paths):
         is_vehicle = data.get("is_vehicle")
         if not isinstance(is_vehicle, bool):
             is_vehicle = None
+        photos = _normalise_photos(data.get("photos"), photo_paths)
         damage = data.get("damage", [])
-        if not isinstance(damage, list) or is_vehicle is False:
+        if (not isinstance(damage, list)
+                or (is_vehicle is False
+                    and not any(photo.get("is_vehicle") is True for photo in photos))):
             damage = []
         return {
             "is_vehicle": is_vehicle,
             "vehicle_description": str(data.get("vehicle_description") or ""),
-            "photos": _normalise_photos(data.get("photos"), photo_paths),
+            "photos": photos,
             "damage": _normalise_damage(damage),
             "error": None,
         }

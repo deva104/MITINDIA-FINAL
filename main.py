@@ -92,6 +92,106 @@ def demo_reset():
     return {"cleared": True}
 
 
+def build_vehicle_groups(photos, damage, excluded):
+    """Split photos, attributed damage, and estimates by model-assigned vehicle."""
+    photo_entries = [photo for photo in (photos or []) if isinstance(photo, dict)]
+    damage_items = [item for item in (damage or []) if isinstance(item, dict)]
+    excluded_names = [os.path.basename(str(name)) for name in (excluded or []) if name]
+    excluded_lookup = {name.lower() for name in excluded_names}
+
+    explicit_groups = []
+    pending_vehicle = []
+    pending_non_vehicle = []
+    for photo in photo_entries:
+        name = os.path.basename(str(photo.get("source_photo") or ""))
+        if not name:
+            continue
+        group = photo.get("vehicle_group")
+        if isinstance(group, int) and not isinstance(group, bool) and group >= 0:
+            explicit_groups.append((group, photo, name))
+        elif photo.get("is_vehicle") is False:
+            pending_non_vehicle.append((photo, name))
+        else:
+            pending_vehicle.append((photo, name))
+
+    grouped = {}
+    for group, photo, name in explicit_groups:
+        grouped.setdefault(group, []).append((photo, name))
+
+    next_group = max(grouped, default=-1) + 1
+    for pending in (pending_vehicle, pending_non_vehicle):
+        if pending:
+            grouped[next_group] = pending
+            next_group += 1
+
+    assigned_names = {
+        name.lower()
+        for entries in grouped.values()
+        for _, name in entries
+    }
+    unassigned_excluded = [
+        name for name in excluded_names if name.lower() not in assigned_names
+    ]
+    if unassigned_excluded:
+        grouped[next_group] = [
+            ({"is_vehicle": None}, name) for name in unassigned_excluded
+        ]
+
+    vehicles = []
+    for group in sorted(grouped):
+        entries = grouped[group]
+        group_photos = [name for _, name in entries]
+        group_lookup = {name.lower() for name in group_photos}
+        group_excluded = [
+            name for name in group_photos if name.lower() in excluded_lookup
+        ]
+        group_damage = [
+            item for item in damage_items
+            if os.path.basename(str(item.get("source_photo") or "")).lower() in group_lookup
+        ]
+
+        label_parts = []
+        for key in ("colour", "make_model", "body_type"):
+            value = next(
+                (
+                    str(photo.get(key)).strip()
+                    for photo, _ in entries
+                    if photo.get(key) is not None and str(photo.get(key)).strip()
+                ),
+                None,
+            )
+            if value:
+                label_parts.append(value)
+        if label_parts:
+            label = " ".join(
+                "SUV" if word.lower() == "suv" else word.title()
+                for word in " ".join(label_parts).split()
+            )
+        else:
+            label = f"Vehicle {group + 1}"
+
+        if entries and all(photo.get("is_vehicle") is False for photo, _ in entries):
+            status = "not_vehicle"
+        elif group_photos and len(group_excluded) == len(group_photos):
+            status = "all_duplicate"
+        elif any(name.lower() not in excluded_lookup for name in group_photos) and not group_damage:
+            status = "no_damage"
+        else:
+            status = "claimable"
+
+        vehicles.append({
+            "group": group,
+            "label": label,
+            "photos": group_photos,
+            "excluded_photos": group_excluded,
+            "damage": group_damage,
+            "estimate": build_estimate(group_damage),
+            "status": status,
+        })
+
+    return vehicles
+
+
 async def analyse_claim(claim_id, doc_paths, photo_paths):
     """Staged pipeline shared by the HTTP upload route and the WhatsApp webhook."""
     started = time.perf_counter()
@@ -105,7 +205,8 @@ async def analyse_claim(claim_id, doc_paths, photo_paths):
         print(f"[analyze] {claim_id} {name}: {elapsed:.2f}s", flush=True)
 
     def make_payload(status, stopped_at, fields=None, damage=None, forensics=None,
-                     flags=None, estimate=None, vehicle_description="", photos=None):
+                     flags=None, estimate=None, vehicle_description="", photos=None,
+                     vehicles=None, claimable_count=0):
         return {
             "claim_id": claim_id,
             "created_at": datetime.now().isoformat(),
@@ -120,6 +221,8 @@ async def analyse_claim(claim_id, doc_paths, photo_paths):
             "forensics": forensics or [],
             "flags": flags or [],
             "estimate": estimate if estimate is not None else build_estimate([]),
+            "vehicles": vehicles or [],
+            "claimable_count": claimable_count,
         }
 
     def finish(payload):
@@ -144,7 +247,9 @@ async def analyse_claim(claim_id, doc_paths, photo_paths):
         # Only a bundle with nothing left to assess is rejected outright. A claim
         # with at least one fresh photo is still worth analysing.
         if dup_paths and not clean_paths:
-            return finish(make_payload("rejected", "duplicate", forensics=dup))
+            vehicles = build_vehicle_groups([], [], excluded_photos)
+            return finish(make_payload("rejected", "duplicate", forensics=dup,
+                                       vehicles=vehicles))
 
         bundle_flags = []
         if dup_paths:
@@ -168,15 +273,22 @@ async def analyse_claim(claim_id, doc_paths, photo_paths):
 
         description = result.get("vehicle_description") or ""
         photos = result.get("photos") or []
+        raw_damage = result.get("damage") or []
+        vehicles = build_vehicle_groups(photos, raw_damage, excluded_photos)
+        claimable_count = sum(
+            vehicle.get("status") == "claimable" for vehicle in vehicles
+        )
         if result.get("error"):
             return finish(make_payload("error", "ai_unavailable", fields=fields, forensics=dup,
                                        flags=bundle_flags, vehicle_description=description,
-                                       photos=photos))
-        if result.get("is_vehicle") is False:
+                                       photos=photos, vehicles=vehicles,
+                                       claimable_count=claimable_count))
+        if (result.get("is_vehicle") is False
+                and not any(photo.get("is_vehicle") is True for photo in photos)):
             return finish(make_payload("rejected", "not_a_vehicle", fields=fields, forensics=dup,
                                        flags=bundle_flags, vehicle_description=description,
-                                       photos=photos))
-        damage = result.get("damage") or []
+                                       photos=photos, vehicles=vehicles,
+                                       claimable_count=claimable_count))
 
         # Stage 2 - ELA + EXIF
         mark = time.perf_counter()
@@ -185,14 +297,26 @@ async def analyse_claim(claim_id, doc_paths, photo_paths):
 
         # Stage 3 - rules and estimate
         mark = time.perf_counter()
+        primary_vehicle = next(
+            (vehicle for vehicle in vehicles if vehicle.get("status") == "claimable"),
+            None,
+        )
+        damage = list(primary_vehicle.get("damage") or []) if primary_vehicle else []
+        estimate = (
+            primary_vehicle.get("estimate")
+            if primary_vehicle
+            else build_estimate([])
+        )
         flags = bundle_flags + run_rules(fields, damage, photo_count=len(clean_paths),
-                                         is_vehicle=result.get("is_vehicle"), photos=photos)
-        estimate = build_estimate(damage)
+                                         is_vehicle=result.get("is_vehicle"), photos=photos,
+                                         vehicles=vehicles,
+                                         claimable_count=claimable_count)
         stage_done("stage3_rules", mark)
 
         return finish(make_payload("analysed", None, fields=fields, damage=damage,
                                    forensics=dup + deep, flags=flags, estimate=estimate,
-                                   vehicle_description=description, photos=photos))
+                                   vehicle_description=description, photos=photos,
+                                   vehicles=vehicles, claimable_count=claimable_count))
     finally:
         conn.close()
 

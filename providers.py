@@ -83,6 +83,8 @@ def call_groq(parts, model, label) -> dict:
             temperature=TEMPERATURE,
         )
         result = json.loads(_strip_fences(response.choices[0].message.content))
+        if not isinstance(result, dict):
+            raise ValueError(f"expected a JSON object, got {type(result).__name__}")
         elapsed = time.perf_counter() - started
         print(f"[vision] {label}: {elapsed:.2f}s via groq/{model}", flush=True)
         return result
@@ -106,6 +108,8 @@ def call_gemini(parts, model, label) -> dict:
             config=config,
         )
         result = json.loads(_strip_fences(response.text))
+        if not isinstance(result, dict):
+            raise ValueError(f"expected a JSON object, got {type(result).__name__}")
         elapsed = time.perf_counter() - started
         print(f"[vision] {label}: {elapsed:.2f}s via gemini/{model}", flush=True)
         return result

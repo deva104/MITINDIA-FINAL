@@ -33,6 +33,31 @@ SESSIONS = {}
 LAST_INBOUND = {}
 PROCESSED = set()
 _PROCESSED_ORDER = deque()
+ANALYSING_IDS = set()
+ANALYSIS_BUSY_REPLY = "Your claim is already being analysed."
+NEW_CLAIM_WHILE_BUSY = (
+    "Your previous claim is still being analysed — these photos will start a new claim."
+)
+CHOICE_CLEARED_REPLY = (
+    "The previous vehicle choice has been cleared. This photo starts a new claim. "
+    "Reply DONE when you are done."
+)
+ANALYSING_REPLY = "Analysing your claim. This takes a few seconds."
+ACCEPTED_MEDIA = (
+    "Send a photo of the damaged vehicle, or a photo or PDF of your claim documents."
+)
+UNSUPPORTED_REPLIES = {
+    "sticker": f"Stickers are not accepted. {ACCEPTED_MEDIA}",
+    "video": f"Videos are not accepted. {ACCEPTED_MEDIA}",
+    "audio": f"Voice notes are not accepted. {ACCEPTED_MEDIA}",
+    "voice": f"Voice notes are not accepted. {ACCEPTED_MEDIA}",
+    "location": f"Locations are not accepted. {ACCEPTED_MEDIA}",
+    "contacts": f"Contact cards are not accepted. {ACCEPTED_MEDIA}",
+}
+UNREADABLE_IMAGE_REPLY = (
+    "I could not read that photo. Please send a clear JPG, PNG, or HEIC photo "
+    "of the damaged vehicle."
+)
 
 
 def _auth_headers():
@@ -63,32 +88,69 @@ def last_inbound_at(wa_id):
     return LAST_INBOUND.get(str(wa_id)) if wa_id else None
 
 
+def _blank_session(now=None):
+    return {
+        "photos": [],
+        "docs": [],
+        "pending_choice": None,
+        "awaiting_docs": False,
+        "missing_docs": [],
+        "limit_notified": False,
+        "content_hashes": set(),
+        "analysing": False,
+        "next_photos": [],
+        "next_docs": [],
+        "next_hashes": set(),
+        "updated": time.time() if now is None else now,
+    }
+
+
 def get_session(wa_id):
     session = SESSIONS.get(wa_id)
     now = time.time()
     if (session is not None
+            and not session.get("analysing")
             and (session.get("pending_choice") or session.get("awaiting_docs"))
             and now - session.get("updated", 0) > PENDING_CHOICE_TIMEOUT):
         SESSIONS.pop(wa_id, None)
         session = None
     if session is None:
-        session = {
-            "photos": [],
-            "docs": [],
-            "pending_choice": None,
-            "awaiting_docs": False,
-            "missing_docs": [],
-            "limit_notified": False,
-            "updated": now,
-        }
+        session = _blank_session(now)
         SESSIONS[wa_id] = session
+    session.setdefault("content_hashes", set())
+    session.setdefault("next_photos", [])
+    session.setdefault("next_docs", [])
+    session.setdefault("next_hashes", set())
     return session
 
 
+def normalised_command(text):
+    value = str(text or "").strip().lower().replace("।", " ")
+    value = " ".join(value.split())
+    return value.strip(".,!?;:")
+
+
+def is_skip_command(text):
+    return normalised_command(text) == "skip"
+
+
 def remember_message(message_id):
-    """Returns True the first time a message id is seen, False on redelivery."""
+    """Returns True the first time a message id is seen, False on redelivery.
+
+    The id is stored in SQLite for 48 hours so a webhook redelivery after a
+    process restart cannot create a second claim.
+    """
     if not message_id or message_id in PROCESSED:
         return False
+    try:
+        from db import remember_processed_message
+
+        if not remember_processed_message(message_id):
+            PROCESSED.add(message_id)
+            return False
+    except Exception:
+        print("[whatsapp] processed-message store failed:", flush=True)
+        traceback.print_exc()
     PROCESSED.add(message_id)
     _PROCESSED_ORDER.append(message_id)
     while len(_PROCESSED_ORDER) > MAX_PROCESSED:
@@ -659,15 +721,12 @@ async def handle_pending_choice(wa_id, text):
         vehicle for vehicle in (pending.get("vehicles") or [])
         if isinstance(vehicle, dict)
     ]
-    answer = str(text or "").strip()
+    answer = normalised_command(text)
     selected = None
-    try:
-        number = int(answer)
-    except (TypeError, ValueError):
-        number = None
+    number = int(answer) if answer.isdigit() else None
     if number is not None and 1 <= number <= len(vehicles):
         selected = vehicles[number - 1]
-    elif answer.upper() in ("YES", "Y") and len(vehicles) == 1:
+    elif answer in ("yes", "y") and len(vehicles) == 1:
         selected = vehicles[0]
 
     if selected is not None:
@@ -682,7 +741,11 @@ async def handle_pending_choice(wa_id, text):
         )
         await send_text(wa_id, reply)
         session["pending_choice"] = None
-        SESSIONS.pop(wa_id, None)
+        session["pending_prompt"] = None
+        if session.get("photos") or session.get("docs"):
+            session["updated"] = time.time()
+        else:
+            SESSIONS.pop(wa_id, None)
         return True
 
     session["updated"] = time.time()
@@ -701,10 +764,32 @@ async def handle_pending_choice(wa_id, text):
     return True
 
 
+def _take_next_claim(session):
+    photos = list(session.get("next_photos") or [])
+    docs = list(session.get("next_docs") or [])
+    hashes = set(session.get("next_hashes") or [])
+    session["next_photos"] = []
+    session["next_docs"] = []
+    session["next_hashes"] = set()
+    if not photos and not docs:
+        return None
+    fresh = _blank_session()
+    fresh["photos"] = photos
+    fresh["docs"] = docs
+    fresh["content_hashes"] = hashes
+    return fresh
+
+
 async def process_session(wa_id, skip_missing=False):
+    if wa_id in ANALYSING_IDS:
+        await send_text(wa_id, ANALYSIS_BUSY_REPLY)
+        return
+    ANALYSING_IDS.add(wa_id)
     keep_session = False
     try:
-        session = SESSIONS.get(wa_id) or {}
+        session = SESSIONS.get(wa_id)
+        if session is None:
+            session = get_session(wa_id)
         intake = classify_session_intake(session)
         missing = list(intake.get("missing") or [])
         if not intake.get("vehicle_count"):
@@ -730,11 +815,15 @@ async def process_session(wa_id, skip_missing=False):
             )
 
         session["awaiting_docs"] = False
-        await send_text(wa_id, "Analysing your claim. This takes about 30 seconds.")
-
-        claim_id = "CLM-" + uuid.uuid4().hex[:8].upper()
         photo_paths = list(session.get("photos") or [])
         doc_paths = list(session.get("docs") or [])
+        session["analysing"] = True
+        session["next_photos"] = []
+        session["next_docs"] = []
+        session["next_hashes"] = set()
+        await send_text(wa_id, ANALYSING_REPLY)
+
+        claim_id = "CLM-" + uuid.uuid4().hex[:8].upper()
 
         # Registered here so the duplicate gate can write phash back against these rows,
         # exactly as the /api/analyze upload path does.
@@ -771,7 +860,15 @@ async def process_session(wa_id, skip_missing=False):
                 or (len(vehicles) == 1 and has_duplicate_group)
             )
         )
-        if needs_choice:
+        fresh = _take_next_claim(session)
+        if fresh is not None:
+            SESSIONS[wa_id] = fresh
+            keep_session = True
+        elif needs_choice:
+            session["analysing"] = False
+            session["photos"] = []
+            session["docs"] = []
+            session["content_hashes"] = set()
             session["pending_choice"] = {
                 "claim_id": payload.get("claim_id", claim_id),
                 "vehicles": vehicles,
@@ -788,5 +885,12 @@ async def process_session(wa_id, skip_missing=False):
         traceback.print_exc()
         await send_text(wa_id, "Something went wrong processing your claim. Please try again.")
     finally:
+        current = SESSIONS.get(wa_id)
+        if current is not None:
+            fresh = _take_next_claim(current)
+            if fresh is not None:
+                SESSIONS[wa_id] = fresh
+                keep_session = True
         if not keep_session:
             SESSIONS.pop(wa_id, None)
+        ANALYSING_IDS.discard(wa_id)

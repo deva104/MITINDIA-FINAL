@@ -452,7 +452,7 @@ class WhatsAppChecklistTests(unittest.IsolatedAsyncioTestCase):
 
         analyse.assert_awaited_once()
         self.assertEqual(sent.await_args_list[0].args[1], (
-            "Analysing your claim. This takes about 30 seconds."
+            "Analysing your claim. This takes a few seconds."
         ))
 
     async def test_image_limit_replies_once_and_keeps_eight(self):

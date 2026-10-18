@@ -230,6 +230,7 @@
   }
 
   function claimPill(c) {
+    if (c && c.status === 'error') return statusPill('error');
     if (!c || !c.decision) return statusPill(c && c.status);
     if (c.decision === 'auto_assess') return '<span class="pill pill-ok">auto-assessed</span>';
     if (c.decision === 'needs_review') return '<span class="pill pill-warn">needs review</span>';
@@ -283,7 +284,8 @@
   
     const status = p.status || 'unknown';
     const stopped = p.stopped_at || null;
-  
+    const escalated = status === 'error';
+
     /* verdict band */
     const band = $('verdict');
     const decision = p.decision || null;
@@ -292,9 +294,9 @@
       needs_review: 'is-error',
       reject: 'is-rejected'
     }[decision];
-    band.className = 'verdict ' + (decisionClass || (
+    band.className = 'verdict ' + (escalated ? 'is-error' : (decisionClass || (
       status === 'analysed' ? 'is-ok' : status === 'rejected' ? 'is-rejected' : 'is-error'
-    ));
+    )));
     $('verdictId').textContent = p.claim_id;
     const source = $('verdictSource');
     if (p.source === 'whatsapp') {
@@ -315,21 +317,21 @@
     }
   
     let title = 'Analysed \u2014 estimate ready', sub = '';
-    if (status === 'rejected' && stopped === 'duplicate') {
+    if (escalated) {
+      title = 'Analysis unavailable \u2014 escalated to human review';
+      sub = 'Automated assessment could not complete. A human assessor will review this claim.';
+    } else if (status === 'rejected' && stopped === 'duplicate') {
       title = 'Rejected \u2014 duplicate photo detected';
       sub = 'This image was already submitted with an earlier claim.';
     } else if (status === 'rejected' && stopped === 'not_a_vehicle') {
       title = 'Rejected \u2014 image is not a vehicle';
       sub = p.vehicle_description || 'The uploaded image does not show a motor vehicle.';
-    } else if (status === 'error') {
-      title = 'Analysis unavailable \u2014 escalated to human review';
-      sub = 'Automated assessment could not complete. A human assessor will review this claim.';
     } else if (p.estimate && p.estimate.requires_survey) {
       sub = 'Estimate exceeds the automated settlement threshold.';
     }
-    if (decision === 'auto_assess') {
+    if (!escalated && decision === 'auto_assess') {
       title = 'Auto-assessed';
-    } else if (decision === 'needs_review') {
+    } else if (!escalated && decision === 'needs_review') {
       title = 'Needs review';
       sub = list(p.decision_reasons)[0] || 'A human assessor should review this claim.';
     }

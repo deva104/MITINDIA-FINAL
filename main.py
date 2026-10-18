@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import os
 import time
@@ -40,13 +41,21 @@ from whatsapp import (
 )
 
 try:
-    from forensics import build_photo_url_map, check_duplicates, run_deep_forensics
+    from forensics import (
+        build_photo_url_map,
+        check_duplicates,
+        prepare_uploaded_image,
+        run_deep_forensics,
+    )
 except ImportError:
     def build_photo_url_map(photo_paths):
         return {}
 
     def check_duplicates(photo_paths, conn):
         return []
+
+    def prepare_uploaded_image(data):
+        return data or None
 
     def run_deep_forensics(photo_paths, conn=None, fields=None):
         return []
@@ -1031,9 +1040,47 @@ async def analyze(
     return await analyse_claim(claim_id, doc_paths, photo_paths)
 
 
+MIME_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+    "image/tif": ".tiff",
+    "application/pdf": ".pdf",
+}
+
+
+def _media_extension(media_obj, fallback):
+    filename = str((media_obj or {}).get("filename") or "")
+    extension = os.path.splitext(filename)[1].lower()
+    if extension:
+        return extension
+    mime = str((media_obj or {}).get("mime_type") or "").lower()
+    return MIME_EXTENSIONS.get(mime, fallback)
+
+
+def _is_image_media(media_obj, fallback_ext=""):
+    mime = str((media_obj or {}).get("mime_type") or "").lower()
+    extension = _media_extension(media_obj, fallback_ext).lower()
+    return mime.startswith("image/") or extension in IMAGE_EXTENSIONS
+
+
+def _photo_receipt(count):
+    return (
+        f"Photo received ({count} total). Reply DONE when you are done."
+    )
+
+
 async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".jpg"):
     session = get_session(wa_id)
-    if bucket == "photos" and len(session["photos"]) >= wa.MAX_IMAGES_PER_CLAIM:
+    media_obj = media_obj or {}
+    analysing = bool(session.get("analysing"))
+    active_photos = session["next_photos"] if analysing else session["photos"]
+    if bucket == "photos" and len(active_photos) >= wa.MAX_IMAGES_PER_CLAIM:
         if not session.get("limit_notified"):
             await send_text(
                 wa_id,
@@ -1044,35 +1091,87 @@ async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".j
         return
 
     data = await download_media(media_obj)
-    if not data:
+    if data is None:
         await send_text(wa_id, "I could not download that file. Please send it again.")
         return
 
+    extension = _media_extension(media_obj, fallback_ext)
+    if bucket == "photos":
+        digest = hashlib.sha256(data).hexdigest()
+        if digest in set(session.get("next_hashes") or []):
+            await send_text(wa_id, _photo_receipt(len(session.get("next_photos") or [])))
+            return
+        if digest in set(session.get("content_hashes") or []):
+            await send_text(wa_id, _photo_receipt(len(session.get("photos") or [])))
+            return
+        prepared = prepare_uploaded_image(data)
+        if prepared is None:
+            await send_text(wa_id, wa.UNREADABLE_IMAGE_REPLY)
+            return
+        if prepared is not data:
+            extension = ".jpg"
+            data = prepared
+    else:
+        digest = None
+
+    choice_cleared = False
+    if session.get("pending_choice") and not analysing:
+        session = wa._blank_session()
+        wa.SESSIONS[wa_id] = session
+        analysing = False
+        choice_cleared = True
+
     folder = os.path.join(UPLOAD_DIR, f"wa_{wa_id}")
     os.makedirs(folder, exist_ok=True)
-    ext = os.path.splitext(str(media_obj.get("filename") or ""))[1] or fallback_ext
-    dest = os.path.join(folder, f"{message_id}{ext}")
+    dest = os.path.join(folder, f"{message_id}{extension}")
     with open(dest, "wb") as fh:
         fh.write(data)
 
-    session[bucket].append(dest)
+    if analysing:
+        target = session["next_photos"] if bucket == "photos" else session["next_docs"]
+        hashes = session.setdefault("next_hashes", set())
+    else:
+        target = session[bucket]
+        hashes = session.setdefault("content_hashes", set())
+    target.append(dest)
+    if digest is not None:
+        hashes.add(digest)
     session["updated"] = time.time()
 
+    if choice_cleared:
+        if bucket == "photos":
+            await send_text(wa_id, wa.CHOICE_CLEARED_REPLY)
+        else:
+            await send_text(
+                wa_id,
+                "The previous vehicle choice has been cleared. This document starts a new claim. "
+                "Reply DONE when you are done.",
+            )
+        return
+    if analysing and bucket == "photos":
+        await send_text(wa_id, wa.NEW_CLAIM_WHILE_BUSY)
+        return
+    if analysing:
+        await send_text(
+            wa_id,
+            "Your previous claim is still being analysed — this document will start a new claim.",
+        )
+        return
     if bucket == "photos":
-        await send_text(
-            wa_id,
-            f"Photo received ({len(session['photos'])} total). Reply DONE when you are done.",
-        )
-    else:
-        await send_text(
-            wa_id,
-            f"Document received ({len(session['docs'])} total). Reply DONE when you are done.",
-        )
+        await send_text(wa_id, _photo_receipt(len(session["photos"])))
+        return
+    await send_text(
+        wa_id,
+        f"Document received ({len(session['docs'])} total). Reply DONE when you are done.",
+    )
 
 
 async def handle_wa_message(message):
     """Runs in the background so the webhook can answer immediately."""
+    wa_id = None
     try:
+        if not isinstance(message, dict):
+            return
         wa_id = message.get("from")
         if not wa_id:
             return
@@ -1084,8 +1183,14 @@ async def handle_wa_message(message):
             await _store_wa_media(wa_id, message_id, message.get("image") or {}, "photos")
         elif message_type == "document":
             document = message.get("document") or {}
-            if str(document.get("mime_type") or "").startswith("image/"):
-                await _store_wa_media(wa_id, message_id, document, "photos")
+            if _is_image_media(document):
+                await _store_wa_media(
+                    wa_id,
+                    message_id,
+                    document,
+                    "photos",
+                    fallback_ext=_media_extension(document, ".jpg"),
+                )
             else:
                 await _store_wa_media(wa_id, message_id, document, "docs", fallback_ext=".bin")
         elif message_type == "text":
@@ -1096,7 +1201,7 @@ async def handle_wa_message(message):
             if session["photos"] or session["docs"]:
                 await process_session(
                     wa_id,
-                    skip_missing=str(text).strip().upper() == "SKIP",
+                    skip_missing=wa.is_skip_command(text),
                 )
             else:
                 await send_text(
@@ -1105,11 +1210,25 @@ async def handle_wa_message(message):
                     "You can also attach the claim form, RC or driving licence. "
                     "Send any message when you are done and I will analyse it.",
                 )
+        elif message_type in wa.UNSUPPORTED_REPLIES:
+            await send_text(wa_id, wa.UNSUPPORTED_REPLIES[message_type])
         else:
-            await send_text(wa_id, "Please send a photo of the damaged vehicle to start a claim.")
+            await send_text(
+                wa_id,
+                "Please send a photo of the damaged vehicle to start a claim. "
+                + wa.ACCEPTED_MEDIA,
+            )
     except Exception:
         print("[whatsapp] handle_wa_message failed:", flush=True)
         traceback.print_exc()
+        if wa_id:
+            try:
+                await send_text(
+                    wa_id,
+                    "Something went wrong reading that message. Please send it again.",
+                )
+            except Exception:
+                traceback.print_exc()
 
 
 @app.get("/webhook")

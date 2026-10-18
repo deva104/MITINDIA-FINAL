@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import time
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +49,10 @@ def init_db():
             after_json  TEXT,
             reason      TEXT NOT NULL,
             created_at  TEXT
+        );
+        CREATE TABLE IF NOT EXISTS processed_messages (
+            message_id   TEXT PRIMARY KEY,
+            processed_at REAL
         );
         """
     )
@@ -235,6 +240,46 @@ def cache_put(content_hash, label, response, provider, model):
             ),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+PROCESSED_MESSAGE_TTL_SECONDS = 48 * 60 * 60
+
+
+def _ensure_processed_messages(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS processed_messages (
+            message_id   TEXT PRIMARY KEY,
+            processed_at REAL
+        )
+        """
+    )
+
+
+def remember_processed_message(message_id, now=None):
+    """Return True the first time a message id is stored within 48 hours."""
+    if not message_id:
+        return False
+    received_at = time.time() if now is None else float(now)
+    cutoff = received_at - PROCESSED_MESSAGE_TTL_SECONDS
+    conn = get_conn()
+    try:
+        _ensure_processed_messages(conn)
+        conn.execute(
+            "DELETE FROM processed_messages WHERE processed_at < ?",
+            (cutoff,),
+        )
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO processed_messages (message_id, processed_at)
+            VALUES (?, ?)
+            """,
+            (str(message_id), received_at),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
     finally:
         conn.close()
 

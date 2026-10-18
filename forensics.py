@@ -55,6 +55,34 @@ def _open_image(path):
     return data, image, hashlib.md5(data).hexdigest()[:10]
 
 
+MAX_STORED_EDGE = 2048
+MAX_STORED_BYTES = 8 * 1024 * 1024
+
+
+def prepare_uploaded_image(data):
+    """Return stored bytes, or None when the upload is not a readable image.
+
+    Bytes at or below the size and edge limits are returned unchanged so a
+    normal photo keeps the hash the duplicate gate already stored. Larger
+    uploads are downscaled to a JPEG before anything else opens them.
+    """
+    if not data:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+            width, height = image.size
+            if len(data) <= MAX_STORED_BYTES and max(width, height) <= 4096:
+                return data
+            converted = image.convert("RGB")
+            converted.thumbnail((MAX_STORED_EDGE, MAX_STORED_EDGE), Image.LANCZOS)
+            buffer = io.BytesIO()
+            converted.save(buffer, format="JPEG", quality=85)
+            return buffer.getvalue()
+    except Exception:
+        return None
+
+
 def _save_original(image, unique_id):
     image.convert("RGB").save(OUTPUT_DIR / f"{unique_id}_original.jpg", "JPEG")
     return f"/static_output/{unique_id}_original.jpg"

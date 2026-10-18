@@ -7,6 +7,13 @@ import fitz
 from PIL import Image
 from vision import generate_json
 
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:
+    print("[gemini] pillow_heif unavailable - HEIC/HEIF photos cannot be opened", flush=True)
+
 MAX_EDGE = 1568
 JPEG_QUALITY = 85
 MAX_PDF_PAGES = 8

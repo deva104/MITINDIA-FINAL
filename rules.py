@@ -407,7 +407,10 @@ def build_estimate(damage):
     for d in damage:
         if not isinstance(d, dict):
             continue
-        d["confirmed"] = _damage_confidence(d) >= 0.6
+        if not isinstance(d.get("confirmed"), bool):
+            d["confirmed"] = _damage_confidence(d) >= 0.6
+        if d.get("rejected") is True:
+            continue
         by_part.setdefault(d.get("part"), []).append(d)
 
     # A panel is repaired or replaced once, regardless of how many damage types
@@ -426,6 +429,7 @@ def build_estimate(damage):
             )
             rate = RATE_CARD.get((group, severity)) if group else None
             entry = {
+                "damage_id": report.get("damage_id"),
                 "part": report_part,
                 "damage_type": report.get("damage_type"),
                 "severity": report_severity,
@@ -481,6 +485,7 @@ def build_estimate(damage):
             continue
         low, high = rate
         line_items.append({
+            "damage_id": d.get("damage_id"),
             "part": part,
             "damage_type": damage_type,
             "severity": severity,

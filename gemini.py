@@ -247,6 +247,33 @@ def _normalise_damage(items):
     return cleaned
 
 
+def assign_damage_ids(photos, damage):
+    """Assign deterministic IDs, suffixing repeated group/part pairs in input order."""
+    photo_groups = {
+        os.path.basename(str(photo.get("source_photo") or "")).lower(): (
+            photo.get("vehicle_group")
+            if isinstance(photo.get("vehicle_group"), int)
+            and not isinstance(photo.get("vehicle_group"), bool)
+            else 0
+        )
+        for photo in (photos or [])
+        if isinstance(photo, dict)
+    }
+    counts = {}
+    for item in damage or []:
+        if not isinstance(item, dict):
+            continue
+        source = os.path.basename(str(item.get("source_photo") or "")).lower()
+        group = photo_groups.get(source, 0)
+        part = str(item.get("part") or "unknown_part")
+        base = f"{group}-{part}"
+        counts[base] = counts.get(base, 0) + 1
+        item["damage_id"] = (
+            base if counts[base] == 1 else f"{base}-{counts[base]}"
+        )
+    return damage
+
+
 NULL_WORDS = ("null", "none", "n/a", "na", "unknown", "not visible", "not legible")
 
 
@@ -337,11 +364,13 @@ def assess_damage(photo_paths):
                 or (is_vehicle is False
                     and not any(photo.get("is_vehicle") is True for photo in photos))):
             damage = []
+        normalised_damage = _normalise_damage(damage)
+        assign_damage_ids(photos, normalised_damage)
         return {
             "is_vehicle": is_vehicle,
             "vehicle_description": str(data.get("vehicle_description") or ""),
             "photos": photos,
-            "damage": _normalise_damage(damage),
+            "damage": normalised_damage,
             "error": None,
         }
     except Exception as e:

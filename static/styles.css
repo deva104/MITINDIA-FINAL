@@ -71,6 +71,13 @@ button{font-family:inherit}
   padding-left:12px;margin-left:4px;border-left:1px solid rgba(255,255,255,.18);
 }
 .topbar-actions{display:flex;align-items:center;gap:10px}
+.assessor-field{display:flex;align-items:center;gap:7px;color:rgba(255,255,255,.7);font-size:11px;font-weight:600}
+.assessor-field input{
+  width:132px;border:1px solid rgba(255,255,255,.28);border-radius:5px;
+  background:rgba(255,255,255,.1);color:#fff;padding:7px 9px;font:12px var(--sans);
+}
+.assessor-field input::placeholder{color:rgba(255,255,255,.45)}
+.assessor-field input:focus{outline:2px solid var(--sky);outline-offset:1px}
 .health{
   display:flex;align-items:center;gap:7px;
   color:rgba(255,255,255,.6);font-size:11px;font-weight:600;
@@ -98,6 +105,7 @@ button{font-family:inherit}
 .btn-sm{padding:7px 14px;font-size:13px}
 .btn-lg{padding:15px 40px;font-size:16px}
 .btn-sm.is-active{background:var(--blue);color:#fff}
+.override-control:disabled{opacity:.45;cursor:not-allowed}
 
 /* ---------- shared ---------- */
 .label{
@@ -209,6 +217,12 @@ button{font-family:inherit}
 }
 .verdict-title{font-size:34px;font-weight:800;letter-spacing:-.02em;margin:0;line-height:1.15}
 .verdict-sub{font-size:16px;color:rgba(255,255,255,.9);margin:10px 0 0;max-width:720px}
+.decision-actions{display:flex;gap:8px;margin-top:20px}
+.btn-verdict{
+  padding:8px 14px;border:1px solid rgba(255,255,255,.6);
+  color:#fff;background:rgba(255,255,255,.12);font-size:12px;
+}
+.btn-verdict:hover{background:#fff;color:var(--navy)}
 
 /* ---------- pipeline (overlaps verdict) ---------- */
 .gutter{padding:0 24px 40px}
@@ -286,7 +300,20 @@ button{font-family:inherit}
   padding:2px 7px;margin:4px 4px 0 0;
 }
 .vehicle-damage-row.is-unconfirmed{opacity:.65;font-style:italic}
+.vehicle-damage-row.is-rejected{opacity:.55;text-decoration:line-through}
 .unconfirmed-note{font-size:11px;color:var(--muted)}
+.damage-override-actions{
+  display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:7px;
+  text-decoration:none;font-style:normal;
+}
+.damage-override-actions select{
+  border:1px solid var(--line);border-radius:4px;background:#fff;color:var(--ink);
+  padding:5px 7px;font:11px var(--sans);
+}
+.damage-override-actions .btn{padding:5px 9px;font-size:11px}
+.btn-confirm{background:var(--teal);color:#fff}
+.btn-confirm.is-prominent{box-shadow:0 0 0 3px rgba(0,168,143,.16)}
+.btn-reject-damage{background:transparent;color:var(--danger);border:1px solid rgba(214,69,65,.5)}
 .vehicle-total{
   display:flex;align-items:center;justify-content:space-between;
   border-top:1px solid var(--line);margin-top:14px;padding-top:14px;
@@ -317,6 +344,7 @@ button{font-family:inherit}
 
 /* rows */
 .row{border:1px solid var(--line);border-radius:6px;padding:14px}
+.row.is-rejected{opacity:.6}
 .row-top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px}
 .row-title{font-size:15px;font-weight:700}
 .row-text{font-size:13px;color:var(--muted);margin:0;line-height:1.5}
@@ -347,6 +375,39 @@ button{font-family:inherit}
   border-radius:6px;padding:14px;font-size:13px;color:#8A5410;line-height:1.55;
 }
 .callout b{display:block;margin-bottom:4px;color:#7A4A0E}
+
+/* ---------- overrides and audit ---------- */
+.system-estimate{
+  color:var(--muted);font-family:var(--mono);font-size:12px;margin:-8px 0 16px;
+}
+.audit-card{margin-top:16px}
+.audit-trail{display:flex;flex-direction:column}
+.audit-row{display:grid;grid-template-columns:165px 1fr;gap:16px;padding:13px 0;border-bottom:1px solid var(--line)}
+.audit-row:last-child{border-bottom:0}
+.audit-time{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.audit-main{font-size:13px}
+.audit-main b{margin-right:6px}
+.audit-action{font-family:var(--mono);font-size:11px;color:var(--blue)}
+.audit-change{display:block;color:var(--muted);font-size:12px;margin:3px 0}
+.audit-reason{display:block;font-size:12px}
+.modal-backdrop{
+  position:fixed;inset:0;z-index:50;background:rgba(15,27,45,.58);
+  display:grid;place-items:center;padding:24px;
+}
+.modal{
+  width:min(520px,100%);background:var(--paper);border-radius:var(--r);
+  box-shadow:0 18px 50px rgba(15,27,45,.28);padding:26px;
+}
+.modal h2{font-size:22px;margin:0 0 8px}
+.modal p{font-size:13px;color:var(--muted);margin:0 0 18px}
+.modal-label{display:block;font-size:12px;font-weight:700;margin-bottom:6px}
+.modal textarea{
+  width:100%;resize:vertical;border:1px solid var(--line);border-radius:6px;
+  padding:11px;font:14px var(--sans);color:var(--ink);
+}
+.modal textarea:focus{outline:2px solid var(--blue);border-color:transparent}
+.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+.modal-error{color:var(--danger) !important;margin:8px 0 0 !important}
 
 @media (max-width:1180px){
   .grid{grid-template-columns:1fr}

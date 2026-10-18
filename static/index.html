@@ -21,6 +21,10 @@
       <span class="brand-tag">Motor claim assessment</span>
     </div>
     <div class="topbar-actions">
+      <label class="assessor-field">
+        <span>Assessor</span>
+        <input id="assessorName" type="text" maxlength="80" placeholder="Your name">
+      </label>
       <span class="health" id="health"><i></i><span>Checking</span></span>
       <button class="btn btn-ghost" id="btnNew">New claim</button>
       <button class="btn btn-outline" id="btnReset">Reset demo</button>
@@ -87,6 +91,11 @@
         </div>
         <h1 class="verdict-title" id="verdictTitle"></h1>
         <p class="verdict-sub" id="verdictSub"></p>
+        <div class="decision-actions" id="decisionActions">
+          <button class="btn btn-verdict override-control" data-action="set_decision" data-value="approved">Approve</button>
+          <button class="btn btn-verdict override-control" data-action="set_decision" data-value="rejected">Reject</button>
+          <button class="btn btn-verdict override-control" data-action="set_decision" data-value="more_info">Request info</button>
+        </div>
       </div>
 
       <div class="gutter">
@@ -139,10 +148,29 @@
             </div>
           </div>
         </div>
+        <div class="card audit-card hidden" id="auditCard">
+          <span class="label">Audit trail</span>
+          <div class="audit-trail" id="auditTrail"></div>
+        </div>
       </div>
     </section>
 
   </main>
+</div>
+
+<div class="modal-backdrop hidden" id="overrideModal" role="dialog" aria-modal="true" aria-labelledby="overrideModalTitle">
+  <div class="modal">
+    <span class="label">Operator override</span>
+    <h2 id="overrideModalTitle">Record override</h2>
+    <p id="overrideModalSummary"></p>
+    <label class="modal-label" for="overrideReason">Reason</label>
+    <textarea id="overrideReason" rows="4" placeholder="Required — explain why this override is justified"></textarea>
+    <p class="modal-error hidden" id="overrideError"></p>
+    <div class="modal-actions">
+      <button class="btn btn-outline" id="overrideCancel">Cancel</button>
+      <button class="btn btn-primary" id="overrideSubmit" disabled>Submit override</button>
+    </div>
+  </div>
 </div>
 
 <script src="app.js"></script>

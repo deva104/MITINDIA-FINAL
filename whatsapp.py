@@ -22,6 +22,7 @@ MAX_PROCESSED = 500
 PENDING_CHOICE_TIMEOUT = 30 * 60
 
 SESSIONS = {}
+LAST_INBOUND = {}
 PROCESSED = set()
 _PROCESSED_ORDER = deque()
 
@@ -39,6 +40,19 @@ def verify(mode, token, challenge):
     if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
         return challenge
     return None
+
+
+def record_inbound(wa_id, timestamp=None):
+    if wa_id:
+        try:
+            received_at = float(timestamp) if timestamp is not None else time.time()
+        except (TypeError, ValueError):
+            received_at = time.time()
+        LAST_INBOUND[str(wa_id)] = received_at
+
+
+def last_inbound_at(wa_id):
+    return LAST_INBOUND.get(str(wa_id)) if wa_id else None
 
 
 def get_session(wa_id):
@@ -128,9 +142,11 @@ async def send_text(to, body):
                 url, headers={**_auth_headers(), "Content-Type": "application/json"}, json=payload
             )
         print(f"[whatsapp] send_text -> {resp.status_code}: {resp.text[:300]}", flush=True)
+        return resp.is_success
     except Exception:
         print("[whatsapp] send_text failed:", flush=True)
         traceback.print_exc()
+        return False
 
 
 async def subscribe_app():

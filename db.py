@@ -38,6 +38,17 @@ def init_db():
             model         TEXT,
             created_at    TEXT
         );
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            claim_id    TEXT,
+            actor       TEXT,
+            action      TEXT,
+            target      TEXT,
+            before_json TEXT,
+            after_json  TEXT,
+            reason      TEXT NOT NULL,
+            created_at  TEXT
+        );
         """
     )
     conn.commit()
@@ -65,6 +76,88 @@ def save_file(claim_id, filename, kind, path):
     file_id = cur.lastrowid
     conn.close()
     return file_id
+
+
+def get_claim(claim_id):
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT payload_json FROM claims WHERE claim_id = ?",
+            (claim_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return json.loads(row["payload_json"])
+    finally:
+        conn.close()
+
+
+def _ensure_audit_log(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            claim_id    TEXT,
+            actor       TEXT,
+            action      TEXT,
+            target      TEXT,
+            before_json TEXT,
+            after_json  TEXT,
+            reason      TEXT NOT NULL,
+            created_at  TEXT
+        )
+        """
+    )
+
+
+def audit_log_add(
+    claim_id, actor, action, target, before, after, reason, created_at=None
+):
+    conn = get_conn()
+    try:
+        _ensure_audit_log(conn)
+        timestamp = created_at or datetime.now().isoformat()
+        cursor = conn.execute(
+            """
+            INSERT INTO audit_log (
+                claim_id, actor, action, target, before_json,
+                after_json, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                claim_id,
+                actor,
+                action,
+                target,
+                json.dumps(before, ensure_ascii=False) if before is not None else None,
+                json.dumps(after, ensure_ascii=False) if after is not None else None,
+                reason,
+                timestamp,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def audit_log_for_claim(claim_id):
+    conn = get_conn()
+    try:
+        _ensure_audit_log(conn)
+        rows = conn.execute(
+            """
+            SELECT id, claim_id, actor, action, target, before_json,
+                   after_json, reason, created_at
+            FROM audit_log
+            WHERE claim_id = ?
+            ORDER BY id ASC
+            """,
+            (claim_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
 
 
 def _ensure_vision_cache(conn):

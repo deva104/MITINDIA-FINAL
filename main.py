@@ -1,18 +1,30 @@
+import copy
+import json
 import os
 import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import List
+from typing import Any, List, Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-from db import get_conn, init_db, list_claims, save_claim, save_file
-from gemini import assess_damage, extract_fields
+from db import (
+    audit_log_add,
+    audit_log_for_claim,
+    get_claim,
+    get_conn,
+    init_db,
+    list_claims,
+    save_claim,
+    save_file,
+)
+from gemini import assign_damage_ids, assess_damage, extract_fields
 from rules import assess_confidence, build_estimate, run_rules
 from vision import fallbacks_used, reset_cache_tracking, stage_was_cached
 
@@ -65,6 +77,168 @@ def health():
     return {"ok": True}
 
 
+class OverrideRequest(BaseModel):
+    actor: Optional[str] = None
+    action: Optional[str] = None
+    target: Optional[str] = None
+    value: Any = None
+    reason: Optional[str] = None
+
+
+OVERRIDE_ACTIONS = {
+    "confirm_damage", "reject_damage", "set_severity", "set_decision",
+}
+SEVERITY_VALUES = {"minor", "moderate", "severe"}
+DECISION_VALUES = {"approved", "rejected", "more_info"}
+WHATSAPP_SERVICE_WINDOW_SECONDS = 24 * 60 * 60
+
+
+def _damage_fingerprint(item):
+    return tuple(
+        str(item.get(key) or "").strip().lower()
+        for key in (
+            "source_photo", "part", "damage_type", "severity", "reasoning",
+        )
+    )
+
+
+def _derive_legacy_damage_ids(payload):
+    """Add deterministic response-only IDs to claims saved before damage IDs."""
+    next_index = 0
+    available = {}
+    vehicles = [
+        vehicle for vehicle in (payload.get("vehicles") or [])
+        if isinstance(vehicle, dict)
+    ]
+
+    if vehicles:
+        for vehicle in vehicles:
+            for item in vehicle.get("damage") or []:
+                if not isinstance(item, dict):
+                    continue
+                if not item.get("damage_id"):
+                    item["damage_id"] = f"legacy-{next_index}"
+                    next_index += 1
+                available.setdefault(_damage_fingerprint(item), []).append(
+                    item["damage_id"]
+                )
+
+    used_flat = set()
+    for item in payload.get("damage") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("damage_id"):
+            used_flat.add(item["damage_id"])
+            continue
+        match = next(
+            (
+                damage_id
+                for damage_id in available.get(_damage_fingerprint(item), [])
+                if damage_id not in used_flat
+            ),
+            None,
+        )
+        if match is None:
+            match = f"legacy-{next_index}"
+            next_index += 1
+        item["damage_id"] = match
+        used_flat.add(match)
+    return payload
+
+
+def _public_audit_row(row):
+    public = dict(row)
+    for source, target in (("before_json", "before"), ("after_json", "after")):
+        try:
+            public[target] = json.loads(public[source]) if public.get(source) else None
+        except (TypeError, ValueError):
+            public[target] = None
+    return public
+
+
+def _apply_damage_overrides(damage, audit_rows):
+    effective = [
+        copy.deepcopy(item) for item in (damage or []) if isinstance(item, dict)
+    ]
+    by_id = {
+        item.get("damage_id"): item
+        for item in effective
+        if item.get("damage_id")
+    }
+    for row in audit_rows:
+        item = by_id.get(row.get("target"))
+        if not item:
+            continue
+        action = row.get("action")
+        after = row.get("after") or {}
+        if action == "confirm_damage":
+            item["confirmed"] = True
+            item["confirmed_by_override"] = True
+        elif action == "reject_damage":
+            item["rejected"] = True
+        elif action == "set_severity" and after.get("severity") in SEVERITY_VALUES:
+            item["severity"] = after["severity"]
+    return effective
+
+
+def _damage_catalog(payload, effective=False):
+    catalog = {}
+    vehicle_key = "effective_vehicles" if effective else "vehicles"
+    damage_key = "effective_damage" if effective else "damage"
+    for vehicle in payload.get(vehicle_key) or []:
+        if not isinstance(vehicle, dict):
+            continue
+        for item in vehicle.get("damage") or []:
+            if isinstance(item, dict) and item.get("damage_id"):
+                catalog[item["damage_id"]] = item
+    for item in payload.get(damage_key) or []:
+        if isinstance(item, dict) and item.get("damage_id"):
+            catalog.setdefault(item["damage_id"], item)
+    return catalog
+
+
+def build_claim_response(payload):
+    response = _derive_legacy_damage_ids(copy.deepcopy(payload))
+    audit_rows = [
+        _public_audit_row(row)
+        for row in audit_log_for_claim(response.get("claim_id"))
+    ]
+    response["overrides"] = audit_rows
+    response["effective_damage"] = _apply_damage_overrides(
+        response.get("damage"), audit_rows
+    )
+    response["effective_estimate"] = build_estimate(
+        response["effective_damage"]
+    )
+
+    effective_vehicles = []
+    for vehicle in response.get("vehicles") or []:
+        if not isinstance(vehicle, dict):
+            continue
+        effective_vehicle = copy.deepcopy(vehicle)
+        effective_vehicle["damage"] = _apply_damage_overrides(
+            vehicle.get("damage"), audit_rows
+        )
+        effective_vehicle["estimate"] = build_estimate(
+            effective_vehicle["damage"]
+        )
+        effective_vehicles.append(effective_vehicle)
+    response["effective_vehicles"] = effective_vehicles
+
+    response["final_decision"] = None
+    for row in audit_rows:
+        if row.get("action") != "set_decision":
+            continue
+        after = row.get("after") or {}
+        response["final_decision"] = {
+            "value": after.get("value"),
+            "actor": row.get("actor"),
+            "at": row.get("created_at"),
+            "reason": row.get("reason"),
+        }
+    return response
+
+
 @app.get("/api/claims")
 def claims():
     return list_claims()
@@ -72,21 +246,158 @@ def claims():
 
 @app.get("/api/claims/{claim_id}")
 def claim_detail(claim_id: str):
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT payload_json FROM claims WHERE claim_id = ?", (claim_id,)
-    ).fetchone()
-    conn.close()
-    if not row:
+    payload = get_claim(claim_id)
+    if payload is None:
         raise HTTPException(status_code=404, detail="claim not found")
-    import json
-    return json.loads(row["payload_json"])
+    return build_claim_response(payload)
+
+
+def _rupees(value):
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return "0"
+
+
+async def _notify_whatsapp_decision(
+    claim_id, payload, actor, decision, reason
+):
+    if payload.get("source") != "whatsapp":
+        return
+    wa_id = payload.get("from_number")
+    try:
+        last_inbound = wa.last_inbound_at(wa_id)
+        if (
+            not wa_id
+            or last_inbound is None
+            or time.time() - last_inbound > WHATSAPP_SERVICE_WINDOW_SECONDS
+        ):
+            audit_log_add(
+                claim_id,
+                actor,
+                "notification_not_sent",
+                "claim",
+                None,
+                {"channel": "whatsapp", "status": "not_sent"},
+                "notification not sent: outside 24h service window",
+            )
+            return
+
+        current = build_claim_response(payload)
+        estimate = current.get("effective_estimate") or {}
+        if decision == "approved":
+            message = (
+                f"*Claim {claim_id} approved* — "
+                f"Rs {_rupees(estimate.get('total_low'))} – "
+                f"Rs {_rupees(estimate.get('total_high'))}. "
+                "An assessor has reviewed your claim."
+            )
+        elif decision == "rejected":
+            message = f"*Claim {claim_id} not approved* — {reason.rstrip('.')}."
+        else:
+            message = (
+                f"*More information needed for {claim_id}* — "
+                f"{reason.rstrip('.')}.\n"
+                "Reply here with the requested photos or documents."
+            )
+
+        sent = await send_text(wa_id, message)
+        if sent:
+            audit_log_add(
+                claim_id,
+                actor,
+                "notification_sent",
+                "claim",
+                None,
+                {
+                    "channel": "whatsapp",
+                    "status": "sent",
+                    "message": message,
+                },
+                "customer notified inside 24h service window",
+            )
+        else:
+            audit_log_add(
+                claim_id,
+                actor,
+                "notification_not_sent",
+                "claim",
+                None,
+                {"channel": "whatsapp", "status": "delivery_failed"},
+                "notification not sent: WhatsApp delivery failed",
+            )
+    except Exception:
+        print(
+            f"[override] {claim_id}: WhatsApp notification failed",
+            flush=True,
+        )
+        traceback.print_exc()
+
+
+@app.post("/api/claims/{claim_id}/override")
+async def override_claim(claim_id: str, request: OverrideRequest):
+    actor = str(request.actor or "").strip()
+    action = str(request.action or "").strip()
+    target = str(request.target or "").strip()
+    reason = str(request.reason or "").strip()
+    if not actor:
+        raise HTTPException(status_code=400, detail="actor is required")
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason is required")
+    if action not in OVERRIDE_ACTIONS:
+        raise HTTPException(status_code=400, detail="invalid override action")
+
+    payload = get_claim(claim_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="claim not found")
+    current = build_claim_response(payload)
+
+    if action == "set_decision":
+        value = str(request.value or "").strip().lower()
+        if target != "claim":
+            raise HTTPException(status_code=400, detail="target must be claim")
+        if value not in DECISION_VALUES:
+            raise HTTPException(status_code=400, detail="invalid decision value")
+        before = (
+            current.get("final_decision")
+            or {"value": current.get("decision"), "source": "system"}
+        )
+        after = {"value": value}
+    else:
+        catalog = _damage_catalog(current, effective=True)
+        before_item = catalog.get(target)
+        if before_item is None:
+            raise HTTPException(
+                status_code=400, detail="target does not exist on this claim"
+            )
+        before = copy.deepcopy(before_item)
+        after = copy.deepcopy(before_item)
+        if action == "confirm_damage":
+            after["confirmed"] = True
+            after["confirmed_by_override"] = True
+        elif action == "reject_damage":
+            after["rejected"] = True
+        else:
+            value = str(request.value or "").strip().lower()
+            if value not in SEVERITY_VALUES:
+                raise HTTPException(status_code=400, detail="invalid severity value")
+            after["severity"] = value
+
+    audit_log_add(
+        claim_id, actor, action, target, before, after, reason
+    )
+    if action == "set_decision":
+        await _notify_whatsapp_decision(
+            claim_id, payload, actor, after["value"], reason
+        )
+    return build_claim_response(payload)
 
 
 @app.post("/api/demo/reset")
 def demo_reset():
     conn = get_conn()
     try:
+        conn.execute("DELETE FROM audit_log")
         conn.execute("DELETE FROM files")
         conn.execute("DELETE FROM claims")
         conn.commit()
@@ -444,6 +755,7 @@ async def analyse_claim(
         description = result.get("vehicle_description") or ""
         photos = result.get("photos") or []
         raw_damage = result.get("damage") or []
+        assign_damage_ids(photos, raw_damage)
         vehicles = build_vehicle_groups(
             photos, raw_damage, excluded_photos, photo_url_map
         )
@@ -552,6 +864,7 @@ async def handle_wa_message(message):
         wa_id = message.get("from")
         if not wa_id:
             return
+        wa.record_inbound(wa_id, message.get("timestamp"))
         message_id = message.get("id")
         message_type = message.get("type")
 

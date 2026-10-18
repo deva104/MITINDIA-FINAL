@@ -41,6 +41,8 @@
   
   const staged = { documents: [], photos: [] };
   let activeId = null;
+  let activeClaim = null;
+  let pendingOverride = null;
   
   /* ---------- helpers ---------- */
   const $ = id => document.getElementById(id);
@@ -96,6 +98,34 @@
 
   function list(value) {
     return Array.isArray(value) ? value : [];
+  }
+
+  function assessorName() {
+    return String($('assessorName').value || '').trim();
+  }
+
+  function loadAssessorName() {
+    try {
+      return localStorage.getItem('claimpilot.assessor') || '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function saveAssessorName(value) {
+    try {
+      localStorage.setItem('claimpilot.assessor', value);
+    } catch (e) {
+      /* The operator can still work when storage is blocked. */
+    }
+  }
+
+  function updateOverrideControls() {
+    const disabled = !assessorName();
+    document.querySelectorAll('.override-control').forEach(control => {
+      control.disabled = disabled;
+      control.title = disabled ? 'Enter an assessor name first' : '';
+    });
   }
 
   function whatsappBadge(p) {
@@ -233,6 +263,7 @@
   function render(p) {
     if (!p || !p.claim_id) return;
     activeId = p.claim_id;
+    activeClaim = p;
     show('viewClaim');
   
     const status = p.status || 'unknown';
@@ -287,6 +318,26 @@
       title = 'Needs review';
       sub = list(p.decision_reasons)[0] || 'A human assessor should review this claim.';
     }
+    const systemTitle = title;
+    const finalDecision = p.final_decision;
+    if (finalDecision && finalDecision.value) {
+      const finalLabels = {
+        approved: 'Approved',
+        rejected: 'Rejected',
+        more_info: 'More information requested'
+      };
+      const finalLabel = finalLabels[finalDecision.value] || human(finalDecision.value);
+      title = finalLabel;
+      const at = finalDecision.at ? new Date(finalDecision.at) : null;
+      const timeLabel = at && isFinite(at.getTime())
+        ? at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        : '';
+      sub = `System: ${systemTitle}  →  ${finalLabel} by ${finalDecision.actor || 'assessor'}${timeLabel ? ', ' + timeLabel : ''}`;
+      band.className = 'verdict ' + (
+        finalDecision.value === 'approved' ? 'is-ok'
+          : finalDecision.value === 'rejected' ? 'is-rejected' : 'is-error'
+      );
+    }
     $('verdictTitle').textContent = title;
     $('verdictSub').textContent = sub;
   
@@ -299,6 +350,8 @@
     renderFields(p);
     if (!list(p.vehicles).length) renderDamage(p);
     renderEstimate(p);
+    renderAudit(p);
+    updateOverrideControls();
     pollClaims();
   }
 
@@ -329,49 +382,86 @@
     return `<span class="pill ${config[0]}">${esc(config[1])}</span>`;
   }
 
+  function damageOverrideControls(item) {
+    if (!item || !item.damage_id) return '';
+    const confirmed = item.confirmed === true;
+    const rejected = item.rejected === true;
+    const confirm = !confirmed && !rejected
+      ? `<button class="btn btn-confirm is-prominent override-control"
+           data-action="confirm_damage" data-target="${esc(item.damage_id)}">Confirm</button>`
+      : '';
+    const reject = !rejected
+      ? `<button class="btn btn-reject-damage override-control"
+           data-action="reject_damage" data-target="${esc(item.damage_id)}">Reject</button>`
+      : '';
+    const options = ['minor', 'moderate', 'severe'].map(value =>
+      `<option value="${value}" ${value === item.severity ? 'selected' : ''}>${human(value)}</option>`
+    ).join('');
+    return `<div class="damage-override-actions">
+      ${confirm}${reject}
+      <select class="severity-override override-control"
+        data-action="set_severity" data-target="${esc(item.damage_id)}"
+        data-current="${esc(item.severity || 'moderate')}">${options}</select>
+    </div>`;
+  }
+
   function vehicleDamageRows(vehicle) {
     const estimate = vehicle.estimate || {};
-    const confirmed = list(estimate.line_items);
+    const damage = list(vehicle.damage);
+    const lines = list(estimate.line_items);
     const unconfirmed = list(estimate.unconfirmed);
     const unpriced = list(estimate.unpriced);
-    const confirmedHtml = confirmed.map(item => {
-      const also = list(item.also_reported).map(value =>
+    if (!damage.length) {
+      return '<p class="empty">No visible damage was detected for this vehicle.</p>';
+    }
+    return damage.map(item => {
+      const line = lines.find(value =>
+        value && (
+          (value.damage_id && value.damage_id === item.damage_id)
+          || (!value.damage_id && value.part === item.part)
+        )
+      );
+      const uncertain = unconfirmed.find(value =>
+        value && (
+          (value.damage_id && value.damage_id === item.damage_id)
+          || (!value.damage_id && value.part === item.part)
+        )
+      );
+      const manual = unpriced.some(value => value && value.part === item.part);
+      const also = list(line && line.also_reported).map(value =>
         `<span class="also-chip">also: ${esc(human(value).toLowerCase())}</span>`
       ).join('');
-      return `<div class="vehicle-damage-row">
+      let price = 'Included in panel price';
+      if (item.rejected) price = 'Excluded by assessor';
+      else if (line) price = `${rupee(line.low)} – ${rupee(line.high)}`;
+      else if (uncertain && uncertain.low != null) {
+        price = `${rupee(uncertain.low)} – ${rupee(uncertain.high)} indicative`;
+      } else if (manual) price = 'Manual pricing';
+      const classes = [
+        'vehicle-damage-row',
+        item.confirmed === false ? 'is-unconfirmed' : '',
+        item.rejected === true ? 'is-rejected' : ''
+      ].filter(Boolean).join(' ');
+      const note = item.rejected
+        ? 'rejected by assessor — not priced'
+        : item.confirmed === false ? 'unconfirmed — not priced' : '';
+      return `<div class="${classes}">
         <div>
           <div class="vehicle-damage-name">${esc(human(item.part))}</div>
           <div class="vehicle-damage-meta">${esc(human(item.damage_type))}${also ? `<div>${also}</div>` : ''}</div>
+          ${note ? `<div class="unconfirmed-note">${note}</div>` : ''}
+          ${damageOverrideControls(item)}
         </div>
         ${sevPill(item.severity)}
-        <span class="vehicle-damage-price">${rupee(item.low)} – ${rupee(item.high)}</span>
+        <span class="vehicle-damage-price">${price}</span>
       </div>`;
     }).join('');
-    const unconfirmedHtml = unconfirmed.map(item => `
-      <div class="vehicle-damage-row is-unconfirmed">
-        <div>
-          <div class="vehicle-damage-name">${esc(human(item.part))}</div>
-          <div class="vehicle-damage-meta">${esc(human(item.damage_type))}</div>
-          <div class="unconfirmed-note">unconfirmed — not priced</div>
-        </div>
-        ${sevPill(item.severity)}
-        <span class="vehicle-damage-price">${rupee(item.low)} – ${rupee(item.high)} indicative</span>
-      </div>`).join('');
-    const unpricedHtml = unpriced.map(item => `
-      <div class="vehicle-damage-row">
-        <div>
-          <div class="vehicle-damage-name">${esc(human(item.part))}</div>
-          <div class="vehicle-damage-meta">${esc(human(item.damage_type))}</div>
-        </div>
-        ${sevPill(item.severity)}
-        <span class="vehicle-damage-price">Manual pricing</span>
-      </div>`).join('');
-    return confirmedHtml + unconfirmedHtml + unpricedHtml ||
-      '<p class="empty">No visible damage was detected for this vehicle.</p>';
   }
 
   function renderVehicles(p) {
-    const vehicles = list(p.vehicles).filter(v => v && typeof v === 'object');
+    const vehicles = list(p.effective_vehicles).length
+      ? list(p.effective_vehicles).filter(v => v && typeof v === 'object')
+      : list(p.vehicles).filter(v => v && typeof v === 'object');
     const section = $('vehicles');
     const banner = $('multiVehicle');
     const legacyDamage = $('damageCard');
@@ -561,28 +651,38 @@
   }
   
   function renderDamage(p) {
-    const dmg = Array.isArray(p.damage) ? p.damage : [];
+    const dmg = Array.isArray(p.effective_damage)
+      ? p.effective_damage : list(p.damage);
     if (!dmg.length) {
       $('damage').innerHTML = '<p class="empty">No visible damage was detected.</p>';
       return;
     }
-    const lines = (p.estimate && Array.isArray(p.estimate.line_items)) ? p.estimate.line_items : [];
+    const effectiveEstimate = p.effective_estimate || p.estimate || {};
+    const lines = list(effectiveEstimate.line_items);
     $('damage').innerHTML = dmg.map(d => {
-      const li = lines.find(l => l && l.part === d.part);
-      const price = li ? `<span class="row-price">${rupee(li.low)} \u2013 ${rupee(li.high)}</span>` : '';
-      return `<div class="row">
+      const li = lines.find(l => l && (
+        (l.damage_id && l.damage_id === d.damage_id)
+        || (!l.damage_id && l.part === d.part)
+      ));
+      const price = d.rejected
+        ? '<span class="row-price">Excluded by assessor</span>'
+        : li ? `<span class="row-price">${rupee(li.low)} \u2013 ${rupee(li.high)}</span>` : '';
+      return `<div class="row ${d.rejected ? 'is-rejected' : ''}">
         <div class="row-top"><span class="row-title">${esc(human(d.part))}</span>${sevPill(d.severity)}</div>
         <p class="row-text">${esc(human(d.damage_type))} \u00B7 confidence ${esc(confText(d.confidence))}</p>
-        <p class="row-text">${esc(d.reasoning || '')}</p>${price}</div>`;
+        <p class="row-text">${esc(d.reasoning || '')}</p>
+        ${damageOverrideControls(d)}${price}</div>`;
     }).join('');
   }
   
   function renderEstimate(p) {
-    const e = p.estimate || {};
+    const e = p.effective_estimate || p.estimate || {};
+    const systemEstimate = p.estimate || {};
     const lines = Array.isArray(e.line_items) ? e.line_items : [];
     const unconfirmedItems = list(e.unconfirmed);
   
-    if (!lines.length && !e.total_high && !unconfirmedItems.length) {
+    if (!lines.length && !e.total_high && !unconfirmedItems.length
+        && !list(p.effective_damage).length && !list(p.damage).length) {
       $('estimate').innerHTML = '<p class="empty">No estimate — this claim did not reach assessment.</p>';
       return;
     }
@@ -604,12 +704,123 @@
     const indicativeLine = unconfirmedItems.length
       ? `<p class="est-indicative">+ ${rupee(indicative.low)} – ${rupee(indicative.high)} indicative, unconfirmed</p>`
       : '';
+    const differs = Number(e.total_low || 0) !== Number(systemEstimate.total_low || 0)
+      || Number(e.total_high || 0) !== Number(systemEstimate.total_high || 0);
+    const systemLine = differs
+      ? `<p class="system-estimate">system estimate Rs ${Number(systemEstimate.total_low || 0).toLocaleString('en-IN')} – Rs ${Number(systemEstimate.total_high || 0).toLocaleString('en-IN')}</p>`
+      : '';
   
     $('estimate').innerHTML = `
       <div class="est-total">${headline}</div>
       <p class="est-caption">${e.total_high ? 'Estimated repair cost range' : 'Confirmed findings only'}</p>
+      ${systemLine}
       ${indicativeLine}
       <div class="est-lines">${body}</div>${unpriced}${survey}`;
+  }
+
+  function auditState(row, state) {
+    state = state || {};
+    const action = String(row.action || '');
+    if (action === 'set_severity') return human(state.severity || 'unknown');
+    if (action === 'confirm_damage') return state.confirmed ? 'confirmed' : 'unconfirmed';
+    if (action === 'reject_damage') return state.rejected ? 'rejected' : 'included';
+    if (action === 'set_decision') return human(state.value || 'none');
+    if (action.startsWith('notification_')) return human(state.status || 'pending');
+    return JSON.stringify(state);
+  }
+
+  function renderAudit(p) {
+    const rows = list(p.overrides).filter(row => row && typeof row === 'object');
+    const card = $('auditCard');
+    if (!rows.length) {
+      card.classList.add('hidden');
+      $('auditTrail').innerHTML = '';
+      return;
+    }
+    $('auditTrail').innerHTML = rows.map(row => {
+      const date = row.created_at ? new Date(row.created_at) : null;
+      const timestamp = date && isFinite(date.getTime())
+        ? date.toLocaleString() : (row.created_at || '');
+      return `<div class="audit-row">
+        <span class="audit-time">${esc(timestamp)}</span>
+        <div class="audit-main">
+          <b>${esc(row.actor || 'System')}</b>
+          <span class="audit-action">${esc(human(row.action))} · ${esc(row.target || 'claim')}</span>
+          <span class="audit-change">${esc(auditState(row, row.before))} → ${esc(auditState(row, row.after))}</span>
+          <span class="audit-reason">${esc(row.reason || '')}</span>
+        </div>
+      </div>`;
+    }).join('');
+    card.classList.remove('hidden');
+  }
+
+  function openOverride(action, target, value) {
+    if (!activeClaim || !assessorName()) return;
+    const labels = {
+      confirm_damage: 'Confirm damage finding',
+      reject_damage: 'Reject damage finding',
+      set_severity: `Set severity to ${human(value)}`,
+      set_decision: {
+        approved: 'Approve claim',
+        rejected: 'Reject claim',
+        more_info: 'Request more information'
+      }[value]
+    };
+    pendingOverride = { action, target, value };
+    $('overrideModalTitle').textContent = labels[action] || 'Record override';
+    $('overrideModalSummary').textContent =
+      `This will be layered over the system assessment for ${activeClaim.claim_id}.`;
+    $('overrideReason').value = '';
+    $('overrideError').textContent = '';
+    $('overrideError').classList.add('hidden');
+    $('overrideSubmit').disabled = true;
+    $('overrideModal').classList.remove('hidden');
+    $('overrideReason').focus();
+  }
+
+  function closeOverride() {
+    pendingOverride = null;
+    $('overrideModal').classList.add('hidden');
+  }
+
+  async function submitOverride() {
+    if (!pendingOverride || !activeClaim) return;
+    const reason = $('overrideReason').value.trim();
+    if (!reason) return;
+    const button = $('overrideSubmit');
+    button.disabled = true;
+    $('overrideError').classList.add('hidden');
+    try {
+      const r = await fetch(
+        'api/claims/' + encodeURIComponent(activeClaim.claim_id) + '/override',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            actor: assessorName(),
+            action: pendingOverride.action,
+            target: pendingOverride.target,
+            value: pendingOverride.value,
+            reason
+          })
+        }
+      );
+      if (!r.ok) {
+        let message = 'HTTP ' + r.status;
+        try {
+          const body = await r.json();
+          message = body.detail || message;
+        } catch (e) {}
+        throw new Error(message);
+      }
+      const updated = await r.json();
+      closeOverride();
+      render(updated);
+    } catch (e) {
+      $('overrideError').textContent = e.message || 'Override failed';
+      $('overrideError').classList.remove('hidden');
+      button.disabled = false;
+    }
   }
   
   /* ---------- upload ---------- */
@@ -697,13 +908,50 @@
   
   /* ---------- boot ---------- */
   document.querySelectorAll('.drop').forEach(wireDrop);
+  $('assessorName').value = loadAssessorName();
+  $('assessorName').addEventListener('input', event => {
+    saveAssessorName(event.target.value);
+    updateOverrideControls();
+  });
+  document.addEventListener('click', event => {
+    const control = event.target.closest('button[data-action]');
+    if (!control || control.disabled) return;
+    openOverride(
+      control.dataset.action,
+      control.dataset.target || 'claim',
+      control.dataset.value || null
+    );
+  });
+  document.addEventListener('change', event => {
+    const control = event.target.closest('select.severity-override');
+    if (!control || control.disabled) return;
+    const value = control.value;
+    control.value = control.dataset.current;
+    openOverride(control.dataset.action, control.dataset.target, value);
+  });
+  $('overrideReason').addEventListener('input', event => {
+    $('overrideSubmit').disabled = !event.target.value.trim();
+  });
+  $('overrideCancel').onclick = closeOverride;
+  $('overrideSubmit').onclick = submitOverride;
+  $('overrideModal').addEventListener('click', event => {
+    if (event.target === $('overrideModal')) closeOverride();
+  });
+  updateOverrideControls();
   $('btnAnalyse').onclick = analyse;
-  $('btnNew').onclick = () => { activeId = null; resetStaged(); show('viewUpload'); pollClaims(); };
+  $('btnNew').onclick = () => {
+    activeId = null;
+    activeClaim = null;
+    resetStaged();
+    show('viewUpload');
+    pollClaims();
+  };
   $('btnReset').onclick = async () => {
     if (!confirm('Clear all claims and stored photo hashes?')) return;
     try {
       await fetch('api/demo/reset', { method: 'POST' });
       activeId = null;
+      activeClaim = null;
       resetStaged();
       show('viewUpload');
       pollClaims();

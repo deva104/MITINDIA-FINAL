@@ -3,23 +3,31 @@ import time
 
 from dotenv import load_dotenv
 
-from providers import call_gemini, call_groq
+from providers import call_gemini, call_groq, call_openrouter
 
 
 load_dotenv()
 
-DEFAULT_PROVIDERS = "groq,gemini"
+DEFAULT_PROVIDERS = "groq,gemini,openrouter"
 PROVIDER_CALLS = {
     "groq": call_groq,
     "gemini": call_gemini,
+    "openrouter": call_openrouter,
 }
 MODEL_ENV = {
     "groq": ("GROQ_VISION_MODEL", "qwen/qwen3.8-27b"),
     "gemini": ("GEMINI_VISION_MODEL", "gemini-3.6-flash"),
+    "openrouter": (
+        "OPENROUTER_VISION_MODEL",
+        "nvidia/nemotron-3.5-super-vl:free",
+    ),
 }
 PROVIDER_MAX_IMAGES = {
     "groq": 3,
     "gemini": 16,
+    # The live endpoint accepted a 16-image JSON-mode probe. This exceeds the
+    # application's eight-page PDF cap without claiming an undocumented maximum.
+    "openrouter": 16,
 }
 
 

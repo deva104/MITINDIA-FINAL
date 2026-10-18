@@ -13,6 +13,7 @@ TEMPERATURE = 0.0
 
 _groq_client = None
 _gemini_client = None
+_openrouter_client = None
 
 
 def _strip_fences(text):
@@ -39,6 +40,22 @@ def _get_gemini_client():
     if _gemini_client is None:
         _gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
     return _gemini_client
+
+
+def _get_openrouter_client():
+    global _openrouter_client
+    if _openrouter_client is None:
+        api_key = os.environ["OPENROUTER_API_KEY"]
+        _openrouter_client = OpenAI(
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={
+                "Authorization": f"Bearer {api_key}",
+                "HTTP-Referer": "ClaimPilot",
+                "X-Title": "ClaimPilot",
+            },
+        )
+    return _openrouter_client
 
 
 def _openai_content(parts):
@@ -116,5 +133,33 @@ def call_gemini(parts, model, label) -> dict:
     except Exception:
         elapsed = time.perf_counter() - started
         print(f"[vision] {label}: failed after {elapsed:.2f}s via gemini/{model}", flush=True)
+        traceback.print_exc()
+        raise
+
+
+def call_openrouter(parts, model, label) -> dict:
+    started = time.perf_counter()
+    try:
+        response = _get_openrouter_client().chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": _openai_content(parts)}],
+            response_format={"type": "json_object"},
+            temperature=TEMPERATURE,
+        )
+        result = json.loads(_strip_fences(response.choices[0].message.content))
+        if not isinstance(result, dict):
+            raise ValueError(f"expected a JSON object, got {type(result).__name__}")
+        elapsed = time.perf_counter() - started
+        print(
+            f"[vision] {label}: {elapsed:.2f}s via openrouter/{model}",
+            flush=True,
+        )
+        return result
+    except Exception:
+        elapsed = time.perf_counter() - started
+        print(
+            f"[vision] {label}: failed after {elapsed:.2f}s via openrouter/{model}",
+            flush=True,
+        )
         traceback.print_exc()
         raise

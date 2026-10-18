@@ -1,8 +1,11 @@
+import hashlib
 import os
 import time
+from contextvars import ContextVar
 
 from dotenv import load_dotenv
 
+from db import cache_get, cache_put
 from providers import call_gemini, call_groq, call_openrouter
 
 
@@ -29,6 +32,57 @@ PROVIDER_MAX_IMAGES = {
     # application's eight-page PDF cap without claiming an undocumented maximum.
     "openrouter": 16,
 }
+_CACHE_EVENTS = ContextVar("vision_cache_events", default=())
+
+
+def reset_cache_tracking():
+    _CACHE_EVENTS.set(())
+
+
+def stage_was_cached():
+    events = _CACHE_EVENTS.get()
+    return bool(events) and all(events)
+
+
+def _record_cache_event(cached):
+    _CACHE_EVENTS.set(_CACHE_EVENTS.get() + (bool(cached),))
+
+
+def _cache_enabled():
+    return os.getenv("CACHE_ENABLED", "true").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def _model_for(provider):
+    model_env, default_model = MODEL_ENV[provider]
+    return os.getenv(model_env, default_model)
+
+
+def _content_hash(parts, label, first_provider, first_model):
+    digest = hashlib.sha256()
+
+    def add(value):
+        data = value if isinstance(value, bytes) else str(value).encode("utf-8")
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+
+    add(label)
+    add(first_provider)
+    add(first_model)
+    for part in parts:
+        if not isinstance(part, tuple) or not part:
+            raise ValueError(f"invalid provider-neutral part: {part!r}")
+        if part[0] == "text" and len(part) == 2:
+            add("text")
+            add(part[1])
+        elif part[0] == "image" and len(part) == 3:
+            add("image")
+            add(part[2])
+            add(part[1])
+        else:
+            raise ValueError(f"invalid provider-neutral part: {part!r}")
+    return digest.hexdigest()
 
 
 def _configured_providers():
@@ -42,6 +96,29 @@ def _configured_providers():
 def generate_json(parts, label) -> dict:
     providers = _configured_providers()
     last_error = None
+    first_provider = providers[0]
+    try:
+        first_model = _model_for(first_provider)
+    except KeyError:
+        first_model = f"unsupported:{first_provider}"
+    content_hash = _content_hash(parts, label, first_provider, first_model)
+    use_cache = _cache_enabled()
+    if use_cache:
+        try:
+            cached = cache_get(content_hash)
+        except Exception as error:
+            print(f"[vision] {label}: cache read failed: {error}", flush=True)
+            cached = None
+        if cached is not None:
+            _record_cache_event(True)
+            print(
+                f"[vision] {label}: cache hit "
+                f"({cached['provider']}/{cached['model']})",
+                flush=True,
+            )
+            return cached["response"]
+    _record_cache_event(False)
+
     image_count = sum(
         isinstance(part, tuple) and len(part) == 3 and part[0] == "image"
         for part in parts
@@ -52,8 +129,7 @@ def generate_json(parts, label) -> dict:
     for provider_index, provider in enumerate(providers):
         try:
             call = PROVIDER_CALLS[provider]
-            model_env, default_model = MODEL_ENV[provider]
-            model = os.getenv(model_env, default_model)
+            model = _model_for(provider)
             max_images = PROVIDER_MAX_IMAGES[provider]
         except KeyError:
             last_error = ValueError(f"unsupported vision provider: {provider}")
@@ -70,11 +146,27 @@ def generate_json(parts, label) -> dict:
             else:
                 for attempt in range(2):
                     try:
-                        return call(parts, model, label)
+                        response = call(parts, model, label)
                     except Exception as error:
                         last_error = error
                         if attempt == 0:
                             time.sleep(2)
+                        continue
+                    if use_cache:
+                        try:
+                            cache_put(
+                                content_hash,
+                                label.split("(", 1)[0],
+                                response,
+                                provider,
+                                model,
+                            )
+                        except Exception as error:
+                            print(
+                                f"[vision] {label}: cache write failed: {error}",
+                                flush=True,
+                            )
+                    return response
 
         if provider_index + 1 < len(providers):
             next_provider = providers[provider_index + 1]

@@ -30,6 +30,14 @@ def init_db():
             path     TEXT,
             phash    TEXT
         );
+        CREATE TABLE IF NOT EXISTS vision_cache (
+            content_hash  TEXT PRIMARY KEY,
+            label         TEXT,
+            response_json TEXT,
+            provider      TEXT,
+            model         TEXT,
+            created_at    TEXT
+        );
         """
     )
     conn.commit()
@@ -57,6 +65,74 @@ def save_file(claim_id, filename, kind, path):
     file_id = cur.lastrowid
     conn.close()
     return file_id
+
+
+def _ensure_vision_cache(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vision_cache (
+            content_hash  TEXT PRIMARY KEY,
+            label         TEXT,
+            response_json TEXT,
+            provider      TEXT,
+            model         TEXT,
+            created_at    TEXT
+        )
+        """
+    )
+
+
+def cache_get(content_hash):
+    conn = get_conn()
+    try:
+        _ensure_vision_cache(conn)
+        row = conn.execute(
+            """
+            SELECT response_json, provider, model
+            FROM vision_cache
+            WHERE content_hash = ?
+            """,
+            (content_hash,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            response = json.loads(row["response_json"])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(response, dict):
+            return None
+        return {
+            "response": response,
+            "provider": row["provider"],
+            "model": row["model"],
+        }
+    finally:
+        conn.close()
+
+
+def cache_put(content_hash, label, response, provider, model):
+    conn = get_conn()
+    try:
+        _ensure_vision_cache(conn)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO vision_cache (
+                content_hash, label, response_json, provider, model, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                content_hash,
+                label,
+                json.dumps(response, ensure_ascii=False),
+                provider,
+                model,
+                datetime.now().isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def list_claims():

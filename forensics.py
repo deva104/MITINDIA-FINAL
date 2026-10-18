@@ -189,7 +189,9 @@ def _claim_coordinates(value):
 
 def check_duplicate(image, path, conn):
     """Compare against phashes already stored in our files table, then record ours."""
-    phash = str(imagehash.phash(image))
+    hash_image = image.copy()
+    hash_image.thumbnail((256, 256), Image.LANCZOS)
+    phash = str(imagehash.phash(hash_image))
 
     rows = conn.execute(
         "SELECT filename, path, phash, claim_id FROM files WHERE phash IS NOT NULL AND path != ?",

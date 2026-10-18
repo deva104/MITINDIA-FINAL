@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from db import get_conn, init_db, list_claims, save_claim, save_file
 from gemini import assess_damage, extract_fields
 from rules import build_estimate, run_rules
+from vision import reset_cache_tracking, stage_was_cached
 
 import whatsapp as wa
 from whatsapp import (
@@ -199,9 +200,9 @@ async def analyse_claim(claim_id, doc_paths, photo_paths):
     timings = []
     excluded_photos = []
 
-    def stage_done(name, since):
+    def stage_done(name, since, cached=False):
         elapsed = round(time.perf_counter() - since, 2)
-        timings.append({"stage": name, "seconds": elapsed})
+        timings.append({"stage": name, "seconds": elapsed, "cached": bool(cached)})
         print(f"[analyze] {claim_id} {name}: {elapsed:.2f}s", flush=True)
 
     def make_payload(status, stopped_at, fields=None, damage=None, forensics=None,
@@ -267,9 +268,10 @@ async def analyse_claim(claim_id, doc_paths, photo_paths):
 
         # Stage 1 - Gemini extraction and damage assessment
         mark = time.perf_counter()
+        reset_cache_tracking()
         fields = extract_fields(doc_paths) if doc_paths else []
         result = assess_damage(clean_paths)
-        stage_done("stage1_gemini", mark)
+        stage_done("stage1_gemini", mark, cached=stage_was_cached())
 
         description = result.get("vehicle_description") or ""
         photos = result.get("photos") or []

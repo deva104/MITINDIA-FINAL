@@ -1,7 +1,10 @@
+import asyncio
 import copy
 import hashlib
+import hmac
 import json
 import os
+import threading
 import time
 import traceback
 import uuid
@@ -9,7 +12,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, List, Optional
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import (
+    BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -24,16 +29,26 @@ from db import (
     current_claim_id,
     database_backend,
     database_ok,
+    delete_session_media,
     get_claim,
     get_conn,
     init_db,
     list_claims,
+    list_session_media,
     media_get,
+    media_put,
     save_claim,
     save_file,
     storage_stats,
 )
-from gemini import assign_damage_ids, assess_damage, classify_image, extract_fields
+from gemini import (
+    MAX_PDF_PAGES,
+    assign_damage_ids,
+    assess_damage,
+    classify_image,
+    extract_fields,
+    render_pdf_pages,
+)
 from rules import assess_confidence, build_estimate, run_rules
 from vision import fallbacks_used, reset_cache_tracking, stage_was_cached
 
@@ -52,6 +67,7 @@ try:
     from forensics import (
         build_photo_url_map,
         check_duplicates,
+        fit_jpeg,
         prepare_uploaded_image,
         run_deep_forensics,
     )
@@ -59,8 +75,11 @@ except ImportError:
     def build_photo_url_map(photo_paths):
         return {}
 
-    def check_duplicates(photo_paths, conn):
+    def check_duplicates(photo_paths, conn, claim_id=None):
         return []
+
+    def fit_jpeg(data):
+        return data
 
     def prepare_uploaded_image(data):
         return data or None
@@ -72,6 +91,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 MAX_CLAIM_IMAGES = 8
+# Analyses run in worker threads so the event loop keeps answering webhooks.
+# This caps how many run at once on a 512 MB instance; the rest queue.
+ANALYSIS_SLOTS = threading.BoundedSemaphore(
+    max(1, int(os.getenv("ANALYSIS_CONCURRENCY", "2") or 2))
+)
 IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".bmp", ".tif", ".tiff",
 }
@@ -122,9 +146,25 @@ def infer_document_types(fields):
     return inferred
 
 
+def require_admin(x_admin_token: Optional[str] = Header(default=None)):
+    """Assessor and admin actions need the ADMIN_TOKEN header. Without a
+    configured token every request is refused: the URL is public."""
+    expected = os.getenv("ADMIN_TOKEN", "").strip()
+    supplied = (x_admin_token or "").strip()
+    if not expected or not supplied or not hmac.compare_digest(
+        supplied.encode("utf-8"), expected.encode("utf-8")
+    ):
+        raise HTTPException(status_code=401, detail="admin token required")
+
+
+ADMIN_ONLY = [Depends(require_admin)]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    if not os.getenv("ADMIN_TOKEN", "").strip():
+        print("[auth] ADMIN_TOKEN is not set: admin endpoints refuse every request", flush=True)
     yield
 
 
@@ -353,13 +393,14 @@ async def _notify_whatsapp_decision(
         return
     wa_id = payload.get("from_number")
     try:
-        last_inbound = wa.last_inbound_at(wa_id)
+        last_inbound = await asyncio.to_thread(wa.last_inbound_at, wa_id)
         if (
             not wa_id
             or last_inbound is None
             or time.time() - last_inbound > WHATSAPP_SERVICE_WINDOW_SECONDS
         ):
-            audit_log_add(
+            await asyncio.to_thread(
+                audit_log_add,
                 claim_id,
                 actor,
                 "notification_not_sent",
@@ -370,7 +411,7 @@ async def _notify_whatsapp_decision(
             )
             return
 
-        current = build_claim_response(payload)
+        current = await asyncio.to_thread(build_claim_response, payload)
         estimate = current.get("effective_estimate") or {}
         if decision == "approved":
             message = (
@@ -390,7 +431,8 @@ async def _notify_whatsapp_decision(
 
         sent = await send_text(wa_id, message)
         if sent:
-            audit_log_add(
+            await asyncio.to_thread(
+                audit_log_add,
                 claim_id,
                 actor,
                 "notification_sent",
@@ -404,7 +446,8 @@ async def _notify_whatsapp_decision(
                 "customer notified inside 24h service window",
             )
         else:
-            audit_log_add(
+            await asyncio.to_thread(
+                audit_log_add,
                 claim_id,
                 actor,
                 "notification_not_sent",
@@ -421,7 +464,7 @@ async def _notify_whatsapp_decision(
         traceback.print_exc()
 
 
-@app.post("/api/claims/{claim_id}/override")
+@app.post("/api/claims/{claim_id}/override", dependencies=ADMIN_ONLY)
 async def override_claim(claim_id: str, request: OverrideRequest):
     actor = str(request.actor or "").strip()
     action = str(request.action or "").strip()
@@ -434,10 +477,10 @@ async def override_claim(claim_id: str, request: OverrideRequest):
     if action not in OVERRIDE_ACTIONS:
         raise HTTPException(status_code=400, detail="invalid override action")
 
-    payload = get_claim(claim_id)
+    payload = await asyncio.to_thread(get_claim, claim_id)
     if payload is None:
         raise HTTPException(status_code=404, detail="claim not found")
-    current = build_claim_response(payload)
+    current = await asyncio.to_thread(build_claim_response, payload)
 
     if action == "set_decision":
         value = str(request.value or "").strip().lower()
@@ -470,17 +513,17 @@ async def override_claim(claim_id: str, request: OverrideRequest):
                 raise HTTPException(status_code=400, detail="invalid severity value")
             after["severity"] = value
 
-    audit_log_add(
-        claim_id, actor, action, target, before, after, reason
+    await asyncio.to_thread(
+        audit_log_add, claim_id, actor, action, target, before, after, reason
     )
     if action == "set_decision":
         await _notify_whatsapp_decision(
             claim_id, payload, actor, after["value"], reason
         )
-    return build_claim_response(payload)
+    return await asyncio.to_thread(build_claim_response, payload)
 
 
-@app.post("/api/demo/reset")
+@app.post("/api/demo/reset", dependencies=ADMIN_ONLY)
 def demo_reset():
     conn = get_conn()
     try:
@@ -488,6 +531,10 @@ def demo_reset():
         conn.execute("DELETE FROM files")
         conn.execute("DELETE FROM claims")
         conn.execute("DELETE FROM media")
+        # Sessions point at media ids; leaving them would strand ids whose
+        # bytes were just deleted.
+        conn.execute("DELETE FROM wa_session_media")
+        conn.execute("DELETE FROM wa_sessions")
         conn.commit()
     finally:
         conn.close()
@@ -798,11 +845,39 @@ def build_vehicle_groups(photos, damage, excluded, photo_urls=None):
 
 async def analyse_claim(
     claim_id, doc_paths, photo_paths, source="web", from_number=None,
-    forced_review_reasons=None,
+    forced_review_reasons=None, page_paths=None,
 ):
-    """Staged pipeline shared by the HTTP upload route and the WhatsApp webhook."""
+    """Staged pipeline shared by the HTTP upload route and the WhatsApp webhook.
+
+    Everything in it is blocking (vision HTTP, Pillow, phash, DB), so it runs
+    in a worker thread. The context is copied, so current_claim_id and the
+    vision cache/fallback trackers behave as before.
+
+    page_paths are pre-rendered PDF pages (WhatsApp stores pages, not PDFs).
+    They go straight to field extraction, like a PDF would, and are never
+    classified or counted against the image cap.
+    """
+    return await asyncio.to_thread(
+        _analyse_claim_in_slot,
+        claim_id, doc_paths, photo_paths, source, from_number,
+        forced_review_reasons, page_paths,
+    )
+
+
+def _analyse_claim_in_slot(*args):
+    with ANALYSIS_SLOTS:
+        return _analyse_claim_sync(*args)
+
+
+def _analyse_claim_sync(
+    claim_id, doc_paths, photo_paths, source="web", from_number=None,
+    forced_review_reasons=None, page_paths=None,
+):
     started = time.perf_counter()
-    temp_inputs = [path for path in list(doc_paths or []) + list(photo_paths or []) if path]
+    page_paths = [path for path in list(page_paths or []) if path]
+    temp_inputs = [
+        path for path in list(doc_paths or []) + list(photo_paths or []) + page_paths if path
+    ]
     claim_token = current_claim_id.set(claim_id)
 
     original_doc_paths = list(doc_paths or [])
@@ -810,7 +885,7 @@ async def analyse_claim(
     direct_doc_paths = [
         path for path in original_doc_paths
         if os.path.splitext(path)[1].lower() not in IMAGE_EXTENSIONS
-    ]
+    ] + page_paths
     doc_image_paths = [
         path for path in original_doc_paths
         if os.path.splitext(path)[1].lower() in IMAGE_EXTENSIONS
@@ -903,7 +978,7 @@ async def analyse_claim(
     try:
         # Stage 0 - duplicate screen, before spending any Gemini quota
         mark = time.perf_counter()
-        dup = check_duplicates(photo_paths, conn)
+        dup = check_duplicates(photo_paths, conn)  # excludes this claim via current_claim_id
         stage_done("stage0_duplicate", mark)
 
         flagged = {d["photo_path"] for d in dup
@@ -1100,12 +1175,20 @@ async def analyze(
     ):
         filename = os.path.basename(upload.filename or "unnamed")
         dest = os.path.join(claim_dir, filename)
-        with open(dest, "wb") as fh:
-            fh.write(await upload.read())
-        save_file(claim_id, filename, kind, dest)
+        content = await upload.read()
+        await asyncio.to_thread(_store_upload, claim_id, filename, kind, dest, content)
         bucket.append(dest)
 
     return await analyse_claim(claim_id, doc_paths, photo_paths)
+
+
+def _store_upload(claim_id, filename, kind, dest, content):
+    with open(dest, "wb") as fh:
+        fh.write(content)
+    save_file(
+        claim_id, filename, kind, dest,
+        hashlib.sha256(content).hexdigest(), len(content),
+    )
 
 
 MIME_EXTENSIONS = {
@@ -1143,19 +1226,45 @@ def _photo_receipt(count):
     )
 
 
+def _photo_mime(media_obj, extension, bucket):
+    mime = str((media_obj or {}).get("mime_type") or "").split(";")[0].strip().lower()
+    if mime not in ("", "application/octet-stream"):
+        return mime
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".heic": "image/heic",
+        ".heif": "image/heif",
+        ".bmp": "image/bmp",
+        ".tif": "image/tiff",
+        ".tiff": "image/tiff",
+    }.get(extension, "image/jpeg")
+
+
+def _is_pdf(media_obj, data):
+    mime = str((media_obj or {}).get("mime_type") or "").split(";")[0].strip().lower()
+    extension = _media_extension(media_obj, "")
+    return mime == "application/pdf" or extension == ".pdf" or bytes(data[:5]) == b"%PDF-"
+
+
+def _document_receipt(count, truncated_from=None):
+    text = f"Document received ({count} total). Reply DONE when you are done."
+    if truncated_from:
+        text += (
+            f" Only the first {MAX_PDF_PAGES} of its {truncated_from} pages were read."
+        )
+    return text
+
+
 async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".jpg"):
-    session = get_session(wa_id)
     media_obj = media_obj or {}
-    analysing = bool(session.get("analysing"))
-    active_photos = session["next_photos"] if analysing else session["photos"]
-    if bucket == "photos" and len(active_photos) >= wa.MAX_IMAGES_PER_CLAIM:
+    session = get_session(wa_id)
+    if bucket == "photos" and len(session["photos"]) >= wa.MAX_IMAGES_PER_CLAIM:
         if not session.get("limit_notified"):
-            await send_text(
-                wa_id,
-                "Maximum 8 images per claim — keeping the first 8.",
-            )
             session["limit_notified"] = True
-        session["updated"] = time.time()
+            await send_text(wa_id, wa.IMAGE_LIMIT_REPLY)
         return
 
     data = await download_media(media_obj)
@@ -1163,48 +1272,91 @@ async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".j
         await send_text(wa_id, "I could not download that file. Please send it again.")
         return
 
-    extension = _media_extension(media_obj, fallback_ext)
+    source_sha = hashlib.sha256(data).hexdigest()
+    source_bytes = len(data)
+    truncated_from = None
     if bucket == "photos":
-        digest = hashlib.sha256(data).hexdigest()
-        if digest in set(session.get("next_hashes") or []):
-            await send_text(wa_id, _photo_receipt(len(session.get("next_photos") or [])))
-            return
-        if digest in set(session.get("content_hashes") or []):
-            await send_text(wa_id, _photo_receipt(len(session.get("photos") or [])))
-            return
-        prepared = prepare_uploaded_image(data)
+        prepared = await asyncio.to_thread(prepare_uploaded_image, data)
         if prepared is None:
             await send_text(wa_id, wa.UNREADABLE_IMAGE_REPLY)
             return
-        if prepared is not data:
-            extension = ".jpg"
-            data = prepared
+        if prepared is data:
+            mime = _photo_mime(media_obj, _media_extension(media_obj, fallback_ext), bucket)
+        else:
+            mime = "image/jpeg"
+        items = [(prepared, mime, "photo", 0)]
     else:
-        digest = None
+        if not _is_pdf(media_obj, data):
+            await send_text(wa_id, wa.DOCUMENT_FORMAT_REPLY)
+            return
+        try:
+            pages, page_count = await asyncio.to_thread(
+                render_pdf_pages,
+                data,
+                os.path.basename(str(media_obj.get("filename") or "document.pdf")),
+            )
+        except Exception as error:
+            print(f"[whatsapp] PDF render failed: {type(error).__name__}", flush=True)
+            await send_text(wa_id, wa.UNREADABLE_PDF_REPLY)
+            return
+        if page_count > len(pages):
+            truncated_from = page_count
+        # Pages are stored, never the PDF: an original over the media cap would
+        # otherwise be refused. Its hash and size go on the claim's files row.
+        pages = await asyncio.to_thread(lambda: [fit_jpeg(page) for page in pages])
+        items = [
+            (page, "image/jpeg", "document_page", number)
+            for number, page in enumerate(pages, 1)
+        ]
+
+    # Blobs are content-addressed and independent of session state, so they
+    # can be written off the loop before the session is touched.
+    media_ids = await asyncio.to_thread(
+        lambda: [media_put(content, mime, kind, None) for content, mime, kind, _ in items]
+    )
+    if not all(media_ids):
+        await send_text(
+            wa_id,
+            wa.UNREADABLE_IMAGE_REPLY if bucket == "photos" else wa.UNREADABLE_PDF_REPLY,
+        )
+        return
+
+    # From the inserts to the replies there is no await: appending media and
+    # reading the session happen together, so concurrent arrivals cannot
+    # interleave, and the unique (wa_id, sha256, page) key absorbs a resend.
+    row_ids = [
+        wa.add_session_media(wa_id, media_id, kind, source_sha, page, source_bytes)
+        for media_id, (_, _, kind, page) in zip(media_ids, items)
+    ]
+    added = any(row_id is not None for row_id in row_ids)
+    session = get_session(wa_id)
+    analysing = bool(session.get("analysing"))
+
+    if not added:
+        if analysing:
+            await send_text(wa_id, wa.ANALYSIS_BUSY_REPLY)
+        elif bucket == "photos":
+            await send_text(wa_id, _photo_receipt(len(session["photos"])))
+        else:
+            await send_text(wa_id, _document_receipt(session["doc_count"]))
+        return
 
     choice_cleared = False
     if session.get("pending_choice") and not analysing:
-        session = wa._blank_session()
-        wa.SESSIONS[wa_id] = session
-        analysing = False
+        session = wa.reset_session(wa_id)
         choice_cleared = True
 
-    folder = os.path.join(UPLOAD_DIR, f"wa_{wa_id}")
-    os.makedirs(folder, exist_ok=True)
-    dest = os.path.join(folder, f"{message_id}{extension}")
-    with open(dest, "wb") as fh:
-        fh.write(data)
-
-    if analysing:
-        target = session["next_photos"] if bucket == "photos" else session["next_docs"]
-        hashes = session.setdefault("next_hashes", set())
-    else:
-        target = session[bucket]
-        hashes = session.setdefault("content_hashes", set())
-    target.append(dest)
-    if digest is not None:
-        hashes.add(digest)
-    session["updated"] = time.time()
+    if bucket == "photos":
+        pending = [
+            row["id"] for row in wa._pending_rows(session, list_session_media(wa_id))
+            if row["kind"] == "photo"
+        ]
+        if row_ids[0] in pending and pending.index(row_ids[0]) >= wa.MAX_IMAGES_PER_CLAIM:
+            delete_session_media(wa_id, [row_ids[0]])
+            if not session.get("limit_notified"):
+                session["limit_notified"] = True
+                await send_text(wa_id, wa.IMAGE_LIMIT_REPLY)
+            return
 
     if choice_cleared:
         if bucket == "photos":
@@ -1228,10 +1380,7 @@ async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".j
     if bucket == "photos":
         await send_text(wa_id, _photo_receipt(len(session["photos"])))
         return
-    await send_text(
-        wa_id,
-        f"Document received ({len(session['docs'])} total). Reply DONE when you are done.",
-    )
+    await send_text(wa_id, _document_receipt(session["doc_count"], truncated_from))
 
 
 async def handle_wa_message(message):
@@ -1246,6 +1395,10 @@ async def handle_wa_message(message):
         wa.record_inbound(wa_id, message.get("timestamp"))
         message_id = message.get("id")
         message_type = message.get("type")
+        wa.sweep_idle_sessions()
+        expiry_notice = wa.take_expiry_notice(wa_id)
+        if expiry_notice:
+            await send_text(wa_id, expiry_notice)
 
         if message_type == "image":
             await _store_wa_media(wa_id, message_id, message.get("image") or {}, "photos")
@@ -1271,6 +1424,8 @@ async def handle_wa_message(message):
                     wa_id,
                     skip_missing=wa.is_skip_command(text),
                 )
+            elif expiry_notice:
+                return
             else:
                 await send_text(
                     wa_id,
@@ -1326,7 +1481,7 @@ async def webhook_receive(request: Request, background: BackgroundTasks):
         for message in messages:
             if not isinstance(message, dict):
                 continue
-            if not remember_message(message.get("id")):
+            if not await asyncio.to_thread(remember_message, message.get("id")):
                 print(f"[whatsapp] skipping already-processed {message.get('id')}", flush=True)
                 continue
             background.add_task(handle_wa_message, message)
@@ -1337,12 +1492,12 @@ async def webhook_receive(request: Request, background: BackgroundTasks):
     return {"ok": True}
 
 
-@app.post("/api/whatsapp/subscribe")
+@app.post("/api/whatsapp/subscribe", dependencies=ADMIN_ONLY)
 async def whatsapp_subscribe():
     return await subscribe_app()
 
 
-@app.get("/api/whatsapp/status")
+@app.get("/api/whatsapp/status", dependencies=ADMIN_ONLY)
 def whatsapp_status():
     return {
         "whatsapp_token_configured": bool(wa.WHATSAPP_TOKEN),

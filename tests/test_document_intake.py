@@ -4,13 +4,20 @@ except ImportError:
     from tests import bootstrap  # noqa: F401
 import asyncio
 import os
+import tempfile
 import time
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+import db
 import gemini
 import main
 import whatsapp
+
+try:
+    from helpers import seed_session
+except ImportError:
+    from tests.helpers import seed_session
 from rules import run_rules
 
 
@@ -277,16 +284,21 @@ class PipelineRoutingTests(unittest.TestCase):
 
 class WhatsAppChecklistTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.original_db = db.DB_PATH
+        db.DB_PATH = os.path.join(self.folder.name, "checklist.db")
+        db.prepare_test_db()
         whatsapp.SESSIONS.clear()
+        whatsapp.ANALYSING_IDS.clear()
+
+    def tearDown(self):
+        whatsapp.SESSIONS.clear()
+        whatsapp.ANALYSING_IDS.clear()
+        db.DB_PATH = self.original_db
+        self.folder.cleanup()
 
     async def test_damage_only_done_then_skip(self):
-        whatsapp.SESSIONS["user"] = {
-            "photos": ["damage-1.jpg", "damage-2.jpg"],
-            "docs": [],
-            "pending_choice": None,
-            "awaiting_docs": False,
-            "updated": time.time(),
-        }
+        seed_session("user", photos=2, updated=time.time())
         intake = {
             "classifications": [],
             "documents_received": {
@@ -353,13 +365,7 @@ class WhatsAppChecklistTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_rc_only_refuses_skip(self):
-        whatsapp.SESSIONS["user"] = {
-            "photos": ["rc.jpg"],
-            "docs": [],
-            "pending_choice": None,
-            "awaiting_docs": True,
-            "updated": time.time(),
-        }
+        seed_session("user", photos=1, awaiting_docs=True, updated=time.time())
         intake = {
             "classifications": [],
             "documents_received": {
@@ -384,13 +390,7 @@ class WhatsAppChecklistTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("user", whatsapp.SESSIONS)
 
     async def test_strict_docs_does_not_offer_skip(self):
-        whatsapp.SESSIONS["user"] = {
-            "photos": ["damage.jpg"],
-            "docs": [],
-            "pending_choice": None,
-            "awaiting_docs": True,
-            "updated": time.time(),
-        }
+        seed_session("user", photos=1, awaiting_docs=True, updated=time.time())
         intake = {
             "classifications": [],
             "documents_received": {
@@ -412,25 +412,16 @@ class WhatsAppChecklistTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("SKIP", sent.await_args.args[1])
 
     def test_stale_awaiting_docs_session_expires(self):
-        whatsapp.SESSIONS["user"] = {
-            "photos": ["old.jpg"],
-            "docs": [],
-            "pending_choice": None,
-            "awaiting_docs": True,
-            "updated": time.time() - whatsapp.PENDING_CHOICE_TIMEOUT - 1,
-        }
+        seed_session(
+            "user", photos=1, awaiting_docs=True,
+            updated=time.time() - whatsapp.PENDING_CHOICE_TIMEOUT - 1,
+        )
         session = whatsapp.get_session("user")
         self.assertFalse(session["awaiting_docs"])
         self.assertEqual(session["photos"], [])
 
     async def test_pdf_bundle_satisfies_checklist(self):
-        whatsapp.SESSIONS["user"] = {
-            "photos": ["damage.jpg"],
-            "docs": ["motor-bundle.pdf"],
-            "pending_choice": None,
-            "awaiting_docs": False,
-            "updated": time.time(),
-        }
+        seed_session("user", photos=1, documents=1, updated=time.time())
         result = {
             "claim_id": "CLM-PDF",
             "status": "analysed",
@@ -460,14 +451,7 @@ class WhatsAppChecklistTests(unittest.IsolatedAsyncioTestCase):
         ))
 
     async def test_image_limit_replies_once_and_keeps_eight(self):
-        whatsapp.SESSIONS["user"] = {
-            "photos": [f"{index}.jpg" for index in range(8)],
-            "docs": [],
-            "pending_choice": None,
-            "awaiting_docs": False,
-            "limit_notified": False,
-            "updated": time.time(),
-        }
+        seed_session("user", photos=8, limit_notified=False, updated=time.time())
         sent = AsyncMock()
         download = AsyncMock(return_value=b"bytes")
         with patch.object(main, "send_text", sent), patch.object(

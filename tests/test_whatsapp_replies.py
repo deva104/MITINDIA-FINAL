@@ -2,12 +2,20 @@ try:
     import bootstrap  # noqa: F401
 except ImportError:
     from tests import bootstrap  # noqa: F401
+import os
+import tempfile
 import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import db
 import main
 import whatsapp
+
+try:
+    from helpers import seed_session
+except ImportError:
+    from tests.helpers import seed_session
 
 
 def estimate(low, high, part="rear_bumper", damage_type="crack", severity="severe"):
@@ -229,7 +237,18 @@ class WhatsAppReplyTests(unittest.TestCase):
 
 class WhatsAppPendingChoiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.original_db = db.DB_PATH
+        db.DB_PATH = os.path.join(self.folder.name, "choices.db")
+        db.prepare_test_db()
         whatsapp.SESSIONS.clear()
+        whatsapp.ANALYSING_IDS.clear()
+
+    def tearDown(self):
+        whatsapp.SESSIONS.clear()
+        whatsapp.ANALYSING_IDS.clear()
+        db.DB_PATH = self.original_db
+        self.folder.cleanup()
 
     async def test_numeric_choice_sends_vehicle_and_clears_session(self):
         vehicles = [
@@ -293,12 +312,7 @@ class WhatsAppPendingChoiceTests(unittest.IsolatedAsyncioTestCase):
             group(1, "Black SUV", "claimable", 8000, 15000),
         ]
         result = payload("CLM-TWO", vehicles)
-        whatsapp.SESSIONS["user"] = {
-            "photos": ["one.jpg", "two.jpg"],
-            "docs": [],
-            "pending_choice": None,
-            "updated": time.time(),
-        }
+        seed_session("user", photos=2, updated=time.time())
         sent = AsyncMock()
         with (
             patch.object(whatsapp, "send_text", sent),
@@ -341,12 +355,10 @@ class WhatsAppPendingChoiceTests(unittest.IsolatedAsyncioTestCase):
         process.assert_not_awaited()
 
     def test_stale_pending_choice_resets_session(self):
-        whatsapp.SESSIONS["user"] = {
-            "photos": ["old.jpg"],
-            "docs": [],
-            "pending_choice": {"claim_id": "OLD", "vehicles": []},
-            "updated": time.time() - whatsapp.PENDING_CHOICE_TIMEOUT - 1,
-        }
+        seed_session(
+            "user", photos=1, pending_choice={"claim_id": "OLD", "vehicles": []},
+            updated=time.time() - whatsapp.PENDING_CHOICE_TIMEOUT - 1,
+        )
 
         session = whatsapp.get_session("user")
 

@@ -135,6 +135,44 @@
     }
   }
 
+  /* Overrides and demo reset need the admin token. It is asked for once and
+     kept in localStorage; if storage is blocked it lives for this page only. */
+  const ADMIN_TOKEN_KEY = 'claimpilot.adminToken';
+  let adminToken = (function () {
+    try {
+      return localStorage.getItem(ADMIN_TOKEN_KEY) || '';
+    } catch (e) {
+      return '';
+    }
+  })();
+
+  function rememberAdminToken(value) {
+    adminToken = value;
+    try {
+      if (value) localStorage.setItem(ADMIN_TOKEN_KEY, value);
+      else localStorage.removeItem(ADMIN_TOKEN_KEY);
+    } catch (e) {
+      /* Kept in memory only. */
+    }
+  }
+
+  async function adminFetch(url, options) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (!adminToken) {
+        const entered = String(prompt('Admin token (needed for assessor actions):') || '').trim();
+        if (!entered) throw new Error('Admin token required');
+        rememberAdminToken(entered);
+      }
+      const headers = Object.assign({}, (options && options.headers) || {}, {
+        'X-Admin-Token': adminToken
+      });
+      const r = await fetch(url, Object.assign({}, options || {}, { headers }));
+      if (r.status !== 401) return r;
+      rememberAdminToken('');
+    }
+    throw new Error('Admin token rejected');
+  }
+
   function updateOverrideControls() {
     const disabled = !assessorName();
     document.querySelectorAll('.override-control').forEach(control => {
@@ -854,7 +892,7 @@
     button.disabled = true;
     $('overrideError').classList.add('hidden');
     try {
-      const r = await fetch(
+      const r = await adminFetch(
         'api/claims/' + encodeURIComponent(activeClaim.claim_id) + '/override',
         {
           method: 'POST',
@@ -1012,14 +1050,15 @@
   $('btnReset').onclick = async () => {
     if (!confirm('Clear all claims and stored photo hashes?')) return;
     try {
-      await fetch('api/demo/reset', { method: 'POST' });
+      const r = await adminFetch('api/demo/reset', { method: 'POST' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
       activeId = null;
       activeClaim = null;
       resetStaged();
       show('viewUpload');
       pollClaims();
     } catch (e) {
-      alert('Reset failed.');
+      alert('Reset failed: ' + e.message);
     }
   };
   

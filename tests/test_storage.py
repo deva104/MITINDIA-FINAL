@@ -66,6 +66,21 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(os.path.exists(inside))
         self.assertTrue(os.path.exists(outside))
 
+    def test_whatsapp_session_and_inbound_roundtrip(self):
+        db.put_session("user", '{"photos": ["abc"], "updated": 1}', "1")
+        self.assertEqual(db.get_session("user"), '{"photos": ["abc"], "updated": 1}')
+        db.put_session("user", '{"photos": []}', "2")
+        self.assertEqual(db.get_session("user"), '{"photos": []}')
+        self.assertEqual(db.list_sessions(), [("user", '{"photos": []}')])
+        db.delete_session("user")
+        self.assertIsNone(db.get_session("user"))
+        db.touch_last_inbound("user", "1700000000.5")
+        self.assertEqual(db.get_last_inbound("user"), "1700000000.5")
+        db.touch_last_inbound("user", "1700000001")
+        self.assertEqual(db.get_last_inbound("user"), "1700000001")
+        db.clear_last_inbound()
+        self.assertIsNone(db.get_last_inbound("user"))
+
     def test_health_reports_the_active_backend(self):
         payload = main.health()
         self.assertIn(payload["db"], ("sqlite", "postgres"))

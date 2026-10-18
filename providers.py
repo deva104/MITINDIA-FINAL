@@ -10,6 +10,9 @@ from openai import OpenAI
 
 
 TEMPERATURE = 0.0
+# Every provider call is bounded. Without this the OpenAI SDK waits up to 600 s
+# and retries twice on its own; vision.generate_json already retries.
+VISION_TIMEOUT_SECONDS = float(os.getenv("VISION_TIMEOUT_SECONDS", "45") or 45)
 
 _groq_client = None
 _gemini_client = None
@@ -31,6 +34,8 @@ def _get_groq_client():
         _groq_client = OpenAI(
             api_key=os.environ["GROQ_API_KEY"],
             base_url="https://api.groq.com/openai/v1",
+            timeout=VISION_TIMEOUT_SECONDS,
+            max_retries=0,
         )
     return _groq_client
 
@@ -38,7 +43,10 @@ def _get_groq_client():
 def _get_gemini_client():
     global _gemini_client
     if _gemini_client is None:
-        _gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        _gemini_client = genai.Client(
+            api_key=os.environ["GEMINI_API_KEY"],
+            http_options=types.HttpOptions(timeout=int(VISION_TIMEOUT_SECONDS * 1000)),
+        )
     return _gemini_client
 
 
@@ -49,6 +57,8 @@ def _get_openrouter_client():
         _openrouter_client = OpenAI(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
+            timeout=VISION_TIMEOUT_SECONDS,
+            max_retries=0,
             default_headers={
                 "Authorization": f"Bearer {api_key}",
                 "HTTP-Referer": "ClaimPilot",

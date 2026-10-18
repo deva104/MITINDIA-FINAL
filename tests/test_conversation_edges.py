@@ -20,6 +20,11 @@ import vision
 import whatsapp
 from forensics import DUPLICATE_DISTANCE, prepare_uploaded_image
 
+try:
+    from helpers import read_all, seed_session
+except ImportError:
+    from tests.helpers import read_all, seed_session
+
 
 ROOT = Path(__file__).resolve().parents[1]
 FRESH_INSTRUCTIONS = (
@@ -167,13 +172,7 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("user", whatsapp.SESSIONS)
 
     async def test_double_done_runs_one_analysis(self):
-        whatsapp.SESSIONS["user"] = {
-            "photos": ["damage.jpg"],
-            "docs": [],
-            "pending_choice": None,
-            "awaiting_docs": False,
-            "updated": time.time(),
-        }
+        seed_session("user", photos=1, updated=time.time())
         sent = AsyncMock()
         first_started = asyncio.Event()
         release = asyncio.Event()
@@ -202,20 +201,15 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_photo_during_analysis_starts_a_new_claim(self):
-        whatsapp.SESSIONS["user"] = {
-            "photos": ["old.jpg"],
-            "docs": [],
-            "content_hashes": set(),
-            "pending_choice": None,
-            "awaiting_docs": False,
-            "updated": time.time(),
-        }
+        (old,), _ = seed_session("user", photos=[jpeg_bytes(color=(200, 1, 1))],
+                                 updated=time.time())
+        old_id = whatsapp.SESSIONS["user"]["photos"][0]
         started = asyncio.Event()
         release = asyncio.Event()
         seen = {}
 
         async def slow_analyse(*args, **kwargs):
-            seen["photos"] = list(args[2] if len(args) > 2 else kwargs.get("photo_paths"))
+            seen["photos"] = read_all(args[2] if len(args) > 2 else kwargs.get("photo_paths"))
             started.set()
             await release.wait()
             return analysed_payload()
@@ -233,20 +227,21 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await task
 
-        self.assertEqual(seen["photos"], ["old.jpg"])
+        self.assertEqual(seen["photos"], [old])
         self.assertIn(
             whatsapp.NEW_CLAIM_WHILE_BUSY,
             [call.args[1] for call in sent.await_args_list],
         )
-        self.assertEqual(len(whatsapp.SESSIONS["user"]["photos"]), 1)
-        self.assertNotIn("old.jpg", whatsapp.SESSIONS["user"]["photos"])
+        session = whatsapp.SESSIONS["user"]
+        self.assertEqual(len(session["photos"]), 1)
+        self.assertNotIn(old_id, session["photos"])
+        self.assertFalse(session["analysing"])
 
     async def test_photo_during_pending_choice_starts_over(self):
         self._pending([
             {"label": "White Kia Sedan", "status": "claimable"},
             {"label": "Black SUV", "status": "claimable"},
         ], "choose")
-        whatsapp.SESSIONS["user"]["photos"] = ["old.jpg"]
         sent = AsyncMock()
         with patch.object(main, "download_media", AsyncMock(return_value=jpeg_bytes())), \
                 patch.object(main, "send_text", sent):
@@ -261,17 +256,12 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
         session = whatsapp.SESSIONS["user"]
         self.assertIsNone(session["pending_choice"])
         self.assertEqual(len(session["photos"]), 1)
-        self.assertNotIn("old.jpg", session["photos"])
 
-    async def test_stale_awaiting_docs_text_is_a_fresh_conversation(self):
-        whatsapp.SESSIONS["user"] = {
-            "photos": ["old.jpg"],
-            "docs": ["old.pdf"],
-            "pending_choice": None,
-            "awaiting_docs": True,
-            "missing_docs": ["rc"],
-            "updated": time.time() - whatsapp.PENDING_CHOICE_TIMEOUT - 5,
-        }
+    async def test_stale_awaiting_docs_text_reports_the_expiry(self):
+        seed_session(
+            "user", photos=1, documents=1, awaiting_docs=True, missing_docs=["rc"],
+            updated=time.time() - whatsapp.PENDING_CHOICE_TIMEOUT - 5,
+        )
         sent = AsyncMock()
         process = AsyncMock()
         with patch.object(main, "send_text", sent), \
@@ -284,9 +274,12 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
             })
 
         process.assert_not_awaited()
-        sent.assert_awaited_once_with("user", FRESH_INSTRUCTIONS)
-        self.assertEqual(whatsapp.SESSIONS["user"]["photos"], [])
-        self.assertFalse(whatsapp.SESSIONS["user"]["awaiting_docs"])
+        sent.assert_awaited_once_with(
+            "user",
+            "Your earlier photos and documents expired after 30 minutes. "
+            "Please send them again.",
+        )
+        self.assertNotIn("user", whatsapp.SESSIONS)
 
     async def test_same_photo_twice_is_counted_once_without_a_fraud_flag(self):
         payload = jpeg_bytes()
@@ -303,16 +296,22 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
 
         session = whatsapp.SESSIONS["user"]
         self.assertEqual(len(session["photos"]), 1)
-        self.assertEqual(len(session["content_hashes"]), 1)
+        self.assertEqual(len(db.list_session_media("user")), 1)
+        self.assertEqual(len(session["photos"][0]), 64)
         self.assertEqual(sent.await_count, 2)
         for call in sent.await_args_list:
             self.assertNotIn("duplicate", call.args[1].lower())
             self.assertIn("Photo received (1 total)", call.args[1])
 
+        stored = db.media_get(session["photos"][0])
+        self.assertIsNotNone(stored)
+        path = os.path.join(self.temp.name, "tap-1.jpg")
+        with open(path, "wb") as handle:
+            handle.write(stored[0])
         conn = db.get_conn()
         try:
-            db.save_file("CLM-ONCE", "tap-1.jpg", "photo", session["photos"][0])
-            results = forensics.check_duplicates(session["photos"], conn)
+            db.save_file("CLM-ONCE", "tap-1.jpg", "photo", path)
+            results = forensics.check_duplicates([path], conn)
         finally:
             conn.close()
         self.assertEqual(results[0]["verdict"], "clean")
@@ -327,13 +326,7 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
             ("ho gaya", False),
             ("Done", False),
         ):
-            whatsapp.SESSIONS["user"] = {
-                "photos": ["damage.jpg"],
-                "docs": [],
-                "pending_choice": None,
-                "awaiting_docs": False,
-                "updated": time.time(),
-            }
+            seed_session("user", photos=1, updated=time.time())
             with patch.object(main, "process_session", process):
                 await main.handle_wa_message({
                     "from": "user",
@@ -345,18 +338,12 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
             process.reset_mock()
 
     async def test_two_senders_stay_isolated(self):
-        whatsapp.SESSIONS["aaa"] = {
-            "photos": ["a.jpg"], "docs": [], "pending_choice": None,
-            "awaiting_docs": False, "updated": time.time(),
-        }
-        whatsapp.SESSIONS["bbb"] = {
-            "photos": ["b.jpg"], "docs": [], "pending_choice": None,
-            "awaiting_docs": False, "updated": time.time(),
-        }
+        (a,), _ = seed_session("aaa", photos=[jpeg_bytes(color=(1, 99, 1))], updated=time.time())
+        (b,), _ = seed_session("bbb", photos=[jpeg_bytes(color=(99, 1, 1))], updated=time.time())
         seen = {}
 
         async def fake_analyse(*args, **kwargs):
-            seen[kwargs.get("from_number")] = list(args[2])
+            seen[kwargs.get("from_number")] = read_all(args[2])
             if kwargs.get("from_number") == "aaa":
                 await asyncio.sleep(0.02)
             return analysed_payload(f"CLM-{kwargs.get('from_number')}")
@@ -370,8 +357,41 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
                 whatsapp.process_session("bbb"),
             )
 
-        self.assertEqual(seen["aaa"], ["a.jpg"])
-        self.assertEqual(seen["bbb"], ["b.jpg"])
+        self.assertEqual(seen["aaa"], [a])
+        self.assertEqual(seen["bbb"], [b])
+
+    async def test_analysis_materialises_stored_media_and_deletes_temp_files(self):
+        first = jpeg_bytes(color=(9, 9, 9))
+        second = jpeg_bytes(color=(8, 8, 8))
+        seed_session("user", photos=[first, second], updated=time.time())
+        media_ids = list(whatsapp.SESSIONS["user"]["photos"])
+        seen = {}
+
+        async def fake_analyse(*args, **kwargs):
+            paths = list(args[2])
+            seen["paths"] = paths
+            seen["bytes"] = read_all(paths)
+            state = db.get_session("user")
+            for path in paths:
+                self.assertNotIn(os.path.basename(path), state)
+            self.assertEqual(
+                [row["media_id"] for row in db.list_session_media("user")], media_ids
+            )
+            return analysed_payload()
+
+        with patch.object(whatsapp, "classify_session_intake", ready_intake), \
+                patch.object(main, "analyse_claim", fake_analyse), \
+                patch.object(whatsapp, "send_text", AsyncMock()), \
+                patch("db.save_file"):
+            await whatsapp.process_session("user")
+
+        self.assertEqual(seen["bytes"], [first, second])
+        for path in seen["paths"]:
+            self.assertFalse(os.path.exists(path))
+        self.assertNotIn("user", whatsapp.SESSIONS)
+        self.assertEqual(db.list_session_media("user"), [])
+        for media_id in media_ids:
+            self.assertIsNone(db.media_get(media_id))
 
 
 class HostileInputTests(unittest.IsolatedAsyncioTestCase):
@@ -409,7 +429,7 @@ class HostileInputTests(unittest.IsolatedAsyncioTestCase):
                 "from": "user", "id": "corrupt", "type": "image", "image": {},
             })
 
-        self.assertEqual(whatsapp.SESSIONS["user"]["photos"], [])
+        self.assertEqual(whatsapp.get_session("user")["photos"], [])
         self.assertEqual(sent.await_count, 2)
         for call in sent.await_args_list:
             self.assertEqual(call.args[1], whatsapp.UNREADABLE_IMAGE_REPLY)
@@ -449,8 +469,10 @@ class HostileInputTests(unittest.IsolatedAsyncioTestCase):
 
         stored = whatsapp.SESSIONS["user"]["photos"]
         self.assertEqual(len(stored), 1)
-        self.assertTrue(stored[0].lower().endswith(".heic"))
-        with Image.open(stored[0]) as opened:
+        self.assertEqual(len(stored[0]), 64)
+        data, mime = db.media_get(stored[0])
+        self.assertEqual(mime, "image/heic")
+        with Image.open(io.BytesIO(data)) as opened:
             opened.load()
             self.assertEqual(opened.size, (32, 32))
         sent.assert_awaited_once()

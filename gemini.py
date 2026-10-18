@@ -44,25 +44,40 @@ def _jpeg_image_part(data, path, page_number=None):
     return ("image", jpeg_bytes, "image/jpeg")
 
 
+def _render_pdf(document, name):
+    page_count = document.page_count
+    if page_count > MAX_PDF_PAGES:
+        print(
+            f"[gemini] {name}: {page_count} pages, truncating to {MAX_PDF_PAGES}",
+            flush=True,
+        )
+    image_parts = []
+    for index in range(min(page_count, MAX_PDF_PAGES)):
+        png_bytes = document.load_page(index).get_pixmap(
+            dpi=PDF_DPI,
+            alpha=False,
+        ).tobytes("png")
+        image_parts.append(_jpeg_image_part(png_bytes, name, page_number=index + 1))
+    return image_parts, page_count
+
+
+def render_pdf_pages(data, name="document.pdf"):
+    """Render PDF bytes to the page JPEGs extract_fields sends (1568px, at most
+    MAX_PDF_PAGES). Returns (list of JPEG bytes, total page count). Raises when
+    the PDF cannot be opened or has no pages."""
+    with fitz.open(stream=data, filetype="pdf") as document:
+        if document.needs_pass:
+            raise ValueError("PDF is password protected")
+        image_parts, page_count = _render_pdf(document, name)
+    if not image_parts:
+        raise ValueError("PDF has no pages")
+    return [part[1] for part in image_parts], page_count
+
+
 def _image_part(path):
     if Path(path).suffix.lower() == ".pdf":
-        image_parts = []
         with fitz.open(path) as document:
-            page_count = document.page_count
-            if page_count > MAX_PDF_PAGES:
-                print(
-                    f"[gemini] {os.path.basename(path)}: {page_count} pages, "
-                    f"truncating to {MAX_PDF_PAGES}",
-                    flush=True,
-                )
-            for index in range(min(page_count, MAX_PDF_PAGES)):
-                png_bytes = document.load_page(index).get_pixmap(
-                    dpi=PDF_DPI,
-                    alpha=False,
-                ).tobytes("png")
-                image_parts.append(
-                    _jpeg_image_part(png_bytes, path, page_number=index + 1)
-                )
+            image_parts, _ = _render_pdf(document, os.path.basename(path))
         return image_parts
 
     return _jpeg_image_part(Path(path).read_bytes(), path)

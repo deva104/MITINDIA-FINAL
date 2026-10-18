@@ -1,3 +1,5 @@
+import asyncio
+import json
 import os
 import time
 import traceback
@@ -9,6 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import db
 from gemini import classify_image, extract_fields
 
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
@@ -30,11 +33,23 @@ DOCUMENT_LABELS = {
     "policy": "Insurance policy",
 }
 
-SESSIONS = {}
-LAST_INBOUND = {}
 PROCESSED = set()
 _PROCESSED_ORDER = deque()
+# Per-number lock for one in-flight analysis. It stays in process memory on
+# purpose: it only has to outlive that analysis, and a restart has no analysis
+# left to protect.
 ANALYSING_IDS = set()
+_MIME_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+    "application/pdf": ".pdf",
+}
 ANALYSIS_BUSY_REPLY = "Your claim is already being analysed."
 NEW_CLAIM_WHILE_BUSY = (
     "Your previous claim is still being analysed — these photos will start a new claim."
@@ -59,6 +74,14 @@ UNREADABLE_IMAGE_REPLY = (
     "I could not read that photo. Please send a clear JPG, PNG, or HEIC photo "
     "of the damaged vehicle."
 )
+UNREADABLE_PDF_REPLY = (
+    "I could not read that PDF. Please send it again, or send a clear photo of each page."
+)
+DOCUMENT_FORMAT_REPLY = (
+    "I can read PDF documents and photos. Please send this document as a PDF "
+    "or a clear photo."
+)
+IMAGE_LIMIT_REPLY = "Maximum 8 images per claim — keeping the first 8."
 
 
 def _auth_headers():
@@ -77,52 +100,305 @@ def verify(mode, token, challenge):
 
 
 def record_inbound(wa_id, timestamp=None):
-    if wa_id:
-        try:
-            received_at = float(timestamp) if timestamp is not None else time.time()
-        except (TypeError, ValueError):
-            received_at = time.time()
-        LAST_INBOUND[str(wa_id)] = received_at
+    if not wa_id:
+        return
+    try:
+        received_at = float(timestamp) if timestamp is not None else time.time()
+    except (TypeError, ValueError):
+        received_at = time.time()
+    db.touch_last_inbound(str(wa_id), received_at)
 
 
 def last_inbound_at(wa_id):
-    return LAST_INBOUND.get(str(wa_id)) if wa_id else None
+    if not wa_id:
+        return None
+    raw = db.get_last_inbound(str(wa_id))
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+class _LastInbound:
+    """Test hook. Timestamps themselves live in wa_last_inbound."""
+
+    def clear(self):
+        db.clear_last_inbound()
+
+
+LAST_INBOUND = _LastInbound()
 
 
 def _blank_session(now=None):
     return {
-        "photos": [],
-        "docs": [],
         "pending_choice": None,
+        "pending_prompt": None,
         "awaiting_docs": False,
         "missing_docs": [],
         "limit_notified": False,
-        "content_hashes": set(),
         "analysing": False,
-        "next_photos": [],
-        "next_docs": [],
-        "next_hashes": set(),
+        "analysis_cutoff": None,
         "updated": time.time() if now is None else now,
     }
 
 
-def get_session(wa_id):
-    session = SESSIONS.get(wa_id)
-    now = time.time()
-    if (session is not None
-            and not session.get("analysing")
-            and (session.get("pending_choice") or session.get("awaiting_docs"))
-            and now - session.get("updated", 0) > PENDING_CHOICE_TIMEOUT):
-        SESSIONS.pop(wa_id, None)
-        session = None
-    if session is None:
-        session = _blank_session(now)
-        SESSIONS[wa_id] = session
-    session.setdefault("content_hashes", set())
-    session.setdefault("next_photos", [])
-    session.setdefault("next_docs", [])
-    session.setdefault("next_hashes", set())
+# Derived from wa_session_media on every load. Never stored in wa_sessions:
+# media arrival is append-only, so no handler can overwrite another's photos.
+_DERIVED_KEYS = ("photos", "docs", "doc_count")
+
+
+def _state_json(session):
+    state = {key: value for key, value in dict(session).items() if key not in _DERIVED_KEYS}
+    return json.dumps(state, ensure_ascii=False)
+
+
+def _decode_state(raw):
+    try:
+        data = json.loads(raw or "")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in _DERIVED_KEYS:
+        data.pop(key, None)
+    return data
+
+
+def _persist(wa_id, session):
+    updated = session.get("updated")
+    if updated is None:
+        updated = time.time()
+    db.put_session(str(wa_id), _state_json(session), updated)
+
+
+def _load_state(wa_id):
+    return _decode_state(db.get_session(str(wa_id)))
+
+
+def _pending_rows(session, rows):
+    """Rows the next DONE would analyse: everything after an in-flight snapshot."""
+    cutoff = session.get("analysis_cutoff") if session.get("analysing") else None
+    if cutoff is None:
+        return list(rows)
+    return [row for row in rows if int(row["id"]) > int(cutoff)]
+
+
+def _attach_media(session, rows):
+    pending = _pending_rows(session, rows)
+    dict.__setitem__(session, "photos", [row["media_id"] for row in pending if row["kind"] == "photo"])
+    dict.__setitem__(session, "docs", [row["media_id"] for row in pending if row["kind"] == "document_page"])
+    dict.__setitem__(session, "doc_count", len({
+        row["sha256"] for row in pending if row["kind"] == "document_page"
+    }))
     return session
+
+
+class _BoundSession(dict):
+    """Session state that writes itself back when a field is set.
+
+    photos/docs are a read-only view of wa_session_media; add media with
+    add_session_media, never by assigning these keys.
+    """
+
+    def __init__(self, wa_id, data):
+        super().__init__(data)
+        self._wa_id = str(wa_id)
+
+    def __setitem__(self, key, value):
+        if key in _DERIVED_KEYS:
+            raise TypeError(f"session {key} is append-only; use add_session_media")
+        super().__setitem__(key, value)
+        _persist(self._wa_id, self)
+
+    def update(self, *args, **kwargs):
+        changes = dict(*args, **kwargs)
+        for key in changes:
+            if key in _DERIVED_KEYS:
+                raise TypeError(f"session {key} is append-only; use add_session_media")
+        for key, value in changes.items():
+            super().__setitem__(key, value)
+        _persist(self._wa_id, self)
+
+
+def _view(wa_id, state=None):
+    state = _load_state(wa_id) if state is None else state
+    session = _BoundSession(wa_id, state if state is not None else _blank_session())
+    return _attach_media(session, db.list_session_media(wa_id))
+
+
+class _SessionStore:
+    """Mapping interface over wa_sessions (state) and wa_session_media (media)."""
+
+    def __getitem__(self, wa_id):
+        state = _load_state(wa_id)
+        rows = db.list_session_media(wa_id)
+        if state is None and not rows:
+            raise KeyError(wa_id)
+        session = _BoundSession(wa_id, state if state is not None else _blank_session())
+        return _attach_media(session, rows)
+
+    def __setitem__(self, wa_id, session):
+        data = dict(session or {})
+        for key in _DERIVED_KEYS:
+            if data.pop(key, None):
+                raise ValueError(f"session {key} cannot be assigned; use add_session_media")
+        data = {**_blank_session(), **data}
+        if data.get("updated") is None:
+            data["updated"] = time.time()
+        _persist(wa_id, data)
+
+    def __delitem__(self, wa_id):
+        db.delete_session(wa_id)
+
+    def __contains__(self, wa_id):
+        return _load_state(wa_id) is not None or bool(db.list_session_media(wa_id))
+
+    def get(self, wa_id, default=None):
+        try:
+            return self[wa_id]
+        except KeyError:
+            return default
+
+    def pop(self, wa_id, *args):
+        """End the conversation state. Media rows are left alone: any still
+        present arrived after the state being ended and start the next claim."""
+        session = _load_state(wa_id)
+        if session is None:
+            if args:
+                return args[0]
+            raise KeyError(wa_id)
+        db.delete_session(wa_id)
+        return session
+
+    def clear(self):
+        db.clear_sessions()
+        db.clear_session_media()
+
+    def items(self):
+        wa_ids = {str(wa_id) for wa_id, _ in db.list_sessions()}
+        wa_ids |= set(db.session_media_activity())
+        for wa_id in sorted(wa_ids):
+            yield wa_id, _view(wa_id)
+
+
+SESSIONS = _SessionStore()
+
+
+def add_session_media(wa_id, media_id, kind, sha256, page=0, source_bytes=None):
+    """Append one stored item to a session. None means it was already there."""
+    return db.add_session_media(wa_id, media_id, kind, sha256, page, source_bytes)
+
+
+def _last_activity(state, rows):
+    times = [float(row["received_at"] or 0) for row in rows]
+    if state is not None:
+        times.append(float(state.get("updated") or 0))
+    return max(times) if times else 0.0
+
+
+def _expire_loaded(wa_id, state, rows, now):
+    """Expire a loaded session if it has been idle for 30 minutes.
+
+    Media and orphaned blobs are deleted. When media is dropped, a small state
+    row keeps an expiry notice so the customer is told the next time they
+    write, however much later that is. Returns (notice, state, rows) as they
+    stand afterwards.
+    """
+    if state is None and not rows:
+        return None, state, rows
+    if wa_id in ANALYSING_IDS:
+        return None, state, rows
+    if now - _last_activity(state, rows) <= PENDING_CHOICE_TIMEOUT:
+        return None, state, rows
+    if state is not None and state.get("expired_notice") and not rows:
+        return None, state, rows
+    dropped = db.delete_session_media(wa_id, [row["id"] for row in rows]) if rows else []
+    notice = {
+        "photos": sum(1 for row in dropped if row["kind"] == "photo"),
+        "docs": len({row["sha256"] for row in dropped if row["kind"] != "photo"}),
+    }
+    if notice["photos"] or notice["docs"]:
+        tombstone = {"expired_notice": notice, "updated": now}
+        db.put_session(str(wa_id), json.dumps(tombstone), now)
+        return notice, tombstone, []
+    db.delete_session(wa_id)
+    return None, None, []
+
+
+def expire_idle_session(wa_id, now=None):
+    now = time.time() if now is None else now
+    notice, _, _ = _expire_loaded(
+        wa_id, _load_state(wa_id), db.list_session_media(wa_id), now
+    )
+    return notice
+
+
+def expiry_text(notice):
+    photos, docs = notice.get("photos"), notice.get("docs")
+    if photos and docs:
+        subject = "photos and documents"
+    elif docs:
+        subject = "documents"
+    else:
+        subject = "photos"
+    return f"Your earlier {subject} expired after 30 minutes. Please send them again."
+
+
+def take_expiry_notice(wa_id):
+    """Expire this number's idle session and return the notice to send, once."""
+    _, state, _ = _expire_loaded(
+        wa_id, _load_state(wa_id), db.list_session_media(wa_id), time.time()
+    )
+    if not state or not state.get("expired_notice"):
+        return None
+    db.delete_session(wa_id)
+    return expiry_text(state["expired_notice"])
+
+
+SWEEP_INTERVAL = 5 * 60
+_LAST_SWEEP = {"at": 0.0}
+
+
+def sweep_idle_sessions(now=None):
+    """Expire every idle session and purge orphaned session blobs, at most once
+    per SWEEP_INTERVAL. Never raises: a failed sweep must not lose a message."""
+    now = time.time() if now is None else now
+    if now - _LAST_SWEEP["at"] < SWEEP_INTERVAL:
+        return
+    _LAST_SWEEP["at"] = now
+    try:
+        wa_ids = {str(wa_id) for wa_id, _ in db.list_sessions()}
+        wa_ids |= set(db.session_media_activity())
+        for wa_id in wa_ids:
+            expire_idle_session(wa_id, now)
+        db.purge_orphan_session_media(PENDING_CHOICE_TIMEOUT)
+    except Exception:
+        print("[whatsapp] session sweep failed:", flush=True)
+        traceback.print_exc()
+
+
+def get_session(wa_id):
+    """Return the live session (state plus a view of its media). An idle one is
+    expired first; a stale analysing flag from a dead process is cleared."""
+    _, state, rows = _expire_loaded(
+        wa_id, _load_state(wa_id), db.list_session_media(wa_id), time.time()
+    )
+    if state is not None and state.get("expired_notice"):
+        state = None
+    session = _BoundSession(wa_id, {**_blank_session(), **(state or {})})
+    if state is not None and state.get("analysing") and wa_id not in ANALYSING_IDS:
+        # The analysis lock does not survive a restart, so this flag cannot either.
+        session.update(analysing=False, analysis_cutoff=None)
+    return _attach_media(session, rows)
+
+
+def reset_session(wa_id):
+    """Fresh conversation state. Media rows are untouched."""
+    session = _BoundSession(wa_id, _blank_session())
+    _persist(wa_id, session)
+    return _attach_media(session, db.list_session_media(wa_id))
 
 
 def normalised_command(text):
@@ -740,13 +1016,13 @@ async def handle_pending_choice(wa_id, text):
             decision=pending.get("decision"),
             decision_reasons=pending.get("decision_reasons"),
         )
-        await send_text(wa_id, reply)
-        session["pending_choice"] = None
-        session["pending_prompt"] = None
+        # State is written before the await so a message arriving meanwhile
+        # never sees, or is overwritten by, a stale copy.
         if session.get("photos") or session.get("docs"):
-            session["updated"] = time.time()
+            session.update(pending_choice=None, pending_prompt=None, updated=time.time())
         else:
             SESSIONS.pop(wa_id, None)
+        await send_text(wa_id, reply)
         return True
 
     session["updated"] = time.time()
@@ -765,44 +1041,118 @@ async def handle_pending_choice(wa_id, text):
     return True
 
 
-def _take_next_claim(session):
-    photos = list(session.get("next_photos") or [])
-    docs = list(session.get("next_docs") or [])
-    hashes = set(session.get("next_hashes") or [])
-    session["next_photos"] = []
-    session["next_docs"] = []
-    session["next_hashes"] = set()
-    if not photos and not docs:
-        return None
-    fresh = _blank_session()
-    fresh["photos"] = photos
-    fresh["docs"] = docs
-    fresh["content_hashes"] = hashes
-    return fresh
+def _materialise_media(wa_id, rows):
+    """Write session media to temp files for the pipeline. Ids stay in the DB.
+
+    Returns (photos, page_paths, created, documents, missing). photos is a
+    list of (path, sha256, source_bytes); documents lists one (filename,
+    sha256, source_bytes) per source PDF, in arrival order.
+    """
+    from main import UPLOAD_DIR
+
+    folder = os.path.join(UPLOAD_DIR, f"wa_{wa_id}")
+    photos, page_paths, created, documents = [], [], [], []
+    document_numbers = {}
+    missing = 0
+    for row in rows:
+        loaded = db.media_get(row["media_id"])
+        if not loaded:
+            missing += 1
+            print(f"[whatsapp] session media missing for {wa_id}", flush=True)
+            continue
+        data, mime = loaded
+        if row["kind"] == "document_page":
+            sha = row["sha256"]
+            if sha not in document_numbers:
+                document_numbers[sha] = len(document_numbers) + 1
+                documents.append((
+                    f"document{document_numbers[sha]}.pdf", sha, row.get("source_bytes"),
+                ))
+            name = f"document{document_numbers[sha]}-page{int(row['page'])}.jpg"
+        else:
+            extension = _MIME_EXTENSIONS.get(str(mime or "").lower(), ".jpg")
+            name = f"photo{len(photos) + 1}-{str(row['media_id'])[:12]}{extension}"
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, name)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        if row["kind"] == "document_page":
+            page_paths.append(path)
+        else:
+            photos.append((path, row["sha256"], row.get("source_bytes")))
+        created.append(path)
+    return photos, page_paths, created, documents, missing
+
+
+def _release_materialised(paths):
+    if not paths:
+        return
+    from main import _release_temp_uploads
+
+    _release_temp_uploads(paths)
+
+
+def _missing_media_text(count):
+    if count == 1:
+        return "1 of your files could not be loaded and was left out. Please send it again."
+    return (
+        f"{count} of your files could not be loaded and were left out. "
+        "Please send them again."
+    )
+
+
+def _register_files(claim_id, documents, photos):
+    from db import save_file
+
+    for filename, sha, size in documents:
+        save_file(claim_id, filename, "document", None, sha, size)
+    for path, sha, size in photos:
+        save_file(claim_id, os.path.basename(path), "photo", path, sha, size)
 
 
 async def process_session(wa_id, skip_missing=False):
     if wa_id in ANALYSING_IDS:
         await send_text(wa_id, ANALYSIS_BUSY_REPLY)
         return
+    # Resolve expiry before taking the lock so a restarted process does not
+    # keep an analysing flag whose lock died with the previous process.
+    session = get_session(wa_id)
     ANALYSING_IDS.add(wa_id)
     keep_session = False
+    temp_paths = []
+    consumed = None
+    claim_id = None
     try:
-        session = SESSIONS.get(wa_id)
-        if session is None:
-            session = get_session(wa_id)
-        intake = classify_session_intake(session)
+        rows = db.list_session_media(wa_id)
+        # Snapshot: exactly these rows belong to this claim, and the number is
+        # busy from here on. Anything that arrives while we classify or analyse
+        # has a higher id and starts the next claim.
+        session.update(
+            analysing=True,
+            analysis_cutoff=max((row["id"] for row in rows), default=0),
+            updated=time.time(),
+        )
+        photos, page_paths, temp_paths, documents, missing_media = await asyncio.to_thread(
+            _materialise_media, wa_id, rows
+        )
+        photo_paths = [path for path, _, _ in photos]
+        view = {"photos": photo_paths, "docs": page_paths}
+        intake = await asyncio.to_thread(classify_session_intake, view)
         missing = list(intake.get("missing") or [])
-        if not intake.get("vehicle_count"):
-            session["awaiting_docs"] = True
-            session["updated"] = time.time()
+        state = {"intake": intake, "missing_docs": missing}
+        notices = [_missing_media_text(missing_media)] if missing_media else []
+        # Reload: a session copy held across an await is never written back.
+        session = get_session(wa_id)
+        if not intake.get("vehicle_count") or (
+            missing and (not skip_missing or strict_docs_enabled())
+        ):
+            session.update(
+                **state, awaiting_docs=True, analysing=False, analysis_cutoff=None,
+                updated=time.time(),
+            )
             keep_session = True
-            await send_text(wa_id, checklist_reply(intake))
-            return
-        if missing and (not skip_missing or strict_docs_enabled()):
-            session["awaiting_docs"] = True
-            session["updated"] = time.time()
-            keep_session = True
+            for notice in notices:
+                await send_text(wa_id, notice)
             await send_text(wa_id, checklist_reply(intake))
             return
 
@@ -815,35 +1165,28 @@ async def process_session(wa_id, skip_missing=False):
                 f"documents not provided: {missing_names}"
             )
 
-        session["awaiting_docs"] = False
-        photo_paths = list(session.get("photos") or [])
-        doc_paths = list(session.get("docs") or [])
-        session["analysing"] = True
-        session["next_photos"] = []
-        session["next_docs"] = []
-        session["next_hashes"] = set()
+        consumed = [row["id"] for row in rows]
+        session.update(**state, awaiting_docs=False, updated=time.time())
+        for notice in notices:
+            await send_text(wa_id, notice)
         await send_text(wa_id, ANALYSING_REPLY)
 
         claim_id = "CLM-" + uuid.uuid4().hex[:8].upper()
 
         # Registered here so the duplicate gate can write phash back against these rows,
         # exactly as the /api/analyze upload path does.
-        from db import save_file
-
-        for path in doc_paths:
-            save_file(claim_id, os.path.basename(path), "document", path)
-        for path in photo_paths:
-            save_file(claim_id, os.path.basename(path), "photo", path)
+        await asyncio.to_thread(_register_files, claim_id, documents, photos)
 
         from main import analyse_claim  # deferred: main imports this module at startup
 
         payload = await analyse_claim(
             claim_id,
-            doc_paths,
+            [],
             photo_paths,
             source="whatsapp",
             from_number=wa_id,
             forced_review_reasons=forced_review_reasons,
+            page_paths=page_paths,
         )
         reply = format_reply(payload)
         vehicles = [
@@ -861,37 +1204,45 @@ async def process_session(wa_id, skip_missing=False):
                 or (len(vehicles) == 1 and has_duplicate_group)
             )
         )
-        fresh = _take_next_claim(session)
-        if fresh is not None:
-            SESSIONS[wa_id] = fresh
+        await asyncio.to_thread(db.delete_session_media, wa_id, consumed)
+        consumed = None
+        live = get_session(wa_id)
+        if live["photos"] or live["docs"]:
+            # Media that arrived during the analysis is the next claim.
+            reset_session(wa_id)
             keep_session = True
         elif needs_choice:
-            session["analysing"] = False
-            session["photos"] = []
-            session["docs"] = []
-            session["content_hashes"] = set()
-            session["pending_choice"] = {
-                "claim_id": payload.get("claim_id", claim_id),
-                "vehicles": vehicles,
-                "undetermined": payload.get("undetermined") or [],
-                "decision": payload.get("decision"),
-                "decision_reasons": payload.get("decision_reasons") or [],
-            }
-            session["pending_prompt"] = reply
-            session["updated"] = time.time()
+            live.update(
+                analysing=False,
+                analysis_cutoff=None,
+                pending_choice={
+                    "claim_id": payload.get("claim_id", claim_id),
+                    "vehicles": vehicles,
+                    "undetermined": payload.get("undetermined") or [],
+                    "decision": payload.get("decision"),
+                    "decision_reasons": payload.get("decision_reasons") or [],
+                },
+                pending_prompt=reply,
+                updated=time.time(),
+            )
             keep_session = True
         await send_text(wa_id, reply)
     except Exception:
         print("[whatsapp] process_session failed:", flush=True)
         traceback.print_exc()
+        if consumed is not None and claim_id and await asyncio.to_thread(db.get_claim, claim_id) is None:
+            # Nothing was saved: keep the media so DONE retries it, and drop the
+            # half-written file rows so the retry is not matched as a duplicate.
+            await asyncio.to_thread(db.delete_files_for_claim, claim_id)
+            consumed = None
         await send_text(wa_id, "Something went wrong processing your claim. Please try again.")
     finally:
-        current = SESSIONS.get(wa_id)
-        if current is not None:
-            fresh = _take_next_claim(current)
-            if fresh is not None:
-                SESSIONS[wa_id] = fresh
-                keep_session = True
+        _release_materialised(temp_paths)
+        if consumed:
+            db.delete_session_media(wa_id, consumed)
         if not keep_session:
-            SESSIONS.pop(wa_id, None)
+            if db.list_session_media(wa_id):
+                reset_session(wa_id)
+            else:
+                SESSIONS.pop(wa_id, None)
         ANALYSING_IDS.discard(wa_id)

@@ -1,0 +1,48 @@
+# Render Blueprint. It applies when the service is created or synced from this
+# file (Blueprints in the dashboard). A service created by hand ignores it, and
+# an existing service's region cannot be changed in place.
+services:
+  - type: web
+    name: claimpilot
+    runtime: python
+    plan: free
+    # Same region as the Neon database (aws us-west-2).
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    # Exactly one worker: the per-number analysis lock (ANALYSING_IDS) lives in
+    # process memory, so a second worker could analyse one session twice.
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    # No healthCheckPath: /api/health queries the database, and frequent
+    # checks would keep Neon awake and spend its free compute hours.
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.11
+      # Secrets and deployment-specific values are entered in the dashboard.
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: WHATSAPP_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_VERIFY_TOKEN
+        sync: false
+      - key: WHATSAPP_WABA_ID
+        sync: false
+      - key: GRAPH_API_VERSION
+        sync: false
+      - key: SIGHTENGINE_API_USER
+        sync: false
+      - key: SIGHTENGINE_API_SECRET
+        sync: false
+      # Optional, with code defaults: VISION_PROVIDERS, GROQ_VISION_MODEL,
+      # GEMINI_VISION_MODEL, OPENROUTER_VISION_MODEL, CACHE_ENABLED,
+      # AI_DETECTION_ENABLED, REQUIRED_DOCS, STRICT_DOCS,
+      # VISION_TIMEOUT_SECONDS (45), ANALYSIS_CONCURRENCY (2).

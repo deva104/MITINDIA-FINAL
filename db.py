@@ -25,12 +25,14 @@ CREATE TABLE IF NOT EXISTS claims (
     payload_json TEXT
 );
 CREATE TABLE IF NOT EXISTS files (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    claim_id TEXT,
-    filename TEXT,
-    kind     TEXT,
-    path     TEXT,
-    phash    TEXT
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id      TEXT,
+    filename      TEXT,
+    kind          TEXT,
+    path          TEXT,
+    phash         TEXT,
+    source_sha256 TEXT,
+    source_bytes  INTEGER
 );
 CREATE TABLE IF NOT EXISTS vision_cache (
     content_hash  TEXT PRIMARY KEY,
@@ -63,6 +65,26 @@ CREATE TABLE IF NOT EXISTS media (
     bytes      BLOB,
     created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS wa_sessions (
+    wa_id      TEXT PRIMARY KEY,
+    state_json TEXT,
+    updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS wa_last_inbound (
+    wa_id TEXT PRIMARY KEY,
+    at    TEXT
+);
+CREATE TABLE IF NOT EXISTS wa_session_media (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    wa_id        TEXT NOT NULL,
+    media_id     TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    sha256       TEXT NOT NULL,
+    page         INTEGER NOT NULL DEFAULT 0,
+    source_bytes INTEGER,
+    received_at  REAL NOT NULL,
+    UNIQUE (wa_id, sha256, page)
+);
 """
 
 POSTGRES_SCHEMA = (
@@ -75,12 +97,14 @@ POSTGRES_SCHEMA = (
     """,
     """
     CREATE TABLE IF NOT EXISTS files (
-        id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-        claim_id TEXT,
-        filename TEXT,
-        kind     TEXT,
-        path     TEXT,
-        phash    TEXT
+        id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        claim_id      TEXT,
+        filename      TEXT,
+        kind          TEXT,
+        path          TEXT,
+        phash         TEXT,
+        source_sha256 TEXT,
+        source_bytes  BIGINT
     )
     """,
     """
@@ -122,6 +146,39 @@ POSTGRES_SCHEMA = (
         created_at TEXT
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS wa_sessions (
+        wa_id      TEXT PRIMARY KEY,
+        state_json TEXT,
+        updated_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS wa_last_inbound (
+        wa_id TEXT PRIMARY KEY,
+        at    TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS wa_session_media (
+        id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        wa_id        TEXT NOT NULL,
+        media_id     TEXT NOT NULL,
+        kind         TEXT NOT NULL,
+        sha256       TEXT NOT NULL,
+        page         INTEGER NOT NULL DEFAULT 0,
+        source_bytes BIGINT,
+        received_at  DOUBLE PRECISION NOT NULL,
+        UNIQUE (wa_id, sha256, page)
+    )
+    """,
+)
+
+# Columns added after a table first shipped. CREATE TABLE IF NOT EXISTS does not
+# add them to an existing table, so init_db adds any that are missing.
+ADDED_COLUMNS = (
+    ("files", "source_sha256", "TEXT"),
+    ("files", "source_bytes", "BIGINT"),
 )
 
 TABLES = (
@@ -131,6 +188,9 @@ TABLES = (
     "audit_log",
     "processed_messages",
     "media",
+    "wa_sessions",
+    "wa_last_inbound",
+    "wa_session_media",
 )
 
 
@@ -162,12 +222,34 @@ class DatabaseConnection:
         self._postgres = postgres
         self._pool = pool
         self._closed = False
+        self._statements = 0
+
+    def _replace_dead_connection(self):
+        try:
+            self._pool.putconn(self._raw)  # the pool discards a broken connection
+        except Exception:
+            try:
+                self._raw.close()
+            except Exception:
+                pass
+        self._raw = self._pool.getconn()
 
     def execute(self, sql, params=None):
         values = tuple(params or ())
         if not self._postgres:
             return self._raw.execute(sql, values)
-        cursor = self._raw.execute(sql.replace("?", "%s"), values or None)
+        statement = sql.replace("?", "%s")
+        try:
+            cursor = self._raw.execute(statement, values or None)
+        except Exception as error:
+            # Retry once, and only when the connection died before this
+            # checkout ran anything: nothing can have been half-applied.
+            if self._statements or not _is_connection_error(error):
+                raise
+            print(f"[db] connection dropped ({type(error).__name__}); retrying once", flush=True)
+            self._replace_dead_connection()
+            cursor = self._raw.execute(statement, values or None)
+        self._statements += 1
         rows = []
         if cursor.description:
             columns = [column.name for column in cursor.description]
@@ -249,10 +331,34 @@ def _pool():
             DB_URL,
             min_size=1,
             max_size=5,
-            kwargs={"autocommit": False, "prepare_threshold": None},
+            kwargs={
+                "autocommit": False,
+                "prepare_threshold": None,
+                # Notice a dead peer in about a minute instead of never.
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 3,
+            },
+            # Neon closes idle connections. Check before checkout so a dead
+            # one is discarded instead of failing the next statement.
+            check=ConnectionPool.check_connection,
+            max_idle=120,
+            max_lifetime=600,
+            # Fail a request in 10 s rather than hang a worker for 30. Raise it
+            # for runs far from the database (e.g. tests from India to Oregon).
+            timeout=float(os.getenv("DB_POOL_TIMEOUT", "10") or 10),
             open=True,
         )
     return _POOL
+
+
+def _is_connection_error(error):
+    try:
+        import psycopg
+    except ImportError:
+        return False
+    return isinstance(error, psycopg.OperationalError)
 
 
 def get_conn():
@@ -270,8 +376,19 @@ def init_db():
         if BACKEND == "postgres":
             for statement in POSTGRES_SCHEMA:
                 conn.execute(statement)
+            for table, column, column_type in ADDED_COLUMNS:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {column_type}"
+                )
         else:
             conn.executescript(SQLITE_SCHEMA)
+            for table, column, column_type in ADDED_COLUMNS:
+                existing = {
+                    row["name"]
+                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
         conn.commit()
     finally:
         conn.close()
@@ -341,25 +458,42 @@ def save_claim(claim_id, payload_dict):
         conn.close()
 
 
-def save_file(claim_id, filename, kind, path):
+def save_file(claim_id, filename, kind, path, source_sha256=None, source_bytes=None):
+    """Register one claim input. source_sha256/source_bytes describe the original
+    upload, so an identical resubmission is detectable after the bytes are gone."""
+    values = (claim_id, filename, kind, path, source_sha256, source_bytes)
     conn = get_conn()
     try:
         if BACKEND == "postgres":
             cursor = conn.execute(
                 """
-                INSERT INTO files (claim_id, filename, kind, path, phash)
-                VALUES (%s, %s, %s, %s, NULL)
+                INSERT INTO files (claim_id, filename, kind, path, phash, source_sha256, source_bytes)
+                VALUES (%s, %s, %s, %s, NULL, %s, %s)
                 RETURNING id
                 """,
-                (claim_id, filename, kind, path),
+                values,
             )
         else:
             cursor = conn.execute(
-                "INSERT INTO files (claim_id, filename, kind, path, phash) VALUES (?, ?, ?, ?, NULL)",
-                (claim_id, filename, kind, path),
+                """
+                INSERT INTO files (claim_id, filename, kind, path, phash, source_sha256, source_bytes)
+                VALUES (?, ?, ?, ?, NULL, ?, ?)
+                """,
+                values,
             )
         conn.commit()
         return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def delete_files_for_claim(claim_id):
+    """Remove file rows of a claim that was never saved, so a retry of the same
+    photos is not matched against them by the duplicate gate."""
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM files WHERE claim_id = ?", (claim_id,))
+        conn.commit()
     finally:
         conn.close()
 
@@ -627,23 +761,17 @@ def media_put(data, mime, kind, claim_id):
             data,
             datetime.now().isoformat(),
         )
-        if BACKEND == "postgres":
-            conn.execute(
-                """
-                INSERT INTO media (id, claim_id, kind, mime, bytes, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (id) DO NOTHING
-                """,
-                values,
-            )
-        else:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO media (id, claim_id, kind, mime, bytes, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                values,
-            )
+        # Same bytes stored again keep the first row, but a claim id is adopted so
+        # session cleanup never deletes a blob a claim now points at.
+        conn.execute(
+            """
+            INSERT INTO media (id, claim_id, kind, mime, bytes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (id) DO UPDATE SET
+                claim_id = COALESCE(media.claim_id, EXCLUDED.claim_id)
+            """,
+            values,
+        )
         conn.commit()
         return media_id
     finally:
@@ -670,6 +798,250 @@ def media_get(media_id):
         if not row:
             return None
         return _blob(row["bytes"]), row["mime"] or "application/octet-stream"
+    finally:
+        conn.close()
+
+
+def put_session(wa_id, state_json, updated_at):
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO wa_sessions (wa_id, state_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT (wa_id) DO UPDATE SET
+                state_json = EXCLUDED.state_json,
+                updated_at = EXCLUDED.updated_at
+            """,
+            (str(wa_id), state_json, str(updated_at)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_session(wa_id):
+    if not wa_id:
+        return None
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT state_json FROM wa_sessions WHERE wa_id = ?",
+            (str(wa_id),),
+        ).fetchone()
+        if not row:
+            return None
+        return row["state_json"]
+    finally:
+        conn.close()
+
+
+def delete_session(wa_id):
+    if not wa_id:
+        return
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM wa_sessions WHERE wa_id = ?", (str(wa_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_sessions():
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT wa_id, state_json FROM wa_sessions"
+        ).fetchall()
+        return [(row["wa_id"], row["state_json"]) for row in rows]
+    finally:
+        conn.close()
+
+
+def clear_sessions():
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM wa_sessions")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def touch_last_inbound(wa_id, at):
+    if not wa_id:
+        return
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO wa_last_inbound (wa_id, at)
+            VALUES (?, ?)
+            ON CONFLICT (wa_id) DO UPDATE SET
+                at = EXCLUDED.at
+            """,
+            (str(wa_id), str(at)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_last_inbound(wa_id):
+    if not wa_id:
+        return None
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT at FROM wa_last_inbound WHERE wa_id = ?",
+            (str(wa_id),),
+        ).fetchone()
+        if not row:
+            return None
+        return row["at"]
+    finally:
+        conn.close()
+
+
+def clear_last_inbound():
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM wa_last_inbound")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+SESSION_MEDIA_COLUMNS = "id, wa_id, media_id, kind, sha256, page, source_bytes, received_at"
+
+
+def add_session_media(wa_id, media_id, kind, sha256, page=0, source_bytes=None, received_at=None):
+    """Append one item to a WhatsApp session. Returns the row id, or None when
+    the same content (wa_id, sha256, page) is already in the session."""
+    values = (
+        str(wa_id), media_id, kind, sha256, int(page), source_bytes,
+        time.time() if received_at is None else float(received_at),
+    )
+    conn = get_conn()
+    try:
+        if BACKEND == "postgres":
+            row = conn.execute(
+                """
+                INSERT INTO wa_session_media
+                    (wa_id, media_id, kind, sha256, page, source_bytes, received_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (wa_id, sha256, page) DO NOTHING
+                RETURNING id
+                """,
+                values,
+            ).fetchone()
+            inserted = row["id"] if row else None
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO wa_session_media
+                    (wa_id, media_id, kind, sha256, page, source_bytes, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (wa_id, sha256, page) DO NOTHING
+                """,
+                values,
+            )
+            inserted = cursor.lastrowid if cursor.rowcount == 1 else None
+        conn.commit()
+        return inserted
+    finally:
+        conn.close()
+
+
+def list_session_media(wa_id):
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            f"SELECT {SESSION_MEDIA_COLUMNS} FROM wa_session_media WHERE wa_id = ? ORDER BY id",
+            (str(wa_id),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def session_media_activity():
+    """{wa_id: latest received_at} for every number that has session media."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT wa_id, MAX(received_at) AS latest FROM wa_session_media GROUP BY wa_id"
+        ).fetchall()
+        return {row["wa_id"]: float(row["latest"] or 0) for row in rows}
+    finally:
+        conn.close()
+
+
+def delete_session_media(wa_id, row_ids=None):
+    """Delete a session's media rows (all, or the given ids) and any blob that
+    nothing references any more. Returns the deleted rows."""
+    conn = get_conn()
+    try:
+        rows = [
+            dict(row) for row in conn.execute(
+                f"SELECT {SESSION_MEDIA_COLUMNS} FROM wa_session_media WHERE wa_id = ?",
+                (str(wa_id),),
+            ).fetchall()
+        ]
+        if row_ids is not None:
+            wanted = {int(value) for value in row_ids}
+            rows = [row for row in rows if int(row["id"]) in wanted]
+        for row in rows:
+            conn.execute("DELETE FROM wa_session_media WHERE id = ?", (row["id"],))
+        for media_id in {row["media_id"] for row in rows}:
+            _delete_unreferenced_media(conn, media_id)
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def _delete_unreferenced_media(conn, media_id):
+    conn.execute(
+        """
+        DELETE FROM media
+        WHERE id = ? AND claim_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM wa_session_media WHERE media_id = ?)
+        """,
+        (media_id, media_id),
+    )
+
+
+SESSION_MEDIA_KINDS = ("photo", "document", "document_page")
+
+
+def purge_orphan_session_media(older_than_seconds):
+    """Delete session blobs (claim_id NULL) that no session row references and
+    that are older than the given age. Returns the number of blobs removed."""
+    cutoff = datetime.fromtimestamp(time.time() - older_than_seconds).isoformat()
+    marks = ", ".join("?" for _ in SESSION_MEDIA_KINDS)
+    conn = get_conn()
+    try:
+        cursor = conn.execute(
+            f"""
+            DELETE FROM media
+            WHERE claim_id IS NULL AND kind IN ({marks}) AND created_at < ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM wa_session_media WHERE wa_session_media.media_id = media.id
+              )
+            """,
+            (*SESSION_MEDIA_KINDS, cutoff),
+        )
+        conn.commit()
+        return cursor.rowcount or 0
+    finally:
+        conn.close()
+
+
+def clear_session_media():
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM wa_session_media")
+        conn.commit()
     finally:
         conn.close()
 

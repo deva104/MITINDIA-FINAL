@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from db import cache_get, cache_put, current_claim_id, media_put
+from db import MAX_MEDIA_BYTES, cache_get, cache_put, current_claim_id, media_put
 from PIL import ExifTags, Image, ImageChops, ImageEnhance
 from rules import parse_date
 
@@ -57,15 +57,49 @@ def _open_image(path):
 
 
 MAX_STORED_EDGE = 2048
-MAX_STORED_BYTES = 8 * 1024 * 1024
+MAX_STORED_BYTES = MAX_MEDIA_BYTES
+STORED_QUALITY = 90
+# Tried in order only when the photo is still over the media cap at quality 90.
+FALLBACK_ENCODINGS = ((2048, 80), (2048, 70), (1600, 70), (1280, 60), (1024, 50))
+
+
+def _encode_within(image, max_bytes, encodings, exif=None):
+    data = b""
+    for edge, quality in encodings:
+        converted = image.convert("RGB")
+        converted.thumbnail((edge, edge), Image.LANCZOS)
+        buffer = io.BytesIO()
+        options = {"format": "JPEG", "quality": quality}
+        if exif:
+            options["exif"] = exif
+        converted.save(buffer, **options)
+        data = buffer.getvalue()
+        if len(data) <= max_bytes:
+            return data
+    return data
+
+
+PAGE_ENCODINGS = ((1568, 70), (1568, 55), (1280, 50), (1024, 45))
+
+
+def fit_jpeg(data, max_bytes=MAX_MEDIA_BYTES):
+    """Return JPEG bytes within the media cap: unchanged when they already fit,
+    otherwise re-encoded at falling quality. Used for rendered document pages."""
+    if len(data) <= max_bytes:
+        return data
+    with Image.open(io.BytesIO(data)) as image:
+        image.load()
+        return _encode_within(image, max_bytes, PAGE_ENCODINGS)
 
 
 def prepare_uploaded_image(data):
     """Return stored bytes, or None when the upload is not a readable image.
 
-    Bytes at or below the size and edge limits are returned unchanged so a
-    normal photo keeps the hash the duplicate gate already stored. Larger
-    uploads are downscaled to a JPEG before anything else opens them.
+    Bytes at or below the media cap and edge limit are returned unchanged so a
+    normal photo keeps the hash the duplicate gate already stored. Anything
+    larger is re-encoded to a JPEG of at most 2048px at quality 90 (lower only
+    if that is still over the cap), keeping its EXIF so the capture checks still
+    have something to read. Never rejects a readable photo for size.
     """
     if not data:
         return None
@@ -75,11 +109,13 @@ def prepare_uploaded_image(data):
             width, height = image.size
             if len(data) <= MAX_STORED_BYTES and max(width, height) <= 4096:
                 return data
-            converted = image.convert("RGB")
-            converted.thumbnail((MAX_STORED_EDGE, MAX_STORED_EDGE), Image.LANCZOS)
-            buffer = io.BytesIO()
-            converted.save(buffer, format="JPEG", quality=85)
-            return buffer.getvalue()
+            exif = image.info.get("exif")
+            return _encode_within(
+                image,
+                MAX_STORED_BYTES,
+                ((MAX_STORED_EDGE, STORED_QUALITY),) + FALLBACK_ENCODINGS,
+                exif=exif if isinstance(exif, (bytes, bytearray)) else None,
+            )
     except Exception:
         return None
 
@@ -427,16 +463,28 @@ def _claim_coordinates(value):
     return None
 
 
-def check_duplicate(image, path, conn):
-    """Compare against phashes already stored in our files table, then record ours."""
+def check_duplicate(image, path, conn, claim_id=None):
+    """Compare against phashes stored for every other claim, then record ours.
+
+    Rows are excluded by claim id, never by path: temp paths can repeat across
+    claims, and a path match must not hide an earlier claim's photo.
+    """
     hash_image = image.copy()
     hash_image.thumbnail((256, 256), Image.LANCZOS)
     phash = str(imagehash.phash(hash_image))
 
-    rows = conn.execute(
-        "SELECT filename, path, phash, claim_id FROM files WHERE phash IS NOT NULL AND path != ?",
-        (path,),
-    ).fetchall()
+    if claim_id:
+        rows = conn.execute(
+            """
+            SELECT filename, path, phash, claim_id FROM files
+            WHERE phash IS NOT NULL AND (claim_id IS NULL OR claim_id <> ?)
+            """,
+            (claim_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT filename, path, phash, claim_id FROM files WHERE phash IS NOT NULL",
+        ).fetchall()
 
     match = None
     for row in rows:
@@ -450,14 +498,25 @@ def check_duplicate(image, path, conn):
             match = (stored_name, distance, stored_claim)
             break
 
-    conn.execute("UPDATE files SET phash = ? WHERE path = ?", (phash, path))
+    if claim_id:
+        conn.execute(
+            "UPDATE files SET phash = ? WHERE claim_id = ? AND path = ?",
+            (phash, claim_id, path),
+        )
+    else:
+        conn.execute("UPDATE files SET phash = ? WHERE path = ?", (phash, path))
     conn.commit()
 
     return phash, match, len(rows)
 
 
-def check_duplicates(photo_paths, conn):
-    """Stage 0: perceptual-hash duplicate detection only."""
+def check_duplicates(photo_paths, conn, claim_id=None):
+    """Stage 0: perceptual-hash duplicate detection only.
+
+    claim_id defaults to the claim being analysed, so its own rows are skipped.
+    """
+    if claim_id is None:
+        claim_id = current_claim_id.get()
     results = []
 
     def add(verdict, detail, path):
@@ -477,7 +536,7 @@ def check_duplicates(photo_paths, conn):
                 continue
 
             try:
-                phash, match, compared = check_duplicate(image, path, conn)
+                phash, match, compared = check_duplicate(image, path, conn, claim_id)
                 if match:
                     stored_name, distance, stored_claim = match
                     # The stored filename is an upload blob name, meaningless to a

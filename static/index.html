@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ClaimPilot AI — Motor Claim Assessment</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23133646'/%3E%3Ctext x='16' y='21' text-anchor='middle' font-family='Arial' font-size='12' font-weight='700' fill='white'%3ECP%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -79,17 +80,29 @@
     <!-- CLAIM VIEW -->
     <section class="view hidden" id="viewClaim">
       <div class="verdict" id="verdict">
-        <span class="verdict-id" id="verdictId"></span>
+        <div class="verdict-meta">
+          <span class="verdict-id" id="verdictId"></span>
+          <span class="source-badge hidden" id="verdictSource"></span>
+          <span class="verdict-confidence hidden" id="verdictConfidence"></span>
+        </div>
         <h1 class="verdict-title" id="verdictTitle"></h1>
         <p class="verdict-sub" id="verdictSub"></p>
       </div>
 
       <div class="gutter">
+        <div class="card undetermined-card hidden" id="undeterminedCard">
+          <span class="label">Could not determine</span>
+          <div class="stack" id="undetermined"></div>
+        </div>
+
         <div class="card pipeline">
           <span class="label">Pipeline trace</span>
           <div class="bars" id="bars"></div>
           <p class="pipeline-callout hidden" id="pipelineCallout"></p>
         </div>
+
+        <div class="multi-vehicle hidden" id="multiVehicle"></div>
+        <div class="vehicles hidden" id="vehicles"></div>
 
         <div class="grid">
           <div class="col-left">
@@ -116,7 +129,7 @@
               <span class="label">Extracted fields</span>
               <div class="fields" id="fields"></div>
             </div>
-            <div class="card">
+            <div class="card" id="damageCard">
               <span class="label">Damage assessment</span>
               <div class="stack" id="damage"></div>
             </div>

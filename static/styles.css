@@ -144,6 +144,12 @@ button{font-family:inherit}
 .claim-id{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--ink)}
 .claim-time{font-size:11px;color:var(--muted)}
 .claim-sum{font-size:13px;color:var(--muted);margin:6px 0 0;line-height:1.45}
+.claim-source{margin-top:8px}
+.source-badge{
+  display:inline-block;border-radius:4px;padding:3px 8px;
+  font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.03em;
+  color:var(--navy);background:rgba(20,26,74,.08);
+}
 
 /* ---------- upload view ---------- */
 .upload-wrap{max-width:820px;margin:0 auto;padding:64px 32px}
@@ -188,10 +194,18 @@ button{font-family:inherit}
 .verdict.is-ok{background:var(--teal)}
 .verdict.is-rejected{background:var(--danger)}
 .verdict.is-error{background:var(--warn)}
+.verdict-meta{display:flex;align-items:center;gap:9px;margin-bottom:10px}
 .verdict-id{
   font-family:var(--mono);font-size:12px;font-weight:600;
-  color:rgba(255,255,255,.8);display:block;margin-bottom:10px;
+  color:rgba(255,255,255,.8);display:block;
   text-transform:uppercase;letter-spacing:.06em;
+}
+.verdict .source-badge{
+  color:#fff;background:rgba(255,255,255,.16);
+}
+.verdict-confidence{
+  font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.8);
+  margin-left:auto;
 }
 .verdict-title{font-size:34px;font-weight:800;letter-spacing:-.02em;margin:0;line-height:1.15}
 .verdict-sub{font-size:16px;color:rgba(255,255,255,.9);margin:10px 0 0;max-width:720px}
@@ -199,12 +213,27 @@ button{font-family:inherit}
 /* ---------- pipeline (overlaps verdict) ---------- */
 .gutter{padding:0 24px 40px}
 .pipeline{margin-top:-40px;position:relative;z-index:2}
+.undetermined-card{
+  margin-top:-40px;position:relative;z-index:3;
+  border-top:4px solid var(--warn);
+}
+.undetermined-card:not(.hidden) + .pipeline{margin-top:0}
+.undetermined-row{
+  padding:11px 0;border-bottom:1px solid var(--line);
+}
+.undetermined-row:last-child{border-bottom:0}
+.undetermined-row b{display:block;font-size:14px;margin-bottom:2px}
+.undetermined-reason{font-size:13px;color:var(--ink)}
+.undetermined-impact{font-size:12px;color:var(--muted);margin-left:5px}
 .bars{display:flex;flex-direction:column;gap:10px}
 .bar-row{display:grid;grid-template-columns:150px 1fr 74px;align-items:center;gap:14px}
 .bar-name{font-size:13px;font-weight:600;color:var(--ink)}
 .bar-track{height:22px;background:var(--canvas);border-radius:4px;overflow:hidden}
 .bar-fill{height:100%;background:var(--blue);border-radius:4px}
 .bar-fill.slim{background:var(--sky)}
+.bar-row.is-cached .bar-name{color:var(--teal)}
+.bar-row.is-cached .bar-track{height:8px}
+.bar-row.is-cached .bar-fill{background:var(--teal)}
 .bar-skip{
   height:22px;border:1px dashed var(--line);border-radius:4px;
   display:flex;align-items:center;padding-left:10px;
@@ -216,6 +245,54 @@ button{font-family:inherit}
   font-size:17px;font-weight:700;color:var(--danger);
   margin:20px 0 0;padding-top:18px;border-top:1px solid var(--line);
 }
+
+/* ---------- vehicle groups ---------- */
+.multi-vehicle{
+  background:rgba(232,145,43,.10);border:1px solid rgba(232,145,43,.45);
+  border-radius:var(--r);padding:16px 20px;margin-bottom:16px;
+  color:#7A4A0E;font-size:14px;font-weight:600;
+}
+.vehicles{display:flex;flex-direction:column;gap:16px;margin-bottom:16px}
+.vehicle-card{margin-bottom:0}
+.vehicle-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
+.vehicle-title{font-size:20px;font-weight:800;margin:0}
+.vehicle-photos{display:flex;gap:10px;overflow-x:auto;margin:0 0 18px;padding-bottom:4px}
+.vehicle-photo{position:relative;flex:0 0 150px}
+.vehicle-photo img{
+  width:150px;height:96px;object-fit:cover;display:block;
+  border-radius:6px;border:1px solid var(--line);background:var(--canvas);
+}
+.vehicle-photo.is-excluded img{opacity:.35;filter:grayscale(.5)}
+.vehicle-photo.is-excluded::after{
+  content:"";position:absolute;left:5px;right:5px;top:47px;height:2px;
+  background:var(--danger);transform:rotate(-8deg);
+}
+.vehicle-photo small{
+  display:block;color:var(--danger);font-size:10px;font-weight:600;
+  margin-top:4px;text-align:center;
+}
+.vehicle-damage{display:flex;flex-direction:column}
+.vehicle-damage-row{
+  display:grid;grid-template-columns:minmax(140px,1fr) auto auto;
+  align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--line);
+}
+.vehicle-damage-row:last-child{border-bottom:0}
+.vehicle-damage-name{font-size:14px;font-weight:700}
+.vehicle-damage-meta{font-size:12px;color:var(--muted);margin-top:2px}
+.vehicle-damage-price{font-family:var(--mono);font-size:13px;white-space:nowrap}
+.also-chip{
+  display:inline-block;font-family:var(--mono);font-size:10px;
+  color:var(--muted);background:var(--canvas);border-radius:4px;
+  padding:2px 7px;margin:4px 4px 0 0;
+}
+.vehicle-damage-row.is-unconfirmed{opacity:.65;font-style:italic}
+.unconfirmed-note{font-size:11px;color:var(--muted)}
+.vehicle-total{
+  display:flex;align-items:center;justify-content:space-between;
+  border-top:1px solid var(--line);margin-top:14px;padding-top:14px;
+  font-size:13px;font-weight:600;
+}
+.vehicle-total strong{font-family:var(--mono);font-size:18px;color:var(--navy)}
 
 /* ---------- evidence grid ---------- */
 .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;margin-top:16px}
@@ -255,6 +332,9 @@ button{font-family:inherit}
 /* estimate */
 .est-total{font-family:var(--mono);font-size:34px;font-weight:600;color:var(--navy);letter-spacing:-.01em}
 .est-caption{font-size:13px;color:var(--muted);margin:4px 0 18px}
+.est-indicative{
+  font-family:var(--mono);font-size:15px;color:var(--muted);margin:5px 0 18px;
+}
 .est-lines{display:flex;flex-direction:column;margin-bottom:16px}
 .est-line{
   display:flex;justify-content:space-between;gap:12px;

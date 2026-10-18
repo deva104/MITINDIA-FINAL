@@ -572,7 +572,11 @@ async def process_session(wa_id):
         from main import analyse_claim  # deferred: main imports this module at startup
 
         payload = await analyse_claim(
-            claim_id, doc_paths, photo_paths, source="whatsapp"
+            claim_id,
+            doc_paths,
+            photo_paths,
+            source="whatsapp",
+            from_number=wa_id,
         )
         reply = format_reply(payload)
         vehicles = [

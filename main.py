@@ -28,8 +28,11 @@ from whatsapp import (
 )
 
 try:
-    from forensics import check_duplicates, run_deep_forensics
+    from forensics import build_photo_url_map, check_duplicates, run_deep_forensics
 except ImportError:
+    def build_photo_url_map(photo_paths):
+        return {}
+
     def check_duplicates(photo_paths, conn):
         return []
 
@@ -230,12 +233,17 @@ def build_undetermined(payload, provider_fallbacks=None):
     return unique
 
 
-def build_vehicle_groups(photos, damage, excluded):
+def build_vehicle_groups(photos, damage, excluded, photo_urls=None):
     """Split photos, attributed damage, and estimates by model-assigned vehicle."""
     photo_entries = [photo for photo in (photos or []) if isinstance(photo, dict)]
     damage_items = [item for item in (damage or []) if isinstance(item, dict)]
     excluded_names = [os.path.basename(str(name)) for name in (excluded or []) if name]
     excluded_lookup = {name.lower() for name in excluded_names}
+    photo_url_lookup = {
+        str(name).lower(): url
+        for name, url in (photo_urls or {}).items()
+        if url
+    }
 
     explicit_groups = []
     pending_vehicle = []
@@ -283,6 +291,12 @@ def build_vehicle_groups(photos, damage, excluded):
         group_excluded = [
             name for name in group_photos if name.lower() in excluded_lookup
         ]
+        group_photo_urls = [
+            photo_url_lookup.get(name.lower()) for name in group_photos
+        ]
+        group_excluded_urls = [
+            photo_url_lookup.get(name.lower()) for name in group_excluded
+        ]
         group_damage = [
             item for item in damage_items
             if os.path.basename(str(item.get("source_photo") or "")).lower() in group_lookup
@@ -318,7 +332,9 @@ def build_vehicle_groups(photos, damage, excluded):
             "group": group,
             "label": label,
             "photos": group_photos,
+            "photo_urls": group_photo_urls,
             "excluded_photos": group_excluded,
+            "excluded_photo_urls": group_excluded_urls,
             "damage": group_damage,
             "estimate": build_estimate(group_damage),
             "status": status,
@@ -327,13 +343,16 @@ def build_vehicle_groups(photos, damage, excluded):
     return vehicles
 
 
-async def analyse_claim(claim_id, doc_paths, photo_paths, source="web"):
+async def analyse_claim(
+    claim_id, doc_paths, photo_paths, source="web", from_number=None
+):
     """Staged pipeline shared by the HTTP upload route and the WhatsApp webhook."""
     started = time.perf_counter()
 
     timings = []
     excluded_photos = []
     provider_fallbacks = []
+    photo_url_map = {}
 
     def stage_done(name, since, cached=False):
         elapsed = round(time.perf_counter() - since, 2)
@@ -347,6 +366,7 @@ async def analyse_claim(claim_id, doc_paths, photo_paths, source="web"):
             "claim_id": claim_id,
             "created_at": datetime.now().isoformat(),
             "source": source,
+            "from_number": from_number,
             "status": status,
             "stopped_at": stopped_at,
             "vehicle_description": vehicle_description,
@@ -388,11 +408,14 @@ async def analyse_claim(claim_id, doc_paths, photo_paths, source="web"):
         dup_paths = [p for p in photo_paths if os.path.abspath(p) in flagged]
         clean_paths = [p for p in photo_paths if os.path.abspath(p) not in flagged]
         excluded_photos = [os.path.basename(p) for p in dup_paths]
+        photo_url_map = build_photo_url_map(photo_paths)
 
         # Only a bundle with nothing left to assess is rejected outright. A claim
         # with at least one fresh photo is still worth analysing.
         if dup_paths and not clean_paths:
-            vehicles = build_vehicle_groups([], [], excluded_photos)
+            vehicles = build_vehicle_groups(
+                [], [], excluded_photos, photo_url_map
+            )
             return finish(make_payload("rejected", "duplicate", forensics=dup,
                                        vehicles=vehicles))
 
@@ -421,7 +444,9 @@ async def analyse_claim(claim_id, doc_paths, photo_paths, source="web"):
         description = result.get("vehicle_description") or ""
         photos = result.get("photos") or []
         raw_damage = result.get("damage") or []
-        vehicles = build_vehicle_groups(photos, raw_damage, excluded_photos)
+        vehicles = build_vehicle_groups(
+            photos, raw_damage, excluded_photos, photo_url_map
+        )
         claimable_count = sum(
             vehicle.get("status") == "claimable" for vehicle in vehicles
         )

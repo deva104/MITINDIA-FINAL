@@ -47,6 +47,27 @@ def _open_image(path):
     return data, image, hashlib.md5(data).hexdigest()[:10]
 
 
+def _save_original(image, unique_id):
+    image.convert("RGB").save(OUTPUT_DIR / f"{unique_id}_original.jpg", "JPEG")
+    return f"/static_output/{unique_id}_original.jpg"
+
+
+def build_photo_url_map(photo_paths):
+    """Write servable originals for every submitted photo, including duplicates."""
+    urls = {}
+    for path in photo_paths or []:
+        try:
+            _, image, unique_id = _open_image(path)
+            urls[os.path.basename(path).lower()] = _save_original(image, unique_id)
+        except Exception as error:
+            print(
+                f"[forensics] original preview failed for {os.path.basename(path)}: "
+                f"{error}",
+                flush=True,
+            )
+    return urls
+
+
 def _is_jpeg(path, image):
     if (getattr(image, "format", "") or "").upper() in ("JPEG", "MPO"):
         return True
@@ -275,8 +296,7 @@ def run_deep_forensics(photo_paths, conn=None, fields=None):
             try:
                 original_url = None
                 try:
-                    image.convert("RGB").save(OUTPUT_DIR / f"{unique_id}_original.jpg", "JPEG")
-                    original_url = f"/static_output/{unique_id}_original.jpg"
+                    original_url = _save_original(image, unique_id)
                 except Exception:
                     original_url = None
 
@@ -293,6 +313,7 @@ def run_deep_forensics(photo_paths, conn=None, fields=None):
                 else:
                     entry = _result("ela", "not_applicable", NOT_APPLICABLE_DETAIL, None)
                 entry["original_url"] = original_url
+                entry["source_photo"] = name
                 results.append(entry)
             except Exception as e:
                 results.append(_result("ela", "fail", f"{name}: ELA failed - {e}"))
@@ -338,6 +359,7 @@ def run_deep_forensics(photo_paths, conn=None, fields=None):
                         ]
                     detail = f"{name}: " + "; ".join(segments)
                 entry = _result("exif", verdict, detail)
+                entry["source_photo"] = name
                 entry["lat"] = lat
                 entry["lon"] = lon
                 results.append(entry)

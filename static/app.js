@@ -93,6 +93,25 @@
               : 'pill-ok';
     return `<span class="pill ${cls}">${esc(k || 'unknown')}</span>`;
   }
+
+  function list(value) {
+    return Array.isArray(value) ? value : [];
+  }
+
+  function whatsappBadge(p) {
+    if (!p || p.source !== 'whatsapp') return '';
+    const digits = String(p.from_number || '').replace(/\D/g, '');
+    const suffix = digits ? digits.slice(-4) : '••••';
+    return `<span class="source-badge">WhatsApp ···${esc(suffix)}</span>`;
+  }
+
+  function indicativeRange(estimate) {
+    const items = list(estimate && estimate.unconfirmed);
+    return {
+      low: items.reduce((sum, item) => sum + (Number(item && item.low) || 0), 0),
+      high: items.reduce((sum, item) => sum + (Number(item && item.high) || 0), 0)
+    };
+  }
   
   /* Backend may return raw payloads or DB rows holding payload_json. */
   function normalise(data) {
@@ -151,6 +170,10 @@
     if (c.status === 'error') return 'Escalated to human review';
     const e = c.estimate || {};
     if (e.total_high) return rupee(e.total_low) + ' – ' + rupee(e.total_high);
+    if (list(e.unconfirmed).length) {
+      const range = indicativeRange(e);
+      return 'Indicative ' + rupee(range.low) + ' – ' + rupee(range.high);
+    }
     return 'Analysed';
   }
   
@@ -159,6 +182,14 @@
     if (s === 'rejected') return '<span class="pill pill-danger">rejected</span>';
     if (s === 'error')    return '<span class="pill pill-warn">error</span>';
     return '<span class="pill pill-mute">' + esc(s || 'unknown') + '</span>';
+  }
+
+  function claimPill(c) {
+    if (!c || !c.decision) return statusPill(c && c.status);
+    if (c.decision === 'auto_assess') return '<span class="pill pill-ok">auto-assessed</span>';
+    if (c.decision === 'needs_review') return '<span class="pill pill-warn">needs review</span>';
+    if (c.decision === 'reject') return '<span class="pill pill-danger">rejected</span>';
+    return statusPill(c.status);
   }
   
   function renderFeed(claims) {
@@ -175,10 +206,11 @@
       <div class="claim ${c.claim_id === activeId ? 'is-active' : ''}" data-id="${esc(c.claim_id)}">
         <div class="claim-top">
           <span class="claim-id">${esc(c.claim_id)}</span>
-          ${statusPill(c.status)}
+          ${claimPill(c)}
         </div>
         <span class="claim-time">${esc(relTime(c.created_at))}</span>
         <p class="claim-sum">${esc(summarise(c))}</p>
+        ${c.source === 'whatsapp' ? `<div class="claim-source">${whatsappBadge(c)}</div>` : ''}
       </div>`).join('');
   
     $('feed').querySelectorAll('.claim').forEach(el => {
@@ -208,10 +240,33 @@
   
     /* verdict band */
     const band = $('verdict');
-    band.className = 'verdict ' + (
+    const decision = p.decision || null;
+    const decisionClass = {
+      auto_assess: 'is-ok',
+      needs_review: 'is-error',
+      reject: 'is-rejected'
+    }[decision];
+    band.className = 'verdict ' + (decisionClass || (
       status === 'analysed' ? 'is-ok' : status === 'rejected' ? 'is-rejected' : 'is-error'
-    );
+    ));
     $('verdictId').textContent = p.claim_id;
+    const source = $('verdictSource');
+    if (p.source === 'whatsapp') {
+      const digits = String(p.from_number || '').replace(/\D/g, '');
+      source.textContent = 'WhatsApp ···' + (digits ? digits.slice(-4) : '••••');
+      source.classList.remove('hidden');
+    } else {
+      source.textContent = '';
+      source.classList.add('hidden');
+    }
+    const confidence = $('verdictConfidence');
+    if (typeof p.confidence === 'number' && isFinite(p.confidence)) {
+      confidence.textContent = 'model confidence ' + p.confidence.toFixed(2);
+      confidence.classList.remove('hidden');
+    } else {
+      confidence.textContent = '';
+      confidence.classList.add('hidden');
+    }
   
     let title = 'Analysed \u2014 estimate ready', sub = '';
     if (status === 'rejected' && stopped === 'duplicate') {
@@ -226,24 +281,170 @@
     } else if (p.estimate && p.estimate.requires_survey) {
       sub = 'Estimate exceeds the automated settlement threshold.';
     }
+    if (decision === 'auto_assess') {
+      title = 'Auto-assessed';
+    } else if (decision === 'needs_review') {
+      title = 'Needs review';
+      sub = list(p.decision_reasons)[0] || 'A human assessor should review this claim.';
+    }
     $('verdictTitle').textContent = title;
     $('verdictSub').textContent = sub;
   
+    renderUndetermined(p);
     renderBars(p);
+    renderVehicles(p);
     renderEvidence(p);
     renderForensics(p);
     renderFlags(p);
     renderFields(p);
-    renderDamage(p);
+    if (!list(p.vehicles).length) renderDamage(p);
     renderEstimate(p);
     pollClaims();
+  }
+
+  function renderUndetermined(p) {
+    const items = list(p.undetermined).filter(x => x && typeof x === 'object');
+    const card = $('undeterminedCard');
+    if (!items.length) {
+      card.classList.add('hidden');
+      $('undetermined').innerHTML = '';
+      return;
+    }
+    $('undetermined').innerHTML = items.map(item => `
+      <div class="undetermined-row">
+        <b>${esc(item.item || 'Unknown item')}</b>
+        <span class="undetermined-reason">${esc(item.reason || '')}</span>
+        ${item.impact ? `<span class="undetermined-impact">· ${esc(item.impact)}</span>` : ''}
+      </div>`).join('');
+    card.classList.remove('hidden');
+  }
+
+  function vehicleStatusPill(status) {
+    const config = {
+      claimable: ['pill-ok', 'Claimable'],
+      no_damage: ['pill-mute', 'No damage'],
+      all_duplicate: ['pill-danger', 'Already claimed'],
+      not_vehicle: ['pill-mute', 'Not a vehicle']
+    }[status] || ['pill-mute', human(status || 'unknown')];
+    return `<span class="pill ${config[0]}">${esc(config[1])}</span>`;
+  }
+
+  function vehicleDamageRows(vehicle) {
+    const estimate = vehicle.estimate || {};
+    const confirmed = list(estimate.line_items);
+    const unconfirmed = list(estimate.unconfirmed);
+    const unpriced = list(estimate.unpriced);
+    const confirmedHtml = confirmed.map(item => {
+      const also = list(item.also_reported).map(value =>
+        `<span class="also-chip">also: ${esc(human(value).toLowerCase())}</span>`
+      ).join('');
+      return `<div class="vehicle-damage-row">
+        <div>
+          <div class="vehicle-damage-name">${esc(human(item.part))}</div>
+          <div class="vehicle-damage-meta">${esc(human(item.damage_type))}${also ? `<div>${also}</div>` : ''}</div>
+        </div>
+        ${sevPill(item.severity)}
+        <span class="vehicle-damage-price">${rupee(item.low)} – ${rupee(item.high)}</span>
+      </div>`;
+    }).join('');
+    const unconfirmedHtml = unconfirmed.map(item => `
+      <div class="vehicle-damage-row is-unconfirmed">
+        <div>
+          <div class="vehicle-damage-name">${esc(human(item.part))}</div>
+          <div class="vehicle-damage-meta">${esc(human(item.damage_type))}</div>
+          <div class="unconfirmed-note">unconfirmed — not priced</div>
+        </div>
+        ${sevPill(item.severity)}
+        <span class="vehicle-damage-price">${rupee(item.low)} – ${rupee(item.high)} indicative</span>
+      </div>`).join('');
+    const unpricedHtml = unpriced.map(item => `
+      <div class="vehicle-damage-row">
+        <div>
+          <div class="vehicle-damage-name">${esc(human(item.part))}</div>
+          <div class="vehicle-damage-meta">${esc(human(item.damage_type))}</div>
+        </div>
+        ${sevPill(item.severity)}
+        <span class="vehicle-damage-price">Manual pricing</span>
+      </div>`).join('');
+    return confirmedHtml + unconfirmedHtml + unpricedHtml ||
+      '<p class="empty">No visible damage was detected for this vehicle.</p>';
+  }
+
+  function renderVehicles(p) {
+    const vehicles = list(p.vehicles).filter(v => v && typeof v === 'object');
+    const section = $('vehicles');
+    const banner = $('multiVehicle');
+    const legacyDamage = $('damageCard');
+    if (!vehicles.length) {
+      section.classList.add('hidden');
+      section.innerHTML = '';
+      banner.classList.add('hidden');
+      banner.innerHTML = '';
+      legacyDamage.classList.remove('hidden');
+      return;
+    }
+
+    legacyDamage.classList.add('hidden');
+    const claimableCount = Number.isInteger(p.claimable_count)
+      ? p.claimable_count
+      : vehicles.filter(v => v.status === 'claimable').length;
+    if (claimableCount > 1) {
+      const primary = vehicles[0] && vehicles[0].label
+        ? vehicles[0].label : 'vehicle group 0';
+      banner.textContent = `${claimableCount} vehicles detected — a claim covers one vehicle. Headline estimate refers to ${primary}.`;
+      banner.classList.remove('hidden');
+    } else {
+      banner.textContent = '';
+      banner.classList.add('hidden');
+    }
+
+    section.innerHTML = vehicles.map(vehicle => {
+      const names = list(vehicle.photos);
+      const urls = list(vehicle.photo_urls);
+      const excluded = new Set(
+        list(vehicle.excluded_photos).map(name => String(name).toLowerCase())
+      );
+      const photos = names.map((name, index) => {
+        const url = urls[index];
+        if (!url) return '';
+        const isExcluded = excluded.has(String(name).toLowerCase());
+        return `<div class="vehicle-photo ${isExcluded ? 'is-excluded' : ''}">
+          <img src="${esc(url)}" alt="${esc(name || vehicle.label || 'Vehicle photo')}">
+          ${isExcluded ? '<small>previously claimed</small>' : ''}
+        </div>`;
+      }).join('');
+      const estimate = vehicle.estimate || {};
+      const range = indicativeRange(estimate);
+      const total = estimate.total_high
+        ? `${rupee(estimate.total_low)} – ${rupee(estimate.total_high)}`
+        : list(estimate.unconfirmed).length
+          ? `No confirmed estimate · ${rupee(range.low)} – ${rupee(range.high)} indicative`
+          : 'No estimate';
+      return `<div class="card vehicle-card">
+        <div class="vehicle-head">
+          <h2 class="vehicle-title">${esc(vehicle.label || 'Vehicle')}</h2>
+          ${vehicleStatusPill(vehicle.status)}
+        </div>
+        ${photos ? `<div class="vehicle-photos">${photos}</div>` : ''}
+        <div class="vehicle-damage">${vehicleDamageRows(vehicle)}</div>
+        <div class="vehicle-total"><span>Group estimate</span><strong>${total}</strong></div>
+      </div>`;
+    }).join('');
+    section.classList.remove('hidden');
   }
   
   function renderBars(p) {
     const timings = Array.isArray(p.timings) ? p.timings : [];
     const map = {};
-    timings.forEach(t => { if (t && t.stage) map[t.stage] = Number(t.seconds) || 0; });
-    const max = Math.max(0.01, ...Object.values(map));
+    timings.forEach(t => {
+      if (t && t.stage) {
+        map[t.stage] = {
+          seconds: Number(t.seconds) || 0,
+          cached: t.cached === true
+        };
+      }
+    });
+    const max = Math.max(0.01, ...Object.values(map).map(value => value.seconds));
   
     $('bars').innerHTML = STAGES.map(s => {
       if (!(s.key in map)) {
@@ -253,18 +454,20 @@
           <div class="bar-skip">${skipped ? 'not required' : 'not reached'}</div>
           <span class="bar-time">\u2014</span></div>`;
       }
-      const sec = map[s.key];
+      const timing = map[s.key];
+      const sec = timing.seconds;
       const pct = Math.max(2, (sec / max) * 100);
       const slim = pct < 12 ? ' slim' : '';
-      return `<div class="bar-row">
-        <span class="bar-name">${s.label}</span>
+      const cached = timing.cached === true;
+      return `<div class="bar-row ${cached ? 'is-cached' : ''}">
+        <span class="bar-name">${s.label}${cached ? ' — cached' : ''}</span>
         <div class="bar-track"><div class="bar-fill${slim}" style="width:${pct}%"></div></div>
         <span class="bar-time">${sec.toFixed(2)}s</span></div>`;
     }).join('');
   
     const out = $('pipelineCallout');
     if (p.stopped_at === 'duplicate') {
-      const s = (map['stage0_duplicate'] || 0).toFixed(2);
+      const s = ((map['stage0_duplicate'] || {}).seconds || 0).toFixed(2);
       out.textContent = `Rejected in ${s}s \u2014 no AI analysis performed`;
       out.classList.remove('hidden');
     } else {
@@ -377,8 +580,9 @@
   function renderEstimate(p) {
     const e = p.estimate || {};
     const lines = Array.isArray(e.line_items) ? e.line_items : [];
+    const unconfirmedItems = list(e.unconfirmed);
   
-    if (!lines.length && !e.total_high) {
+    if (!lines.length && !e.total_high && !unconfirmedItems.length) {
       $('estimate').innerHTML = '<p class="empty">No estimate — this claim did not reach assessment.</p>';
       return;
     }
@@ -392,10 +596,19 @@
   
     const unpriced = (Array.isArray(e.unpriced) && e.unpriced.length)
       ? `<p class="empty">${e.unpriced.length} item(s) had no rate card entry.</p>` : '';
+
+    const indicative = indicativeRange(e);
+    const headline = e.total_high
+      ? `${rupee(e.total_low)} – ${rupee(e.total_high)}`
+      : 'No confirmed estimate';
+    const indicativeLine = unconfirmedItems.length
+      ? `<p class="est-indicative">+ ${rupee(indicative.low)} – ${rupee(indicative.high)} indicative, unconfirmed</p>`
+      : '';
   
     $('estimate').innerHTML = `
-      <div class="est-total">${rupee(e.total_low)} \u2013 ${rupee(e.total_high)}</div>
-      <p class="est-caption">Estimated repair cost range</p>
+      <div class="est-total">${headline}</div>
+      <p class="est-caption">${e.total_high ? 'Estimated repair cost range' : 'Confirmed findings only'}</p>
+      ${indicativeLine}
       <div class="est-lines">${body}</div>${unpriced}${survey}`;
   }
   

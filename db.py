@@ -151,6 +151,14 @@ def list_claims():
             {
                 "claim_id": r["claim_id"],
                 "created_at": r["created_at"],
+                "status": payload.get("status"),
+                "stopped_at": payload.get("stopped_at"),
+                "decision": payload.get("decision"),
+                "decision_reasons": payload.get("decision_reasons", []),
+                "confidence": payload.get("confidence"),
+                "source": payload.get("source"),
+                "from_number": payload.get("from_number"),
+                "claimable_count": payload.get("claimable_count"),
                 "flags": payload.get("flags", []),
                 "estimate": payload.get("estimate", {}),
             }

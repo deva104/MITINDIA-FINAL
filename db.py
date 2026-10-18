@@ -175,18 +175,28 @@ def _ensure_vision_cache(conn):
     )
 
 
-def cache_get(content_hash):
+def cache_get(content_hash, label=None):
     conn = get_conn()
     try:
         _ensure_vision_cache(conn)
-        row = conn.execute(
-            """
-            SELECT response_json, provider, model
-            FROM vision_cache
-            WHERE content_hash = ?
-            """,
-            (content_hash,),
-        ).fetchone()
+        if label is None:
+            row = conn.execute(
+                """
+                SELECT response_json, provider, model, label
+                FROM vision_cache
+                WHERE content_hash = ?
+                """,
+                (content_hash,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT response_json, provider, model, label
+                FROM vision_cache
+                WHERE content_hash = ? AND label = ?
+                """,
+                (content_hash, label),
+            ).fetchone()
         if not row:
             return None
         try:
@@ -199,6 +209,7 @@ def cache_get(content_hash):
             "response": response,
             "provider": row["provider"],
             "model": row["model"],
+            "label": row["label"],
         }
     finally:
         conn.close()

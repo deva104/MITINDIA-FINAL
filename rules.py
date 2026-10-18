@@ -171,7 +171,7 @@ def _part_group(part):
 
 
 def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None,
-              vehicles=None, claimable_count: int = 0):
+              vehicles=None, claimable_count: int = 0, forensics=None):
     flags = []
     damage = damage or []
 
@@ -323,6 +323,29 @@ def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None
                 "A claim covers one vehicle."
             ),
             "evidence": labels,
+        })
+
+    # 9. AI-generation detection is a review signal, never a rejection verdict.
+    for check in forensics or []:
+        if (
+            not isinstance(check, dict)
+            or check.get("check") != "ai_generated"
+            or check.get("verdict") != "suspicious"
+        ):
+            continue
+        photo = check.get("source_photo") or "submitted photo"
+        try:
+            score = f"{float(check.get('score')):.2f}"
+        except (TypeError, ValueError):
+            score = "unknown"
+        flags.append({
+            "rule": "ai_generated_photo",
+            "severity": "HIGH",
+            "message": (
+                f"{photo} shows strong signs of AI generation "
+                f"(score {score})."
+            ),
+            "evidence": [photo, score],
         })
 
     return flags

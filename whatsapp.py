@@ -200,6 +200,14 @@ def _estimate_range(estimate):
     )
 
 
+def _is_authenticity_signal(value):
+    text = str(value or "").lower()
+    return any(term in text for term in (
+        "ai generation", "ai-generation", "ai_generated",
+        "generated image", "artificially generated", "fraud",
+    ))
+
+
 def _undetermined_lines(items):
     if not items:
         return []
@@ -210,7 +218,11 @@ def _undetermined_lines(items):
     lines = ["", "*Could not determine:*"]
     for item in items:
         reason = reason_labels.get(item.get("reason"), item.get("reason"))
-        lines.append(f"- {item.get('item')} — {reason}")
+        label = item.get("item")
+        if _is_authenticity_signal(label) or _is_authenticity_signal(reason):
+            label = "Photo authenticity"
+            reason = "independent verification unavailable"
+        lines.append(f"- {label} — {reason}")
     return lines
 
 
@@ -275,7 +287,10 @@ def _single_vehicle_reply(claim_id, vehicle, excluded_count=0, total_photos=None
     lines += _undetermined_lines(undetermined)
     if decision == "needs_review":
         reasons = decision_reasons or []
-        first_reason = reasons[0] if reasons else "automated checks require review"
+        if any(_is_authenticity_signal(reason) for reason in reasons):
+            first_reason = "photo authenticity requires verification"
+        else:
+            first_reason = reasons[0] if reasons else "automated checks require review"
         lines += ["", f"Flagged for manual review: {first_reason.rstrip('.')}."]
     elif excluded_count:
         lines += ["", "Flagged for manual review."]

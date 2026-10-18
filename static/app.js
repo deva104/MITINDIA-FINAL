@@ -36,7 +36,8 @@
     duplicate_photo: 'Duplicate photo',
     duplicate: 'Duplicate check',
     ela: 'Error level analysis',
-    exif: 'Capture metadata'
+    exif: 'Capture metadata',
+    ai_generated: 'AI-generation check'
   };
   
   const staged = { documents: [], photos: [] };
@@ -83,7 +84,13 @@
   }
   
   function verdictPill(v) {
-    const cls = { clean: 'pill-ok', suspicious: 'pill-warn', fail: 'pill-danger' }[v] || 'pill-mute';
+    const cls = {
+      clean: 'pill-ok',
+      suspicious: 'pill-warn',
+      inconclusive: 'pill-warn',
+      unavailable: 'pill-mute',
+      fail: 'pill-danger'
+    }[v] || 'pill-mute';
     const txt = v === 'not_applicable' ? 'not applicable' : (v || 'unknown');
     return `<span class="pill ${cls}">${esc(txt)}</span>`;
   }
@@ -609,8 +616,12 @@
           <a class="maplink" target="_blank" rel="noopener"
              href="https://www.google.com/maps?q=${encodeURIComponent(f.lat + ',' + f.lon)}">View on map</a></div>`;
       }
+      const score = typeof f.score === 'number' && isFinite(f.score)
+        ? `<span class="forensic-score">score ${f.score.toFixed(2)}</span>`
+        : '';
       return `<div class="row">
-        <div class="row-top"><span class="row-title">${esc(human(f.check))}</span>${verdictPill(f.verdict)}</div>
+        <div class="row-top"><span class="row-title">${esc(human(f.check))}</span>
+          <span class="forensic-verdict">${score}${verdictPill(f.verdict)}</span></div>
         <p class="row-text">${esc(f.detail || '')}</p>${geo}</div>`;
     }).join('');
   }

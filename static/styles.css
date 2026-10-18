@@ -347,6 +347,8 @@ button{font-family:inherit}
 .row.is-rejected{opacity:.6}
 .row-top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px}
 .row-title{font-size:15px;font-weight:700}
+.forensic-verdict{display:flex;align-items:center;gap:8px}
+.forensic-score{font-family:var(--mono);font-size:11px;color:var(--muted)}
 .row-text{font-size:13px;color:var(--muted);margin:0;line-height:1.5}
 .row-price{font-family:var(--mono);font-size:14px;font-weight:600;color:var(--ink);margin-top:8px;display:block}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}

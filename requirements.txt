@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 python-dotenv
+httpx
 google-genai
 openai
 pillow

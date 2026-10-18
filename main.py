@@ -525,6 +525,26 @@ def build_undetermined(payload, provider_fallbacks=None):
             "impact": "cannot confirm when or where photos were taken",
         })
 
+    for check in payload.get("forensics") or []:
+        if not isinstance(check, dict) or check.get("check") != "ai_generated":
+            continue
+        if check.get("verdict") == "inconclusive":
+            try:
+                score = f"{float(check.get('score')):.2f}"
+            except (TypeError, ValueError):
+                score = "unknown"
+            entries.append({
+                "item": "Photo authenticity",
+                "reason": f"AI-generation score inconclusive ({score})",
+                "impact": "authenticity not confirmed",
+            })
+        elif check.get("verdict") == "unavailable":
+            entries.append({
+                "item": "AI-generation check",
+                "reason": check.get("detail") or "classifier unavailable",
+                "impact": "photo authenticity not independently checked",
+            })
+
     for fallback in provider_fallbacks or []:
         entries.append({
             "item": "Primary vision provider",
@@ -776,7 +796,16 @@ async def analyse_claim(
 
         # Stage 2 - ELA + EXIF
         mark = time.perf_counter()
-        deep = run_deep_forensics(clean_paths, conn, fields)
+        vehicle_photo_names = {
+            os.path.basename(str(photo.get("source_photo") or "")).lower()
+            for photo in photos
+            if isinstance(photo, dict) and photo.get("is_vehicle") is True
+        }
+        vehicle_paths = [
+            path for path in clean_paths
+            if os.path.basename(path).lower() in vehicle_photo_names
+        ]
+        deep = run_deep_forensics(vehicle_paths, conn, fields)
         stage_done("stage2_deep_forensics", mark)
 
         # Stage 3 - rules and estimate
@@ -794,7 +823,8 @@ async def analyse_claim(
         flags = bundle_flags + run_rules(fields, damage, photo_count=len(clean_paths),
                                          is_vehicle=result.get("is_vehicle"), photos=photos,
                                          vehicles=vehicles,
-                                         claimable_count=claimable_count)
+                                         claimable_count=claimable_count,
+                                         forensics=deep)
         stage_done("stage3_rules", mark)
 
         return finish(make_payload("analysed", None, fields=fields, damage=damage,

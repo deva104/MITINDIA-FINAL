@@ -5,9 +5,14 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 import imagehash
+from db import cache_get, cache_put
+from dotenv import load_dotenv
 from PIL import ExifTags, Image, ImageChops, ImageEnhance
 from rules import parse_date
+
+load_dotenv()
 
 try:
     from pillow_heif import register_heif_opener
@@ -35,6 +40,9 @@ MISSING_EXIF_DETAIL = (
     "capture time and location unavailable — image was re-encoded in transit "
     "(normal for WhatsApp photos)"
 )
+SIGHTENGINE_URL = "https://api.sightengine.com/1.0/check.json"
+SIGHTENGINE_TIMEOUT = 8.0
+AI_CACHE_LABEL = "ai_generated"
 
 
 def _result(check, verdict, detail, heatmap_url=None):
@@ -72,6 +80,149 @@ def _is_jpeg(path, image):
     if (getattr(image, "format", "") or "").upper() in ("JPEG", "MPO"):
         return True
     return os.path.splitext(path)[1].lower() in JPEG_EXTENSIONS
+
+
+def _ai_detection_enabled():
+    return os.getenv("AI_DETECTION_ENABLED", "true").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def _ai_score_result(score):
+    if score >= 0.85:
+        return _result(
+            "ai_generated",
+            "suspicious",
+            f"image shows strong signs of AI generation (score {score:.2f})",
+        )
+    if score >= 0.50:
+        return _result(
+            "ai_generated",
+            "inconclusive",
+            f"AI-generation score is inconclusive (score {score:.2f})",
+        )
+    return _result(
+        "ai_generated",
+        "clean",
+        f"image shows no strong signs of AI generation (score {score:.2f})",
+    )
+
+
+def check_ai_generated(data, name, mime_type="application/octet-stream"):
+    """Classify original bytes; every failure becomes an unavailable signal."""
+    if not _ai_detection_enabled():
+        return _result(
+            "ai_generated",
+            "unavailable",
+            "AI-generation check disabled by configuration",
+        )
+
+    content_hash = hashlib.sha256(data).hexdigest()
+    try:
+        cached = cache_get(content_hash, label=AI_CACHE_LABEL)
+    except Exception as error:
+        cached = None
+        print(
+            f"[forensics] ai_generated: cache read failed ({type(error).__name__})",
+            flush=True,
+        )
+    if cached:
+        try:
+            score = float(cached["response"]["score"])
+            print(
+                f"[forensics] ai_generated: cache hit for {name}",
+                flush=True,
+            )
+            result = _ai_score_result(score)
+            result["score"] = score
+            return result
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    api_user = os.getenv("SIGHTENGINE_API_USER", "").strip()
+    api_secret = os.getenv("SIGHTENGINE_API_SECRET", "").strip()
+    if not api_user or not api_secret:
+        return _result(
+            "ai_generated",
+            "unavailable",
+            "Sightengine credentials are not configured",
+        )
+
+    try:
+        response = httpx.post(
+            SIGHTENGINE_URL,
+            files={"media": (name, data, mime_type)},
+            data={
+                "models": "genai",
+                "api_user": api_user,
+                "api_secret": api_secret,
+            },
+            timeout=SIGHTENGINE_TIMEOUT,
+        )
+        if response.status_code == 429:
+            return _result(
+                "ai_generated",
+                "unavailable",
+                "Sightengine quota exhausted (HTTP 429)",
+            )
+        if response.status_code >= 400:
+            return _result(
+                "ai_generated",
+                "unavailable",
+                f"Sightengine API error (HTTP {response.status_code})",
+            )
+        try:
+            output = response.json()
+        except Exception:
+            return _result(
+                "ai_generated",
+                "unavailable",
+                "Sightengine returned invalid JSON",
+            )
+        try:
+            score = float(output["type"]["ai_generated"])
+        except (KeyError, TypeError, ValueError):
+            return _result(
+                "ai_generated",
+                "unavailable",
+                "Sightengine response missing type.ai_generated",
+            )
+        if not 0.0 <= score <= 1.0:
+            return _result(
+                "ai_generated",
+                "unavailable",
+                "Sightengine returned an invalid AI-generation score",
+            )
+
+        result = _ai_score_result(score)
+        result["score"] = score
+        try:
+            cache_put(
+                content_hash,
+                AI_CACHE_LABEL,
+                {"score": score},
+                "sightengine",
+                "genai",
+            )
+        except Exception as error:
+            print(
+                f"[forensics] ai_generated: cache write failed "
+                f"({type(error).__name__})",
+                flush=True,
+            )
+        return result
+    except httpx.TimeoutException:
+        return _result(
+            "ai_generated",
+            "unavailable",
+            "Sightengine request timed out after 8 seconds",
+        )
+    except Exception as error:
+        return _result(
+            "ai_generated",
+            "unavailable",
+            f"Sightengine request failed: {type(error).__name__}",
+        )
 
 
 def run_ela(image, quality=ELA_QUALITY, boost=ELA_BOOST):
@@ -280,7 +431,7 @@ def check_duplicates(photo_paths, conn):
 
 
 def run_deep_forensics(photo_paths, conn=None, fields=None):
-    """ELA + EXIF. No duplicate check."""
+    """ELA + EXIF + AI-generation signal. No duplicate check."""
     results = []
     try:
         for path in photo_paths or []:
@@ -290,6 +441,11 @@ def run_deep_forensics(photo_paths, conn=None, fields=None):
             except Exception as e:
                 for check in ("ela", "exif"):
                     results.append(_result(check, "fail", f"{name}: could not open image - {e}"))
+                results.append(_result(
+                    "ai_generated",
+                    "unavailable",
+                    f"{name}: original image bytes could not be read",
+                ))
                 continue
 
             # 1. ELA - only meaningful on JPEG, which carries compression history
@@ -365,6 +521,25 @@ def run_deep_forensics(photo_paths, conn=None, fields=None):
                 results.append(entry)
             except Exception as e:
                 results.append(_result("exif", "fail", f"{name}: EXIF check failed - {e}"))
+
+            # 3. AI-generation classifier - the original upload bytes are
+            # intentional; resizing or recompression can erase its signal.
+            try:
+                mime_type = Image.MIME.get(
+                    str(getattr(image, "format", "") or "").upper(),
+                    "application/octet-stream",
+                )
+                entry = check_ai_generated(data, name, mime_type)
+                entry["source_photo"] = name
+                results.append(entry)
+            except Exception as error:
+                entry = _result(
+                    "ai_generated",
+                    "unavailable",
+                    f"AI-generation check failed: {type(error).__name__}",
+                )
+                entry["source_photo"] = name
+                results.append(entry)
     except Exception as e:
         results.append(_result("ela", "fail", f"forensics aborted - {e}"))
     return results

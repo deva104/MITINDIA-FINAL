@@ -328,9 +328,74 @@ def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None
     return flags
 
 
+def _damage_confidence(item):
+    try:
+        value = float(item.get("confidence"))
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, value))
+
+
+def assess_confidence(payload):
+    damage = [
+        item for item in (payload.get("damage") or [])
+        if isinstance(item, dict)
+    ]
+    confidence = (
+        sum(_damage_confidence(item) for item in damage) / len(damage)
+        if damage
+        else 0.0
+    )
+
+    if payload.get("status") == "rejected":
+        stopped_at = payload.get("stopped_at") or "validation"
+        return {
+            "decision": "reject",
+            "reasons": [f"Claim rejected at {stopped_at}"],
+            "confidence": round(confidence, 3),
+        }
+
+    reasons = []
+    for flag in payload.get("flags") or []:
+        if isinstance(flag, dict) and str(flag.get("severity")).upper() == "HIGH":
+            reasons.append(flag.get("message") or f"High-severity flag: {flag.get('rule')}")
+
+    estimate = payload.get("estimate") or {}
+    if estimate.get("requires_survey") is True:
+        reasons.append(estimate.get("survey_reason") or "Estimate requires a survey")
+
+    claimable_count = payload.get("claimable_count") or 0
+    if claimable_count > 1:
+        reasons.append(
+            f"claimable_count is {claimable_count}; a claim covers one vehicle"
+        )
+
+    for item in damage:
+        if _damage_confidence(item) < 0.6:
+            part = str(item.get("part") or "unknown part").replace("_", " ")
+            reasons.append(f"Low-confidence damage finding: {part}")
+
+    for field in payload.get("fields") or []:
+        if isinstance(field, dict) and field.get("status") == "unreadable":
+            reasons.append(f"Unreadable field: {field.get('name')}")
+
+    if estimate.get("unpriced"):
+        reasons.append("One or more confirmed damage items require manual pricing")
+
+    # Keep stable ordering while suppressing duplicate reasons raised by
+    # overlapping checks.
+    reasons = list(dict.fromkeys(reason for reason in reasons if reason))
+    return {
+        "decision": "needs_review" if reasons else "auto_assess",
+        "reasons": reasons,
+        "confidence": round(confidence, 3),
+    }
+
+
 def build_estimate(damage):
     line_items = []
     unpriced = []
+    unconfirmed = []
     total_low = 0
     total_high = 0
 
@@ -342,13 +407,48 @@ def build_estimate(damage):
     for d in damage:
         if not isinstance(d, dict):
             continue
+        d["confirmed"] = _damage_confidence(d) >= 0.6
         by_part.setdefault(d.get("part"), []).append(d)
 
     # A panel is repaired or replaced once, regardless of how many damage types
     # appear on it.
     for part, reports in by_part.items():
+        for report in reports:
+            if report.get("confirmed"):
+                continue
+            report_part = report.get("part")
+            report_severity = report.get("severity")
+            group = _part_group(str(report_part) if report_part is not None else "")
+            severity = (
+                str(report_severity).strip().lower()
+                if report_severity is not None
+                else ""
+            )
+            rate = RATE_CARD.get((group, severity)) if group else None
+            entry = {
+                "part": report_part,
+                "damage_type": report.get("damage_type"),
+                "severity": report_severity,
+                "confidence": _damage_confidence(report),
+            }
+            if rate:
+                entry["low"], entry["high"] = rate
+            else:
+                entry["low"] = None
+                entry["high"] = None
+                entry["reason"] = "no rate card entry"
+            unconfirmed.append(entry)
+
+        confirmed_reports = [
+            report for report in reports if report.get("confirmed")
+        ]
+        if not confirmed_reports:
+            continue
+
+        # An insurer must not be given a total that includes findings the system
+        # is unsure about.
         d = max(
-            reports,
+            confirmed_reports,
             key=lambda item: severity_order.get(
                 str(item.get("severity") or "").strip().lower(),
                 0,
@@ -358,7 +458,7 @@ def build_estimate(damage):
         damage_type = d.get("damage_type")
         severity = d.get("severity")
         also_reported = []
-        for report in reports:
+        for report in confirmed_reports:
             if report is d:
                 continue
             other_type = report.get("damage_type")
@@ -395,6 +495,7 @@ def build_estimate(damage):
     return {
         "line_items": line_items,
         "unpriced": unpriced,
+        "unconfirmed": unconfirmed,
         "total_low": total_low,
         "total_high": total_high,
         "requires_survey": requires_survey,

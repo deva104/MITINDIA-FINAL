@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import gemini
 import main
+from rules import assess_confidence
 
 
 class FakeConnection:
@@ -214,6 +215,39 @@ class VehicleGroupingTests(unittest.TestCase):
         self.assertEqual(photos[0]["vehicle_group"], 0)
         self.assertIn("source_photo", damage_items[0])
         self.assertEqual(damage_items[0]["source_photo"], "car.jpg")
+
+    def test_vehicle_label_preserves_model_tokens(self):
+        self.assertEqual(
+            main.format_vehicle_label([
+                "silver", "maruti suzuki swift vxi", "sedan",
+            ]),
+            "Silver Maruti Suzuki Swift VXI Sedan",
+        )
+        self.assertEqual(
+            main.format_vehicle_label(["grey", "honda cr-v", "suv"]),
+            "Grey Honda CR-V SUV",
+        )
+
+    def test_whatsapp_unverifiable_exif_is_informational(self):
+        assessment = assess_confidence({
+            "status": "analysed",
+            "source": "whatsapp",
+            "damage": [{"part": "rear_bumper", "confidence": 0.9}],
+            "flags": [],
+            "claimable_count": 1,
+            "estimate": {
+                "requires_survey": False,
+                "unpriced": [],
+            },
+            "fields": [],
+            "forensics": [{
+                "check": "exif",
+                "verdict": "unverifiable",
+            }],
+        })
+
+        self.assertEqual(assessment["decision"], "auto_assess")
+        self.assertEqual(assessment["reasons"], [])
 
 
 if __name__ == "__main__":

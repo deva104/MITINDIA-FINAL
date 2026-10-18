@@ -13,8 +13,8 @@ from fastapi.staticfiles import StaticFiles
 
 from db import get_conn, init_db, list_claims, save_claim, save_file
 from gemini import assess_damage, extract_fields
-from rules import build_estimate, run_rules
-from vision import reset_cache_tracking, stage_was_cached
+from rules import assess_confidence, build_estimate, run_rules
+from vision import fallbacks_used, reset_cache_tracking, stage_was_cached
 
 import whatsapp as wa
 from whatsapp import (
@@ -93,6 +93,143 @@ def demo_reset():
     return {"cleared": True}
 
 
+RULE_FIELD_IMPACTS = {
+    "insured_name_claim_form": (
+        "Insured name", "identity consistency not verified"
+    ),
+    "owner_name_rc": (
+        "Registered owner name", "identity consistency not verified"
+    ),
+    "holder_name_dl": (
+        "Driving licence holder name", "identity consistency not verified"
+    ),
+    "registration_number_claim_form": (
+        "Claim registration number", "vehicle registration match not verified"
+    ),
+    "registration_number_rc": (
+        "RC registration number", "vehicle registration match not verified"
+    ),
+    "dl_expiry_date": (
+        "Driving licence expiry", "licence validity at time of loss not verified"
+    ),
+    "accident_date": (
+        "Accident date", "date-dependent validity checks not verified"
+    ),
+    "policy_start_date": (
+        "Policy start date", "policy activity at time of loss not verified"
+    ),
+    "policy_end_date": (
+        "Policy end date", "policy activity at time of loss not verified"
+    ),
+    "accident_description": (
+        "Accident description",
+        "reported narrative could not be compared with visible damage",
+    ),
+}
+PRESERVE_LABEL_CASE = {
+    "BMW", "SUV", "VXI", "ZXI", "LXI", "CR-V", "HR-V", "MG", "XUV",
+    "GTI", "AMG",
+}
+
+
+def format_vehicle_label(parts):
+    words = []
+    for token in " ".join(str(part) for part in parts if part).split():
+        upper = token.upper()
+        if upper in PRESERVE_LABEL_CASE or token.isupper():
+            words.append(upper)
+        elif "-" in token:
+            words.append("-".join(
+                segment.upper() if len(segment) <= 2
+                else segment[:1].upper() + segment[1:].lower()
+                for segment in token.split("-")
+            ))
+        elif (
+            len(token) <= 4
+            and (
+                any(character.isdigit() for character in token)
+                or (
+                    token.isalpha()
+                    and not any(vowel in token.lower() for vowel in "aeiou")
+                )
+            )
+        ):
+            words.append(upper)
+        else:
+            words.append(token[:1].upper() + token[1:].lower())
+    return " ".join(words)
+
+
+def build_undetermined(payload, provider_fallbacks=None):
+    entries = []
+    for field in payload.get("fields") or []:
+        if not isinstance(field, dict):
+            continue
+        status = field.get("status")
+        field_info = RULE_FIELD_IMPACTS.get(field.get("name"))
+        if status == "unreadable":
+            reason = "value present but illegible"
+            if not field_info:
+                item = str(field.get("name") or "Document field").replace("_", " ").title()
+                field_info = (item, "submitted value not verified")
+        elif status == "not_present":
+            if not field_info:
+                continue
+            reason = "not present in submitted documents"
+        else:
+            continue
+        entries.append({
+            "item": field_info[0],
+            "reason": reason,
+            "impact": field_info[1],
+        })
+
+    for item in payload.get("damage") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            confidence = float(item.get("confidence"))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence < 0.6:
+            part = str(item.get("part") or "Unknown part").replace("_", " ").title()
+            entries.append({
+                "item": f"{part} damage",
+                "reason": "low model confidence",
+                "impact": "excluded from the headline estimate",
+            })
+
+    if any(
+        isinstance(item, dict)
+        and item.get("check") == "exif"
+        and item.get("verdict") == "unverifiable"
+        for item in (payload.get("forensics") or [])
+    ):
+        entries.append({
+            "item": "Photo capture time and location",
+            "reason": "metadata stripped in transit",
+            "impact": "cannot confirm when or where photos were taken",
+        })
+
+    for fallback in provider_fallbacks or []:
+        entries.append({
+            "item": "Primary vision provider",
+            "reason": (
+                f"{fallback['from']} unavailable, fell back to {fallback['to']}"
+            ),
+            "impact": "none — result verified by the fallback",
+        })
+
+    unique = []
+    seen = set()
+    for entry in entries:
+        key = (entry["item"], entry["reason"], entry["impact"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(entry)
+    return unique
+
+
 def build_vehicle_groups(photos, damage, excluded):
     """Split photos, attributed damage, and estimates by model-assigned vehicle."""
     photo_entries = [photo for photo in (photos or []) if isinstance(photo, dict)]
@@ -164,10 +301,7 @@ def build_vehicle_groups(photos, damage, excluded):
             if value:
                 label_parts.append(value)
         if label_parts:
-            label = " ".join(
-                "SUV" if word.lower() == "suv" else word.title()
-                for word in " ".join(label_parts).split()
-            )
+            label = format_vehicle_label(label_parts)
         else:
             label = f"Vehicle {group + 1}"
 
@@ -193,12 +327,13 @@ def build_vehicle_groups(photos, damage, excluded):
     return vehicles
 
 
-async def analyse_claim(claim_id, doc_paths, photo_paths):
+async def analyse_claim(claim_id, doc_paths, photo_paths, source="web"):
     """Staged pipeline shared by the HTTP upload route and the WhatsApp webhook."""
     started = time.perf_counter()
 
     timings = []
     excluded_photos = []
+    provider_fallbacks = []
 
     def stage_done(name, since, cached=False):
         elapsed = round(time.perf_counter() - since, 2)
@@ -208,9 +343,10 @@ async def analyse_claim(claim_id, doc_paths, photo_paths):
     def make_payload(status, stopped_at, fields=None, damage=None, forensics=None,
                      flags=None, estimate=None, vehicle_description="", photos=None,
                      vehicles=None, claimable_count=0):
-        return {
+        payload = {
             "claim_id": claim_id,
             "created_at": datetime.now().isoformat(),
+            "source": source,
             "status": status,
             "stopped_at": stopped_at,
             "vehicle_description": vehicle_description,
@@ -225,6 +361,14 @@ async def analyse_claim(claim_id, doc_paths, photo_paths):
             "vehicles": vehicles or [],
             "claimable_count": claimable_count,
         }
+        payload["undetermined"] = build_undetermined(
+            payload, provider_fallbacks
+        )
+        assessment = assess_confidence(payload)
+        payload["decision"] = assessment["decision"]
+        payload["decision_reasons"] = assessment["reasons"]
+        payload["confidence"] = assessment["confidence"]
+        return payload
 
     def finish(payload):
         save_claim(claim_id, payload)
@@ -271,6 +415,7 @@ async def analyse_claim(claim_id, doc_paths, photo_paths):
         reset_cache_tracking()
         fields = extract_fields(doc_paths) if doc_paths else []
         result = assess_damage(clean_paths)
+        provider_fallbacks = list(fallbacks_used())
         stage_done("stage1_gemini", mark, cached=stage_was_cached())
 
         description = result.get("vehicle_description") or ""

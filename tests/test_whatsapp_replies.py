@@ -188,6 +188,40 @@ class WhatsAppReplyTests(unittest.TestCase):
         ))
         self.assertTrue(reply.endswith("Flagged for manual review."))
 
+    def test_unconfirmed_damage_has_no_zero_estimate(self):
+        vehicle = group(
+            0, "White Kia Sedan", "claimable", 0, 0,
+            photos=["uncertain.jpg"],
+        )
+        vehicle["estimate"]["line_items"] = []
+        vehicle["estimate"]["unconfirmed"] = [{
+            "part": "front_bumper",
+            "damage_type": "crack",
+            "severity": "severe",
+            "confidence": 0.4,
+            "low": 8000,
+            "high": 15000,
+        }]
+        result = payload("CLM-UNCERTAIN", [vehicle])
+        result["decision"] = "needs_review"
+        result["decision_reasons"] = [
+            "Low-confidence damage finding: front bumper"
+        ]
+
+        reply = whatsapp.format_reply(result)
+
+        self.assertNotIn("*Estimate: Rs 0 – Rs 0*", reply)
+        self.assertIn("*No confirmed estimate yet*", reply)
+        self.assertIn(
+            "Indicative range Rs 8,000 – Rs 15,000, pending assessor review.",
+            reply,
+        )
+        self.assertIn(
+            "No confirmed estimate yet; indicative range "
+            "Rs 8,000 – Rs 15,000, pending assessor review",
+            whatsapp._vehicle_summary(vehicle),
+        )
+
 
 class WhatsAppPendingChoiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

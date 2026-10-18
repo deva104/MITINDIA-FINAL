@@ -170,13 +170,36 @@ def _stage_seconds(payload, stage):
 
 def _estimate_range(estimate):
     estimate = estimate or {}
+    unconfirmed = estimate.get("unconfirmed") or []
+    if not estimate.get("total_high") and unconfirmed:
+        low = sum(item.get("low") or 0 for item in unconfirmed)
+        high = sum(item.get("high") or 0 for item in unconfirmed)
+        return (
+            f"No confirmed estimate yet; indicative range "
+            f"{_rupees(low)} – {_rupees(high)}, pending assessor review"
+        )
     return (
         f"{_rupees(estimate.get('total_low'))} "
         f"– {_rupees(estimate.get('total_high'))}"
     )
 
 
-def _single_vehicle_reply(claim_id, vehicle, excluded_count=0, total_photos=None):
+def _undetermined_lines(items):
+    if not items:
+        return []
+    reason_labels = {
+        "value present but illegible": "illegible on the document",
+        "metadata stripped in transit": "metadata removed in transit",
+    }
+    lines = ["", "*Could not determine:*"]
+    for item in items:
+        reason = reason_labels.get(item.get("reason"), item.get("reason"))
+        lines.append(f"- {item.get('item')} — {reason}")
+    return lines
+
+
+def _single_vehicle_reply(claim_id, vehicle, excluded_count=0, total_photos=None,
+                          undetermined=None, decision=None, decision_reasons=None):
     estimate = vehicle.get("estimate") or {}
     line_items = estimate.get("line_items") or []
     lines = []
@@ -214,21 +237,42 @@ def _single_vehicle_reply(claim_id, vehicle, excluded_count=0, total_photos=None
     for item in unpriced:
         lines.append(f"- {_pretty(item.get('part'))} — manual pricing required")
 
-    if not line_items and not unpriced:
+    if not line_items and not unpriced and estimate.get("unconfirmed"):
+        lines.append("- Possible damage detected — excluded pending manual review")
+    elif not line_items and not unpriced:
         lines.append("- Damage detected — manual pricing required")
 
-    lines += ["", f"*Estimate: {_estimate_range(estimate)}*"]
-    if excluded_count:
+    unconfirmed = estimate.get("unconfirmed") or []
+    if not estimate.get("total_high") and unconfirmed:
+        indicative_low = sum(item.get("low") or 0 for item in unconfirmed)
+        indicative_high = sum(item.get("high") or 0 for item in unconfirmed)
+        lines += [
+            "",
+            "*No confirmed estimate yet*",
+            (
+                f"Indicative range {_rupees(indicative_low)} – "
+                f"{_rupees(indicative_high)}, pending assessor review."
+            ),
+        ]
+    else:
+        lines += ["", f"*Estimate: {_estimate_range(estimate)}*"]
+    lines += _undetermined_lines(undetermined)
+    if decision == "needs_review":
+        reasons = decision_reasons or []
+        first_reason = reasons[0] if reasons else "automated checks require review"
+        lines += ["", f"Flagged for manual review: {first_reason.rstrip('.')}."]
+    elif excluded_count:
         lines += ["", "Flagged for manual review."]
     return "\n".join(lines)
 
 
 def _vehicle_summary(vehicle):
-    damage_items = vehicle.get("damage") or []
-    first = damage_items[0] if damage_items else {}
+    estimate = vehicle.get("estimate") or {}
+    line_items = estimate.get("line_items") or []
+    first = line_items[0] if line_items else {}
     part = str(first.get("part") or "damage").replace("_", " ")
     damage_type = str(first.get("damage_type") or "detected").replace("_", " ")
-    return f"{part} {damage_type}, {_estimate_range(vehicle.get('estimate'))}"
+    return f"{part} {damage_type}, {_estimate_range(estimate)}"
 
 
 def _number_word(number, title=False):
@@ -405,6 +449,9 @@ def format_reply(payload):
                 claimable[0],
                 excluded_count=excluded_count,
                 total_photos=total_photos,
+                undetermined=payload.get("undetermined"),
+                decision=payload.get("decision"),
+                decision_reasons=payload.get("decision_reasons"),
             )
             notes = []
             for vehicle in no_damage:
@@ -478,6 +525,9 @@ async def handle_pending_choice(wa_id, text):
             selected,
             excluded_count=len(selected.get("excluded_photos") or []),
             total_photos=len(selected.get("photos") or []),
+            undetermined=pending.get("undetermined"),
+            decision=pending.get("decision"),
+            decision_reasons=pending.get("decision_reasons"),
         )
         await send_text(wa_id, reply)
         session["pending_choice"] = None
@@ -521,7 +571,9 @@ async def process_session(wa_id):
 
         from main import analyse_claim  # deferred: main imports this module at startup
 
-        payload = await analyse_claim(claim_id, doc_paths, photo_paths)
+        payload = await analyse_claim(
+            claim_id, doc_paths, photo_paths, source="whatsapp"
+        )
         reply = format_reply(payload)
         vehicles = [
             vehicle for vehicle in (payload.get("vehicles") or [])
@@ -542,6 +594,9 @@ async def process_session(wa_id):
             session["pending_choice"] = {
                 "claim_id": payload.get("claim_id", claim_id),
                 "vehicles": vehicles,
+                "undetermined": payload.get("undetermined") or [],
+                "decision": payload.get("decision"),
+                "decision_reasons": payload.get("decision_reasons") or [],
             }
             session["pending_prompt"] = reply
             session["updated"] = time.time()

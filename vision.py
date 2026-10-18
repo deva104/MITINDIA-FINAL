@@ -33,15 +33,21 @@ PROVIDER_MAX_IMAGES = {
     "openrouter": 16,
 }
 _CACHE_EVENTS = ContextVar("vision_cache_events", default=())
+_FALLBACK_EVENTS = ContextVar("vision_fallback_events", default=())
 
 
 def reset_cache_tracking():
     _CACHE_EVENTS.set(())
+    _FALLBACK_EVENTS.set(())
 
 
 def stage_was_cached():
     events = _CACHE_EVENTS.get()
     return bool(events) and all(events)
+
+
+def fallbacks_used():
+    return _FALLBACK_EVENTS.get()
 
 
 def _record_cache_event(cached):
@@ -170,6 +176,12 @@ def generate_json(parts, label) -> dict:
 
         if provider_index + 1 < len(providers):
             next_provider = providers[provider_index + 1]
+            _FALLBACK_EVENTS.set(
+                _FALLBACK_EVENTS.get() + ({
+                    "from": provider,
+                    "to": next_provider,
+                },)
+            )
             print(
                 f"[vision] {label}: falling back from {provider} to {next_provider}",
                 flush=True,

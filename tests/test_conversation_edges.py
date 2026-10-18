@@ -92,7 +92,7 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
         db.DB_PATH = os.path.join(self.temp.name, "edges.db")
         main.UPLOAD_DIR = os.path.join(self.temp.name, "uploads")
         os.makedirs(main.UPLOAD_DIR, exist_ok=True)
-        db.init_db()
+        db.prepare_test_db()
         whatsapp.SESSIONS.clear()
         whatsapp.PROCESSED.clear()
         whatsapp._PROCESSED_ORDER.clear()
@@ -378,7 +378,7 @@ class HostileInputTests(unittest.IsolatedAsyncioTestCase):
         db.DB_PATH = os.path.join(self.temp.name, "hostile.db")
         main.UPLOAD_DIR = os.path.join(self.temp.name, "uploads")
         os.makedirs(main.UPLOAD_DIR, exist_ok=True)
-        db.init_db()
+        db.prepare_test_db()
         whatsapp.SESSIONS.clear()
         whatsapp.PROCESSED.clear()
         whatsapp._PROCESSED_ORDER.clear()
@@ -619,7 +619,7 @@ class ProcessedMessageStoreTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.original_db = db.DB_PATH
         db.DB_PATH = os.path.join(self.temp.name, "messages.db")
-        db.init_db()
+        db.prepare_test_db()
         whatsapp.PROCESSED.clear()
         whatsapp._PROCESSED_ORDER.clear()
 

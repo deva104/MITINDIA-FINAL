@@ -72,7 +72,7 @@ class OverrideTests(unittest.TestCase):
         self.folder = tempfile.TemporaryDirectory()
         self.original_db = db.DB_PATH
         db.DB_PATH = os.path.join(self.folder.name, "overrides.db")
-        db.init_db()
+        db.prepare_test_db()
         whatsapp.LAST_INBOUND.clear()
 
     def tearDown(self):

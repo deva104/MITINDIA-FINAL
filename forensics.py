@@ -7,7 +7,7 @@ from pathlib import Path
 
 import httpx
 import imagehash
-from db import cache_get, cache_put
+from db import cache_get, cache_put, current_claim_id, media_put
 from dotenv import load_dotenv
 from PIL import ExifTags, Image, ImageChops, ImageEnhance
 from rules import parse_date
@@ -83,22 +83,61 @@ def prepare_uploaded_image(data):
         return None
 
 
-def _save_original(image, unique_id):
-    image.convert("RGB").save(OUTPUT_DIR / f"{unique_id}_original.jpg", "JPEG")
-    return f"/static_output/{unique_id}_original.jpg"
+PROCESSED_EDGE = 1568
+PROCESSED_QUALITY = 85
+
+
+def _jpeg_bytes(image):
+    """1568px JPEG, the same size the vision call sends. Never the original upload."""
+    converted = image.convert("RGB")
+    if max(converted.size) > PROCESSED_EDGE:
+        converted.thumbnail((PROCESSED_EDGE, PROCESSED_EDGE), Image.LANCZOS)
+    data = b""
+    for quality in (PROCESSED_QUALITY, 60, 40):
+        buffer = io.BytesIO()
+        converted.save(buffer, format="JPEG", quality=quality)
+        data = buffer.getvalue()
+        if len(data) <= 2 * 1024 * 1024:
+            return data
+    return data
+
+
+def _store_processed(image, kind):
+    try:
+        media_id = media_put(
+            _jpeg_bytes(image),
+            "image/jpeg",
+            kind,
+            current_claim_id.get(),
+        )
+    except Exception as error:
+        print(
+            f"[forensics] media store failed ({kind}): {type(error).__name__}",
+            flush=True,
+        )
+        return None
+    if not media_id:
+        return None
+    return f"/media/{media_id}"
+
+
+def _save_original(image, unique_id=None):
+    return _store_processed(image, "original")
 
 
 def build_photo_url_map(photo_paths):
-    """Write servable originals for every submitted photo, including duplicates."""
+    """Store a processed preview for every submitted photo, including duplicates."""
     urls = {}
     for path in photo_paths or []:
         try:
-            _, image, unique_id = _open_image(path)
-            urls[os.path.basename(path).lower()] = _save_original(image, unique_id)
+            _, image, _ = _open_image(path)
+            url = _store_processed(image, "photo")
+            if url:
+                urls[os.path.basename(path).lower()] = url
         except Exception as error:
             print(
                 f"[forensics] original preview failed for {os.path.basename(path)}: "
-                f"{error}",
+                f"{type(error).__name__}",
                 flush=True,
             )
     return urls
@@ -486,13 +525,12 @@ def run_deep_forensics(photo_paths, conn=None, fields=None):
 
                 if _is_jpeg(path, image):
                     ela_image, max_diff = run_ela(image)
-                    ela_image.save(OUTPUT_DIR / f"{unique_id}_ela.jpg", "JPEG")
                     level = "high" if max_diff > ELA_HIGH else ("medium" if max_diff > ELA_MEDIUM else "low")
                     entry = _result(
                         "ela",
                         "suspicious" if max_diff > ELA_MEDIUM else "clean",
                         f"{name}: error level max difference {max_diff} ({level})",
-                        f"/static_output/{unique_id}_ela.jpg",
+                        _store_processed(ela_image, "ela"),
                     )
                 else:
                     entry = _result("ela", "not_applicable", NOT_APPLICABLE_DETAIL, None)

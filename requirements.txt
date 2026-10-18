@@ -9,3 +9,5 @@ pillow-heif
 imagehash
 pymupdf
 python-multipart
+psycopg[binary]
+psycopg_pool

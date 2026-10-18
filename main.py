@@ -11,19 +11,24 @@ from typing import Any, List, Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from db import (
     audit_log_add,
     audit_log_for_claim,
+    current_claim_id,
+    database_backend,
+    database_ok,
     get_claim,
     get_conn,
     init_db,
     list_claims,
+    media_get,
     save_claim,
     save_file,
+    storage_stats,
 )
 from gemini import assign_damage_ids, assess_damage, classify_image, extract_fields
 from rules import assess_confidence, build_estimate, run_rules
@@ -132,7 +137,28 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health():
-    return {"ok": True}
+    ok = database_ok()
+    return {"ok": ok, "db": database_backend(), "db_ok": ok}
+
+
+@app.get("/api/storage")
+def storage():
+    return storage_stats()
+
+
+@app.get("/media/{media_id}")
+def media_file(media_id: str):
+    if len(media_id) != 64 or any(character not in "0123456789abcdef" for character in media_id):
+        raise HTTPException(status_code=404, detail="media not found")
+    found = media_get(media_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="media not found")
+    data, mime = found
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 class OverrideRequest(BaseModel):
@@ -458,6 +484,7 @@ def demo_reset():
         conn.execute("DELETE FROM audit_log")
         conn.execute("DELETE FROM files")
         conn.execute("DELETE FROM claims")
+        conn.execute("DELETE FROM media")
         conn.commit()
     finally:
         conn.close()
@@ -772,6 +799,8 @@ async def analyse_claim(
 ):
     """Staged pipeline shared by the HTTP upload route and the WhatsApp webhook."""
     started = time.perf_counter()
+    temp_inputs = [path for path in list(doc_paths or []) + list(photo_paths or []) if path]
+    claim_token = current_claim_id.set(claim_id)
 
     original_doc_paths = list(doc_paths or [])
     photo_paths = list(photo_paths or [])
@@ -862,7 +891,12 @@ async def analyse_claim(
               f"stopped_at={payload['stopped_at']} total {time.perf_counter() - started:.2f}s", flush=True)
         return payload
 
-    conn = get_conn()
+    try:
+        conn = get_conn()
+    except Exception:
+        current_claim_id.reset(claim_token)
+        _release_temp_uploads(temp_inputs)
+        raise
     try:
         # Stage 0 - duplicate screen, before spending any Gemini quota
         mark = time.perf_counter()
@@ -1014,6 +1048,37 @@ async def analyse_claim(
                                    vehicles=vehicles, claimable_count=claimable_count))
     finally:
         conn.close()
+        current_claim_id.reset(claim_token)
+        _release_temp_uploads(temp_inputs)
+
+
+def _release_temp_uploads(paths):
+    """Delete request files under uploads/. Fixtures and other paths stay."""
+    root = os.path.abspath(UPLOAD_DIR)
+    parents = set()
+    for path in paths or []:
+        if not path:
+            continue
+        absolute = os.path.abspath(path)
+        try:
+            if os.path.commonpath([root, absolute]) != root:
+                continue
+        except ValueError:
+            continue
+        parents.add(os.path.dirname(absolute))
+        if not os.path.isfile(absolute):
+            continue
+        try:
+            os.remove(absolute)
+        except OSError as error:
+            print(f"[storage] could not delete temp file: {type(error).__name__}", flush=True)
+    for directory in sorted(parents, key=len, reverse=True):
+        if directory == root:
+            continue
+        try:
+            os.rmdir(directory)
+        except OSError:
+            pass
 
 
 @app.post("/api/analyze")

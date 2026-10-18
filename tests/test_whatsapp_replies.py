@@ -298,6 +298,17 @@ class WhatsAppPendingChoiceTests(unittest.IsolatedAsyncioTestCase):
         sent = AsyncMock()
         with (
             patch.object(whatsapp, "send_text", sent),
+            patch.object(whatsapp, "classify_session_intake", return_value={
+                "classifications": [],
+                "documents_received": {
+                    "rc": 1,
+                    "driving_licence": 1,
+                    "claim_form": 1,
+                    "policy": 0,
+                },
+                "vehicle_count": 2,
+                "missing": [],
+            }),
             patch.object(main, "analyse_claim", AsyncMock(return_value=result)),
             patch("db.save_file"),
         ):

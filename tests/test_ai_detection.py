@@ -201,6 +201,11 @@ class AiDetectionTests(unittest.TestCase):
             get_conn=lambda: FakeConnection(),
             check_duplicates=lambda paths, conn: [],
             build_photo_url_map=lambda paths: {},
+            classify_image=lambda path: {
+                "doc_type": "other",
+                "confidence": 0.99,
+                "number_plate": None,
+            },
             assess_damage=lambda paths: dog_result,
             save_claim=lambda claim_id, payload: None,
         ), patch.object(main, "run_deep_forensics") as deep:
@@ -214,6 +219,11 @@ class AiDetectionTests(unittest.TestCase):
             get_conn=lambda: FakeConnection(),
             check_duplicates=lambda paths, conn: duplicate_result,
             build_photo_url_map=lambda paths: {},
+            classify_image=lambda path: {
+                "doc_type": "other",
+                "confidence": 0.99,
+                "number_plate": None,
+            },
             assess_damage=lambda paths: dog_result,
             save_claim=lambda claim_id, payload: None,
         ), patch.object(main, "run_deep_forensics") as deep:
@@ -265,6 +275,15 @@ class AiDetectionTests(unittest.TestCase):
             get_conn=lambda: FakeConnection(),
             check_duplicates=lambda paths, conn: [],
             build_photo_url_map=lambda paths: {},
+            classify_image=lambda path: {
+                "doc_type": (
+                    "vehicle_photo"
+                    if os.path.basename(path) == "car.jpg"
+                    else "other"
+                ),
+                "confidence": 0.99,
+                "number_plate": None,
+            },
             assess_damage=lambda paths: result,
             save_claim=lambda claim_id, payload: None,
         ), patch.object(
@@ -308,6 +327,11 @@ class AiDetectionTests(unittest.TestCase):
             get_conn=lambda: FakeConnection(),
             check_duplicates=lambda paths, conn: [],
             build_photo_url_map=lambda paths: {},
+            classify_image=lambda path: {
+                "doc_type": "vehicle_photo",
+                "confidence": 0.99,
+                "number_plate": None,
+            },
             assess_damage=lambda paths: result,
             save_claim=lambda claim_id, payload: None,
         ), patch.object(forensics, "OUTPUT_DIR", Path(self.folder.name)):

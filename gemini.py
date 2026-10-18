@@ -109,6 +109,66 @@ severity MUST be one of: minor, moderate, severe
 reasoning = one short sentence on what you observed.
 Only report damage you can actually see. Do not infer hidden damage."""
 
+CLASSIFY_PROMPT = """Classify this one uploaded image for an Indian motor insurance claim.
+Return JSON exactly as:
+{"doc_type":"vehicle_photo|rc|driving_licence|claim_form|policy|other_document|other","confidence":0.0,"number_plate":null}
+Use vehicle_photo for an exterior or interior motor-vehicle photograph, including damage photos.
+Use rc only for a Registration Certificate, driving_licence only for a driving licence,
+claim_form only for a motor claim form, and policy only for an insurance policy document.
+Use other_document for another readable document and other for everything else.
+number_plate: read it only from a vehicle_photo when it is clearly legible. Otherwise null.
+Never guess a number plate."""
+
+CLASSIFICATION_TYPES = {
+    "vehicle_photo",
+    "rc",
+    "driving_licence",
+    "claim_form",
+    "policy",
+    "other_document",
+    "other",
+}
+
+
+def classify_image(path):
+    if Path(path).suffix.lower() == ".pdf":
+        return {
+            "doc_type": "other_document",
+            "confidence": 1.0,
+            "number_plate": None,
+        }
+    try:
+        data = _generate(
+            [_image_part(path), ("text", CLASSIFY_PROMPT)],
+            "classify_image",
+        )
+        if not isinstance(data, dict):
+            raise ValueError("classification response is not an object")
+        doc_type = str(data.get("doc_type") or "").strip().lower()
+        if doc_type not in CLASSIFICATION_TYPES:
+            doc_type = "other"
+        confidence = _coerce_confidence(data.get("confidence"))
+        number_plate = _clean_text(data.get("number_plate"))
+        if doc_type != "vehicle_photo":
+            number_plate = None
+        return {
+            "doc_type": doc_type,
+            "confidence": confidence,
+            "number_plate": number_plate,
+        }
+    except Exception:
+        print(
+            f"[gemini] classify_image failed for {os.path.basename(path)}:",
+            flush=True,
+        )
+        traceback.print_exc()
+        # Low confidence is deliberately routed into the damage pipeline.
+        return {
+            "doc_type": "other",
+            "confidence": 0.0,
+            "number_plate": None,
+        }
+
 
 def extract_fields(doc_paths):
     if not doc_paths:

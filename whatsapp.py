@@ -6,6 +6,7 @@ from collections import deque
 
 import httpx
 from dotenv import load_dotenv
+from gemini import classify_image, extract_fields
 
 load_dotenv()
 
@@ -20,6 +21,13 @@ BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 HTTP_TIMEOUT = 30.0
 MAX_PROCESSED = 500
 PENDING_CHOICE_TIMEOUT = 30 * 60
+MAX_IMAGES_PER_CLAIM = 8
+DOCUMENT_LABELS = {
+    "rc": "Registration certificate",
+    "driving_licence": "Driving licence",
+    "claim_form": "Claim form",
+    "policy": "Insurance policy",
+}
 
 SESSIONS = {}
 LAST_INBOUND = {}
@@ -59,7 +67,7 @@ def get_session(wa_id):
     session = SESSIONS.get(wa_id)
     now = time.time()
     if (session is not None
-            and session.get("pending_choice")
+            and (session.get("pending_choice") or session.get("awaiting_docs"))
             and now - session.get("updated", 0) > PENDING_CHOICE_TIMEOUT):
         SESSIONS.pop(wa_id, None)
         session = None
@@ -68,6 +76,9 @@ def get_session(wa_id):
             "photos": [],
             "docs": [],
             "pending_choice": None,
+            "awaiting_docs": False,
+            "missing_docs": [],
+            "limit_notified": False,
             "updated": now,
         }
         SESSIONS[wa_id] = session
@@ -528,6 +539,115 @@ def format_reply(payload):
     return f"*Claim {claim_id}*\nStatus: {status}"
 
 
+def required_docs():
+    configured = os.getenv(
+        "REQUIRED_DOCS", "rc,driving_licence,claim_form"
+    )
+    return [
+        value.strip().lower()
+        for value in configured.split(",")
+        if value.strip().lower() in DOCUMENT_LABELS
+    ]
+
+
+def strict_docs_enabled():
+    return os.getenv("STRICT_DOCS", "false").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _infer_document_types(fields):
+    found = {
+        field.get("name")
+        for field in (fields or [])
+        if isinstance(field, dict)
+        and field.get("status") == "found"
+        and field.get("value") not in (None, "")
+    }
+    inferred = set()
+    if found & {
+        "owner_name_rc", "registration_number_rc",
+        "chassis_number", "engine_number", "vehicle_make_model",
+    }:
+        inferred.add("rc")
+    if found & {"holder_name_dl", "dl_number", "dl_expiry_date"}:
+        inferred.add("driving_licence")
+    if found & {
+        "insured_name_claim_form", "registration_number_claim_form",
+        "accident_date", "accident_time", "accident_location",
+        "accident_description",
+    }:
+        inferred.add("claim_form")
+    if found & {"policy_number", "policy_start_date", "policy_end_date"}:
+        inferred.add("policy")
+    return inferred
+
+
+def classify_session_intake(session):
+    classifications = []
+    received = {doc_type: 0 for doc_type in DOCUMENT_LABELS}
+    vehicle_count = 0
+    for path in list(session.get("photos") or [])[:MAX_IMAGES_PER_CLAIM]:
+        result = classify_image(path)
+        entry = {"path": path, **result}
+        classifications.append(entry)
+        try:
+            confidence = float(result.get("confidence"))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        doc_type = result.get("doc_type")
+        if confidence < 0.6 or doc_type == "vehicle_photo":
+            vehicle_count += 1
+        elif doc_type in received:
+            received[doc_type] += 1
+
+    document_paths = list(session.get("docs") or [])
+    if document_paths:
+        for doc_type in _infer_document_types(extract_fields(document_paths)):
+            received[doc_type] = max(1, received[doc_type])
+
+    required = required_docs()
+    missing = [doc_type for doc_type in required if not received[doc_type]]
+    result = {
+        "classifications": classifications,
+        "documents_received": received,
+        "vehicle_count": vehicle_count,
+        "missing": missing,
+    }
+    session["intake"] = result
+    session["missing_docs"] = missing
+    return result
+
+
+def checklist_reply(intake):
+    vehicle_count = intake.get("vehicle_count", 0)
+    if not vehicle_count:
+        return "\n".join([
+            "*Vehicle photo needed*",
+            "",
+            "I received your documents, but no vehicle photo was found.",
+            "Send at least one clear photo of the damaged vehicle.",
+            "SKIP is not available until a vehicle photo is provided.",
+        ])
+
+    lines = ["*Almost there — documents needed*", "", "Received:"]
+    lines.append(f"✓ Damage photos ({vehicle_count})")
+    received = intake.get("documents_received") or {}
+    for doc_type in required_docs():
+        if received.get(doc_type):
+            lines.append(f"✓ {DOCUMENT_LABELS[doc_type]}")
+    lines += ["", "Still needed:"]
+    for doc_type in intake.get("missing") or []:
+        lines.append(f"- {DOCUMENT_LABELS[doc_type]}")
+    lines += ["", "Send them here."]
+    if not strict_docs_enabled():
+        lines[-1] += (
+            " Or reply *SKIP* to submit now — your claim will go to an "
+            "assessor, who will request them."
+        )
+    return "\n".join(lines)
+
+
 async def handle_pending_choice(wa_id, text):
     """Handle a numeric/YES response, returning True when a choice was pending."""
     session = get_session(wa_id)
@@ -581,13 +701,38 @@ async def handle_pending_choice(wa_id, text):
     return True
 
 
-async def process_session(wa_id):
+async def process_session(wa_id, skip_missing=False):
     keep_session = False
     try:
+        session = SESSIONS.get(wa_id) or {}
+        intake = classify_session_intake(session)
+        missing = list(intake.get("missing") or [])
+        if not intake.get("vehicle_count"):
+            session["awaiting_docs"] = True
+            session["updated"] = time.time()
+            keep_session = True
+            await send_text(wa_id, checklist_reply(intake))
+            return
+        if missing and (not skip_missing or strict_docs_enabled()):
+            session["awaiting_docs"] = True
+            session["updated"] = time.time()
+            keep_session = True
+            await send_text(wa_id, checklist_reply(intake))
+            return
+
+        forced_review_reasons = []
+        if missing:
+            missing_names = ", ".join(
+                DOCUMENT_LABELS[doc_type].lower() for doc_type in missing
+            )
+            forced_review_reasons.append(
+                f"documents not provided: {missing_names}"
+            )
+
+        session["awaiting_docs"] = False
         await send_text(wa_id, "Analysing your claim. This takes about 30 seconds.")
 
         claim_id = "CLM-" + uuid.uuid4().hex[:8].upper()
-        session = SESSIONS.get(wa_id) or {}
         photo_paths = list(session.get("photos") or [])
         doc_paths = list(session.get("docs") or [])
 
@@ -608,6 +753,7 @@ async def process_session(wa_id):
             photo_paths,
             source="whatsapp",
             from_number=wa_id,
+            forced_review_reasons=forced_review_reasons,
         )
         reply = format_reply(payload)
         vehicles = [

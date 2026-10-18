@@ -221,6 +221,25 @@ def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None
             "evidence": ["registration_number_claim_form", "registration_number_rc"],
         })
 
+    # A legible plate in the submitted vehicle photo must belong to the RC.
+    if reg_rc:
+        normalised_rc = _norm_reg(reg_rc)
+        for photo in photos or []:
+            if not isinstance(photo, dict) or not photo.get("number_plate"):
+                continue
+            number_plate = str(photo["number_plate"])
+            if _norm_reg(number_plate) != normalised_rc:
+                source = photo.get("source_photo") or "vehicle photo"
+                flags.append({
+                    "rule": "vehicle_identity_mismatch",
+                    "severity": "HIGH",
+                    "message": (
+                        f"Number plate '{number_plate}' in {source} does not match "
+                        f"the RC registration '{reg_rc}'."
+                    ),
+                    "evidence": [source, number_plate, reg_rc],
+                })
+
     # 3. dl_expired_at_loss
     dl_exp = parsed_dates["dl_expiry_date"]
     acc_date = parsed_dates["accident_date"]

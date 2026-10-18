@@ -24,7 +24,7 @@ from db import (
     save_claim,
     save_file,
 )
-from gemini import assign_damage_ids, assess_damage, extract_fields
+from gemini import assign_damage_ids, assess_damage, classify_image, extract_fields
 from rules import assess_confidence, build_estimate, run_rules
 from vision import fallbacks_used, reset_cache_tracking, stage_was_cached
 
@@ -54,6 +54,55 @@ except ImportError:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+MAX_CLAIM_IMAGES = 8
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".bmp", ".tif", ".tiff",
+}
+DOCUMENT_TYPES = {"rc", "driving_licence", "claim_form", "policy"}
+DOCUMENT_LABELS = {
+    "rc": "Registration certificate",
+    "driving_licence": "Driving licence",
+    "claim_form": "Claim form",
+    "policy": "Insurance policy",
+}
+
+
+def required_document_types():
+    configured = os.getenv(
+        "REQUIRED_DOCS", "rc,driving_licence,claim_form"
+    )
+    return [
+        value.strip().lower()
+        for value in configured.split(",")
+        if value.strip().lower() in DOCUMENT_TYPES
+    ]
+
+
+def infer_document_types(fields):
+    found = {
+        field.get("name")
+        for field in (fields or [])
+        if isinstance(field, dict)
+        and field.get("status") == "found"
+        and field.get("value") not in (None, "")
+    }
+    inferred = set()
+    if found & {
+        "owner_name_rc", "registration_number_rc",
+        "chassis_number", "engine_number", "vehicle_make_model",
+    }:
+        inferred.add("rc")
+    if found & {"holder_name_dl", "dl_number", "dl_expiry_date"}:
+        inferred.add("driving_licence")
+    if found & {
+        "insured_name_claim_form", "registration_number_claim_form",
+        "accident_date", "accident_time", "accident_location",
+        "accident_description",
+    }:
+        inferred.add("claim_form")
+    if found & {"policy_number", "policy_start_date", "policy_end_date"}:
+        inferred.add("policy")
+    return inferred
 
 
 @asynccontextmanager
@@ -513,6 +562,40 @@ def build_undetermined(payload, provider_fallbacks=None):
                 "impact": "excluded from the headline estimate",
             })
 
+    for result in payload.get("classifications") or []:
+        if not isinstance(result, dict):
+            continue
+        try:
+            confidence = float(result.get("confidence"))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence < 0.6:
+            entries.append({
+                "item": result.get("filename") or "Uploaded image",
+                "reason": f"low classification confidence ({confidence:.2f})",
+                "impact": "kept as a vehicle photo; document type not established",
+            })
+
+    received = payload.get("documents_received") or {}
+    for doc_type in payload.get("required_documents") or []:
+        if not received.get(doc_type):
+            entries.append({
+                "item": DOCUMENT_LABELS.get(doc_type, doc_type.replace("_", " ").title()),
+                "reason": "required document not provided",
+                "impact": "claim documentation incomplete",
+            })
+
+    vehicle_photos = [
+        photo for photo in (payload.get("photos") or [])
+        if isinstance(photo, dict) and photo.get("is_vehicle") is True
+    ]
+    if vehicle_photos and any(not photo.get("number_plate") for photo in vehicle_photos):
+        entries.append({
+            "item": "Number plate",
+            "reason": "not legible in photos",
+            "impact": "vehicle identity not verified from the photographs",
+        })
+
     if any(
         isinstance(item, dict)
         and item.get("check") == "exif"
@@ -675,15 +758,48 @@ def build_vehicle_groups(photos, damage, excluded, photo_urls=None):
 
 
 async def analyse_claim(
-    claim_id, doc_paths, photo_paths, source="web", from_number=None
+    claim_id, doc_paths, photo_paths, source="web", from_number=None,
+    forced_review_reasons=None,
 ):
     """Staged pipeline shared by the HTTP upload route and the WhatsApp webhook."""
     started = time.perf_counter()
+
+    original_doc_paths = list(doc_paths or [])
+    photo_paths = list(photo_paths or [])
+    direct_doc_paths = [
+        path for path in original_doc_paths
+        if os.path.splitext(path)[1].lower() not in IMAGE_EXTENSIONS
+    ]
+    doc_image_paths = [
+        path for path in original_doc_paths
+        if os.path.splitext(path)[1].lower() in IMAGE_EXTENSIONS
+    ]
+    all_images = photo_paths + doc_image_paths
+    kept_images = all_images[:MAX_CLAIM_IMAGES]
+    intake_excluded = [
+        os.path.basename(path) for path in all_images[MAX_CLAIM_IMAGES:]
+    ]
+    kept_lookup = {os.path.abspath(path) for path in kept_images}
+    photo_paths = [
+        path for path in photo_paths if os.path.abspath(path) in kept_lookup
+    ]
+    doc_image_paths = [
+        path for path in doc_image_paths if os.path.abspath(path) in kept_lookup
+    ]
 
     timings = []
     excluded_photos = []
     provider_fallbacks = []
     photo_url_map = {}
+    classifications = []
+    unclassified = []
+    documents_received = {doc_type: 0 for doc_type in DOCUMENT_TYPES}
+    required_documents = required_document_types()
+    forced_review_reasons = [
+        str(reason).strip()
+        for reason in (forced_review_reasons or [])
+        if str(reason).strip()
+    ]
 
     def stage_done(name, since, cached=False):
         elapsed = round(time.perf_counter() - since, 2)
@@ -704,6 +820,11 @@ async def analyse_claim(
             "photos": photos or [],
             "timings": list(timings),
             "excluded_photos": list(excluded_photos),
+            "intake_excluded": list(intake_excluded),
+            "classifications": list(classifications),
+            "documents_received": dict(documents_received),
+            "required_documents": list(required_documents),
+            "unclassified": list(unclassified),
             "fields": fields or [],
             "damage": damage or [],
             "forensics": forensics or [],
@@ -719,6 +840,11 @@ async def analyse_claim(
         payload["decision"] = assessment["decision"]
         payload["decision_reasons"] = assessment["reasons"]
         payload["confidence"] = assessment["confidence"]
+        if forced_review_reasons and payload["decision"] != "reject":
+            payload["decision"] = "needs_review"
+            payload["decision_reasons"] = list(dict.fromkeys(
+                forced_review_reasons + payload["decision_reasons"]
+            ))
         return payload
 
     def finish(payload):
@@ -739,7 +865,7 @@ async def analyse_claim(
         dup_paths = [p for p in photo_paths if os.path.abspath(p) in flagged]
         clean_paths = [p for p in photo_paths if os.path.abspath(p) not in flagged]
         excluded_photos = [os.path.basename(p) for p in dup_paths]
-        photo_url_map = build_photo_url_map(photo_paths)
+        photo_url_map = build_photo_url_map(kept_images)
 
         # Only a bundle with nothing left to assess is rejected outright. A claim
         # with at least one fresh photo is still worth analysing.
@@ -764,16 +890,62 @@ async def analyse_claim(
             print(f"[analyze] {claim_id} excluding {len(dup_paths)} duplicate photo(s): "
                   f"{', '.join(excluded_photos)}", flush=True)
 
+        # Stage 0.5 - classify each image independently, then route it.
+        mark = time.perf_counter()
+        reset_cache_tracking()
+        routed_photo_paths = []
+        routed_doc_paths = list(direct_doc_paths)
+        for path in clean_paths + doc_image_paths:
+            result = classify_image(path)
+            doc_type = result.get("doc_type")
+            try:
+                confidence = float(result.get("confidence"))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            entry = {
+                "filename": os.path.basename(path),
+                "doc_type": doc_type,
+                "confidence": confidence,
+                "number_plate": result.get("number_plate"),
+                "url": photo_url_map.get(os.path.basename(path).lower()),
+            }
+            classifications.append(entry)
+            if confidence < 0.6 or doc_type == "vehicle_photo":
+                routed_photo_paths.append(path)
+            elif doc_type in DOCUMENT_TYPES:
+                routed_doc_paths.append(path)
+                documents_received[doc_type] += 1
+            else:
+                unclassified.append(entry)
+        clean_paths = routed_photo_paths
+        doc_paths = routed_doc_paths
+        stage_done("stage0_5_classify", mark, cached=stage_was_cached())
+
         # Stage 1 - Gemini extraction and damage assessment
         mark = time.perf_counter()
         reset_cache_tracking()
         fields = extract_fields(doc_paths) if doc_paths else []
+        if direct_doc_paths:
+            for doc_type in infer_document_types(fields):
+                documents_received[doc_type] = max(
+                    1, documents_received.get(doc_type, 0)
+                )
         result = assess_damage(clean_paths)
         provider_fallbacks = list(fallbacks_used())
         stage_done("stage1_gemini", mark, cached=stage_was_cached())
 
         description = result.get("vehicle_description") or ""
         photos = result.get("photos") or []
+        plates = {
+            str(item.get("filename") or "").lower(): item.get("number_plate")
+            for item in classifications
+            if item.get("number_plate")
+        }
+        for photo in photos:
+            if isinstance(photo, dict):
+                photo["number_plate"] = plates.get(
+                    os.path.basename(str(photo.get("source_photo") or "")).lower()
+                )
         raw_damage = result.get("damage") or []
         assign_damage_ids(photos, raw_damage)
         vehicles = build_vehicle_groups(
@@ -860,6 +1032,17 @@ async def analyze(
 
 
 async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".jpg"):
+    session = get_session(wa_id)
+    if bucket == "photos" and len(session["photos"]) >= wa.MAX_IMAGES_PER_CLAIM:
+        if not session.get("limit_notified"):
+            await send_text(
+                wa_id,
+                "Maximum 8 images per claim — keeping the first 8.",
+            )
+            session["limit_notified"] = True
+        session["updated"] = time.time()
+        return
+
     data = await download_media(media_obj)
     if not data:
         await send_text(wa_id, "I could not download that file. Please send it again.")
@@ -872,19 +1055,18 @@ async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".j
     with open(dest, "wb") as fh:
         fh.write(data)
 
-    session = get_session(wa_id)
     session[bucket].append(dest)
     session["updated"] = time.time()
 
     if bucket == "photos":
         await send_text(
             wa_id,
-            f"Photo received ({len(session['photos'])} total). Send any message when you are done.",
+            f"Photo received ({len(session['photos'])} total). Reply DONE when you are done.",
         )
     else:
         await send_text(
             wa_id,
-            f"Document received ({len(session['docs'])} total). Send any message when you are done.",
+            f"Document received ({len(session['docs'])} total). Reply DONE when you are done.",
         )
 
 
@@ -912,7 +1094,10 @@ async def handle_wa_message(message):
                 return
             session = get_session(wa_id)
             if session["photos"] or session["docs"]:
-                await process_session(wa_id)
+                await process_session(
+                    wa_id,
+                    skip_missing=str(text).strip().upper() == "SKIP",
+                )
             else:
                 await send_text(
                     wa_id,

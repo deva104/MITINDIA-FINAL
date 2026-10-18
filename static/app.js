@@ -3,6 +3,7 @@
 
    const STAGES = [
     { key: 'stage0_duplicate',      label: 'Duplicate check' },
+    { key: 'stage0_5_classify',     label: 'Document classification' },
     { key: 'stage1_gemini',         label: 'AI assessment' },
     { key: 'stage2_deep_forensics', label: 'Image forensics' },
     { key: 'stage3_rules',          label: 'Cross-checks' }
@@ -38,6 +39,13 @@
     ela: 'Error level analysis',
     exif: 'Capture metadata',
     ai_generated: 'AI-generation check'
+  };
+
+  const DOCUMENT_LABELS = {
+    rc: 'Registration certificate',
+    driving_licence: 'Driving licence',
+    claim_form: 'Claim form',
+    policy: 'Insurance policy'
   };
   
   const staged = { documents: [], photos: [] };
@@ -349,6 +357,7 @@
     $('verdictSub').textContent = sub;
   
     renderUndetermined(p);
+    renderDocuments(p);
     renderBars(p);
     renderVehicles(p);
     renderEvidence(p);
@@ -376,6 +385,47 @@
         <span class="undetermined-reason">${esc(item.reason || '')}</span>
         ${item.impact ? `<span class="undetermined-impact">· ${esc(item.impact)}</span>` : ''}
       </div>`).join('');
+    card.classList.remove('hidden');
+  }
+
+  function renderDocuments(p) {
+    const required = list(p.required_documents);
+    const unclassified = list(p.unclassified).filter(
+      item => item && typeof item === 'object'
+    );
+    const card = $('documentsCard');
+    if (!required.length && !unclassified.length) {
+      card.classList.add('hidden');
+      $('documentChecklist').innerHTML = '';
+      $('unclassifiedImages').classList.add('hidden');
+      return;
+    }
+
+    const received = p.documents_received || {};
+    $('documentChecklist').innerHTML = required.map(docType => {
+      const count = Number(received[docType] || 0);
+      return `<div class="document-row">
+        <span>${esc(DOCUMENT_LABELS[docType] || human(docType))}</span>
+        <span class="document-state ${count ? 'is-received' : 'is-missing'}">
+          ${count ? '✓ Received' + (count > 1 ? ` (${count})` : '') : 'Missing'}
+        </span>
+      </div>`;
+    }).join('');
+
+    const unclassifiedBox = $('unclassifiedImages');
+    if (unclassified.length) {
+      unclassifiedBox.innerHTML = `
+        <div class="unclassified-title">Unclassified images</div>
+        <div class="unclassified-list">${unclassified.map(item => `
+          <div class="unclassified-item">
+            ${item.url ? `<img src="${esc(item.url)}" alt="${esc(item.filename || 'Unclassified image')}">` : ''}
+            <span>${esc(item.filename || 'Image')}</span>
+          </div>`).join('')}</div>`;
+      unclassifiedBox.classList.remove('hidden');
+    } else {
+      unclassifiedBox.innerHTML = '';
+      unclassifiedBox.classList.add('hidden');
+    }
     card.classList.remove('hidden');
   }
 

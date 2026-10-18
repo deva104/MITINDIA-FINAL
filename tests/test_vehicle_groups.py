@@ -36,6 +36,11 @@ class VehicleGroupingTests(unittest.TestCase):
             main,
             get_conn=lambda: FakeConnection(),
             check_duplicates=lambda paths, conn: [],
+            classify_image=lambda path: {
+                "doc_type": "vehicle_photo",
+                "confidence": 0.99,
+                "number_plate": None,
+            },
             assess_damage=lambda paths: result,
             run_deep_forensics=lambda paths, conn, fields=None: [],
             save_claim=lambda claim_id, payload: None,

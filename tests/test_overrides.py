@@ -1,3 +1,7 @@
+try:
+    import bootstrap  # noqa: F401
+except ImportError:
+    from tests import bootstrap  # noqa: F401
 import asyncio
 import copy
 import os

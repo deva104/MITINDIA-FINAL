@@ -6,9 +6,10 @@ from collections import deque
 
 import httpx
 from dotenv import load_dotenv
-from gemini import classify_image, extract_fields
 
 load_dotenv()
+
+from gemini import classify_image, extract_fields
 
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")

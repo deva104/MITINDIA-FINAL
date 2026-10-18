@@ -1,3 +1,7 @@
+try:
+    import bootstrap  # noqa: F401
+except ImportError:
+    from tests import bootstrap  # noqa: F401
 import asyncio
 import os
 import time
@@ -123,7 +127,7 @@ class PipelineRoutingTests(unittest.TestCase):
             get_conn=lambda: FakeConnection(),
             check_duplicates=lambda paths, conn: [],
             build_photo_url_map=lambda paths: {
-                os.path.basename(path).lower(): f"/static_output/{os.path.basename(path)}"
+                os.path.basename(path).lower(): f"/media/{os.path.basename(path)}"
                 for path in paths
             },
             classify_image=lambda path: classifications[os.path.basename(path)],

@@ -2,10 +2,10 @@ import hashlib
 import json
 import os
 import sqlite3
-import sys
 import time
 from contextvars import ContextVar
 from datetime import datetime
+from urllib.parse import urlparse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "claimpilot.db")
@@ -208,33 +208,45 @@ class DatabaseConnection:
         self._raw.close()
 
 
-def active_database_url():
-    """Postgres URL for this process.
+def _select_backend():
+    """Read DATABASE_URL once. Later environment changes must not switch backends."""
+    url = os.getenv("DATABASE_URL", "").strip()
+    if url:
+        return "postgres", url
+    return "sqlite", ""
 
-    The test runner never reads DATABASE_URL, so a suite cannot reach the
-    production branch. CLAIMPILOT_USE_TEST_DB=1 selects TEST_DATABASE_URL.
-    """
-    if "unittest" in sys.modules:
-        if os.getenv("CLAIMPILOT_USE_TEST_DB", "").strip() == "1":
-            return os.getenv("TEST_DATABASE_URL", "").strip()
-        return ""
-    return os.getenv("DATABASE_URL", "").strip()
+
+def _public_host(url):
+    """Hostname only, with a Neon endpoint id shortened. Never user or password."""
+    host = urlparse(url).hostname or ""
+    labels = host.split(".")
+    if labels and labels[0].startswith("ep-"):
+        pooled = "-pooler" if labels[0].endswith("-pooler") else ""
+        labels[0] = f"ep-...{pooled}"
+        return ".".join(labels)
+    return host
+
+
+BACKEND, DB_URL = _select_backend()
+if BACKEND == "postgres":
+    print(f"[db] backend=postgres host={_public_host(DB_URL)}", flush=True)
+else:
+    print("[db] backend=sqlite", flush=True)
 
 
 def database_backend():
-    return "postgres" if active_database_url() else "sqlite"
+    return BACKEND
 
 
 def _pool():
     global _POOL
-    url = active_database_url()
-    if not url:
+    if not DB_URL:
         raise RuntimeError("Postgres pool requested without a database URL")
     if _POOL is None:
         from psycopg_pool import ConnectionPool
 
         _POOL = ConnectionPool(
-            url,
+            DB_URL,
             min_size=1,
             max_size=5,
             kwargs={"autocommit": False, "prepare_threshold": None},
@@ -244,7 +256,7 @@ def _pool():
 
 
 def get_conn():
-    if active_database_url():
+    if BACKEND == "postgres":
         pool = _pool()
         return DatabaseConnection(pool.getconn(), postgres=True, pool=pool)
     raw = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -255,7 +267,7 @@ def get_conn():
 def init_db():
     conn = get_conn()
     try:
-        if database_backend() == "postgres":
+        if BACKEND == "postgres":
             for statement in POSTGRES_SCHEMA:
                 conn.execute(statement)
         else:
@@ -279,7 +291,7 @@ def reset_tables():
 def prepare_test_db():
     """Create tables. On the shared Postgres test branch, also remove existing rows."""
     init_db()
-    if database_backend() == "postgres":
+    if BACKEND == "postgres":
         reset_tables()
 
 
@@ -308,7 +320,7 @@ def save_claim(claim_id, payload_dict):
     payload = json.dumps(payload_dict, ensure_ascii=False)
     conn = get_conn()
     try:
-        if database_backend() == "postgres":
+        if BACKEND == "postgres":
             conn.execute(
                 """
                 INSERT INTO claims (claim_id, created_at, payload_json)
@@ -332,7 +344,7 @@ def save_claim(claim_id, payload_dict):
 def save_file(claim_id, filename, kind, path):
     conn = get_conn()
     try:
-        if database_backend() == "postgres":
+        if BACKEND == "postgres":
             cursor = conn.execute(
                 """
                 INSERT INTO files (claim_id, filename, kind, path, phash)
@@ -367,7 +379,7 @@ def get_claim(claim_id):
 
 
 def _ensure_audit_log(conn):
-    if database_backend() == "postgres":
+    if BACKEND == "postgres":
         conn.execute(POSTGRES_SCHEMA[3])
         return
     conn.execute(
@@ -404,7 +416,7 @@ def audit_log_add(
             reason,
             timestamp,
         )
-        if database_backend() == "postgres":
+        if BACKEND == "postgres":
             cursor = conn.execute(
                 """
                 INSERT INTO audit_log (
@@ -451,7 +463,7 @@ def audit_log_for_claim(claim_id):
 
 
 def _ensure_vision_cache(conn):
-    statement = POSTGRES_SCHEMA[2] if database_backend() == "postgres" else """
+    statement = POSTGRES_SCHEMA[2] if BACKEND == "postgres" else """
         CREATE TABLE IF NOT EXISTS vision_cache (
             content_hash  TEXT PRIMARY KEY,
             label         TEXT,
@@ -516,7 +528,7 @@ def cache_put(content_hash, label, response, provider, model):
             model,
             datetime.now().isoformat(),
         )
-        if database_backend() == "postgres":
+        if BACKEND == "postgres":
             conn.execute(
                 """
                 INSERT INTO vision_cache (
@@ -541,7 +553,7 @@ def cache_put(content_hash, label, response, provider, model):
 
 
 def _ensure_processed_messages(conn):
-    statement = POSTGRES_SCHEMA[4] if database_backend() == "postgres" else """
+    statement = POSTGRES_SCHEMA[4] if BACKEND == "postgres" else """
         CREATE TABLE IF NOT EXISTS processed_messages (
             message_id   TEXT PRIMARY KEY,
             processed_at REAL
@@ -563,7 +575,7 @@ def remember_processed_message(message_id, now=None):
             "DELETE FROM processed_messages WHERE processed_at < ?",
             (cutoff,),
         )
-        if database_backend() == "postgres":
+        if BACKEND == "postgres":
             inserted = conn.execute(
                 """
                 INSERT INTO processed_messages (message_id, processed_at)
@@ -615,7 +627,7 @@ def media_put(data, mime, kind, claim_id):
             data,
             datetime.now().isoformat(),
         )
-        if database_backend() == "postgres":
+        if BACKEND == "postgres":
             conn.execute(
                 """
                 INSERT INTO media (id, claim_id, kind, mime, bytes, created_at)
@@ -665,7 +677,7 @@ def media_get(media_id):
 def storage_stats():
     conn = get_conn()
     try:
-        length = "octet_length(bytes)" if database_backend() == "postgres" else "LENGTH(bytes)"
+        length = "octet_length(bytes)" if BACKEND == "postgres" else "LENGTH(bytes)"
         media_row = conn.execute(
             f"SELECT COALESCE(SUM({length}), 0) AS total FROM media"
         ).fetchone()

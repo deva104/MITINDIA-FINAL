@@ -1,3 +1,7 @@
+try:
+    import bootstrap  # noqa: F401
+except ImportError:
+    from tests import bootstrap  # noqa: F401
 import time
 import unittest
 from unittest.mock import AsyncMock, patch

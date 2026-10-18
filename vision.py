@@ -5,11 +5,10 @@ from contextvars import ContextVar
 
 from dotenv import load_dotenv
 
+load_dotenv()
+
 from db import cache_get, cache_put
 from providers import call_gemini, call_groq, call_openrouter
-
-
-load_dotenv()
 
 DEFAULT_PROVIDERS = "groq,gemini,openrouter"
 PROVIDER_CALLS = {

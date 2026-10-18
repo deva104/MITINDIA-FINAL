@@ -1,3 +1,7 @@
+try:
+    import bootstrap  # noqa: F401
+except ImportError:
+    from tests import bootstrap  # noqa: F401
 import os
 import tempfile
 import unittest
@@ -16,7 +20,7 @@ class StorageTests(unittest.TestCase):
         self.original_db = db.DB_PATH
         self.original_upload = main.UPLOAD_DIR
         db.DB_PATH = os.path.join(self.folder.name, "storage.db")
-        main.UPLOAD_DIR = os.path.join(self.folder.name, "uploads")
+        main.UPLOAD_DIR = os.path.join(self.folder.name, "incoming")
         os.makedirs(main.UPLOAD_DIR, exist_ok=True)
         db.prepare_test_db()
 
@@ -50,7 +54,7 @@ class StorageTests(unittest.TestCase):
         with Image.open(__import__("io").BytesIO(data)) as image:
             self.assertLessEqual(max(image.size), forensics.PROCESSED_EDGE)
 
-    def test_temp_cleanup_stays_inside_uploads(self):
+    def test_temp_cleanup_stays_inside_upload_directory(self):
         inside = os.path.join(main.UPLOAD_DIR, "CLM-1", "photo.jpg")
         os.makedirs(os.path.dirname(inside), exist_ok=True)
         with open(inside, "wb") as handle:

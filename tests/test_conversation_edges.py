@@ -1,3 +1,7 @@
+try:
+    import bootstrap  # noqa: F401
+except ImportError:
+    from tests import bootstrap  # noqa: F401
 import asyncio
 import io
 import os
@@ -90,7 +94,7 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
         self.original_db = db.DB_PATH
         self.original_upload = main.UPLOAD_DIR
         db.DB_PATH = os.path.join(self.temp.name, "edges.db")
-        main.UPLOAD_DIR = os.path.join(self.temp.name, "uploads")
+        main.UPLOAD_DIR = os.path.join(self.temp.name, "incoming")
         os.makedirs(main.UPLOAD_DIR, exist_ok=True)
         db.prepare_test_db()
         whatsapp.SESSIONS.clear()
@@ -376,7 +380,7 @@ class HostileInputTests(unittest.IsolatedAsyncioTestCase):
         self.original_db = db.DB_PATH
         self.original_upload = main.UPLOAD_DIR
         db.DB_PATH = os.path.join(self.temp.name, "hostile.db")
-        main.UPLOAD_DIR = os.path.join(self.temp.name, "uploads")
+        main.UPLOAD_DIR = os.path.join(self.temp.name, "incoming")
         os.makedirs(main.UPLOAD_DIR, exist_ok=True)
         db.prepare_test_db()
         whatsapp.SESSIONS.clear()
@@ -587,11 +591,11 @@ class HostileInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("verdict ' + (escalated ? 'is-error'", source)
 
     def test_screen_photo_of_a_claimed_image_is_outside_the_duplicate_gate(self):
-        original = ROOT / "uploads" / "CLM-0CC08F7C" / "image.png"
-        screens = list((ROOT / "uploads").glob("wa_*/*.jpg"))
+        fixtures = ROOT / "tests" / "fixtures"
+        original = fixtures / "claimed_panel.jpeg"
+        screen = fixtures / "claimed_panel_screenshot.jpeg"
         self.assertTrue(original.exists())
-        self.assertEqual(len(screens), 1)
-        screen = screens[0]
+        self.assertTrue(screen.exists())
 
         def phash(path):
             with Image.open(path) as image:

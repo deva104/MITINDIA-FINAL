@@ -52,10 +52,22 @@ _MIME_EXTENSIONS = {
     "image/tiff": ".tiff",
     "application/pdf": ".pdf",
 }
-ANALYSIS_BUSY_REPLY = "Your claim is already being analysed."
+ANALYSIS_BUSY_REPLY = "Your claim is still being analysed — you will get the result here."
 NEW_CLAIM_WHILE_BUSY = (
     "Your previous claim is still being analysed — these photos will start a new claim."
 )
+NEW_DOCUMENT_WHILE_BUSY = (
+    "Your previous claim is still being analysed — this document will start a new claim."
+)
+UNHANDLED_WITH_MEDIA_REPLY = (
+    "That type of message cannot be read here. Send photos or a PDF of your "
+    "documents, then reply DONE."
+)
+# While an analysis runs, new media gets one notice (not one per photo), and
+# media identical to what is being analysed is held here and added back as
+# soon as the analysis releases its rows, so it starts the next claim.
+BUSY_NOTICE_SENT = set()
+DEFERRED_MEDIA = {}
 CHOICE_CLEARED_REPLY = (
     "The previous vehicle choice has been cleared. This photo starts a new claim. "
     "Reply DONE when you are done."
@@ -313,6 +325,36 @@ SESSIONS = _SessionStore()
 def add_session_media(wa_id, media_id, kind, sha256, page=0, source_bytes=None):
     """Append one stored item to a session. None means it was already there."""
     return db.add_session_media(wa_id, media_id, kind, sha256, page, source_bytes)
+
+
+def is_analysing(wa_id):
+    """An analysis is running for this number in this process."""
+    return wa_id in ANALYSING_IDS
+
+
+def take_busy_notice(wa_id):
+    """True once per analysis: the first new media item gets the notice."""
+    if wa_id in BUSY_NOTICE_SENT:
+        return False
+    BUSY_NOTICE_SENT.add(wa_id)
+    return True
+
+
+def defer_media(wa_id, media_id, kind, sha256, page, source_bytes):
+    """Hold media identical to rows being analysed (the unique key refuses it
+    while those rows exist) until the analysis releases them."""
+    held = DEFERRED_MEDIA.setdefault(wa_id, [])
+    if all((item[2], item[3]) != (sha256, page) for item in held):
+        held.append((media_id, kind, sha256, page, source_bytes))
+
+
+def restore_deferred_media(wa_id):
+    """Add held media back as the next claim's rows. Returns how many."""
+    restored = 0
+    for media_id, kind, sha256, page, source_bytes in DEFERRED_MEDIA.pop(wa_id, []):
+        if add_session_media(wa_id, media_id, kind, sha256, page, source_bytes) is not None:
+            restored += 1
+    return restored
 
 
 def _last_activity(state, rows):
@@ -1224,6 +1266,9 @@ async def process_session(wa_id, skip_missing=False):
         )
         await asyncio.to_thread(db.delete_session_media, wa_id, consumed)
         consumed = None
+        # Media identical to this claim's, sent during the analysis, is now
+        # the next claim (the duplicate gate will judge it then).
+        restore_deferred_media(wa_id)
         live = get_session(wa_id)
         if live["photos"] or live["docs"]:
             # Media that arrived during the analysis is the next claim.
@@ -1248,11 +1293,22 @@ async def process_session(wa_id, skip_missing=False):
     except Exception:
         print("[whatsapp] process_session failed:", flush=True)
         traceback.print_exc()
-        saved = bool(claim_id) and await asyncio.to_thread(db.get_claim, claim_id) is not None
+        try:
+            saved = bool(claim_id) and await asyncio.to_thread(db.get_claim, claim_id) is not None
+        except Exception as error:
+            # The database cannot say (a PoolTimeout or an outage): keep the
+            # media and ask for DONE, never a raw error.
+            print(f"[whatsapp] could not check the claim after a failure: "
+                  f"{type(error).__name__}", flush=True)
+            saved, consumed = False, None
         if consumed is not None and claim_id and not saved:
             # Nothing was saved: keep the media so DONE retries it, and drop the
             # half-written file rows so the retry is not matched as a duplicate.
-            await asyncio.to_thread(db.delete_files_for_claim, claim_id)
+            try:
+                await asyncio.to_thread(db.delete_files_for_claim, claim_id)
+            except Exception as error:
+                print(f"[whatsapp] could not drop half-written file rows: "
+                      f"{type(error).__name__}", flush=True)
             consumed = None
         if saved:
             # The claim exists; a retry would only meet the duplicate gate.
@@ -1267,11 +1323,19 @@ async def process_session(wa_id, skip_missing=False):
             )
     finally:
         _release_materialised(temp_paths)
-        if consumed:
-            db.delete_session_media(wa_id, consumed)
-        if not keep_session:
-            if db.list_session_media(wa_id):
-                reset_session(wa_id)
-            else:
-                SESSIONS.pop(wa_id, None)
+        try:
+            if consumed:
+                db.delete_session_media(wa_id, consumed)
+            # Failure paths: kept rows absorb identical held media; the rest returns.
+            restore_deferred_media(wa_id)
+            if not keep_session:
+                if db.list_session_media(wa_id):
+                    reset_session(wa_id)
+                else:
+                    SESSIONS.pop(wa_id, None)
+        except Exception as error:
+            # The reply has been sent; a cleanup failure must not send another.
+            print(f"[whatsapp] session cleanup failed: {type(error).__name__}", flush=True)
+        DEFERRED_MEDIA.pop(wa_id, None)
+        BUSY_NOTICE_SENT.discard(wa_id)
         ANALYSING_IDS.discard(wa_id)

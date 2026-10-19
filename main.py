@@ -17,7 +17,7 @@ from fastapi import (
     BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -263,6 +263,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+try:
+    from psycopg_pool import PoolTimeout
+except ImportError:  # SQLite-only installs
+    PoolTimeout = None
+
+if PoolTimeout is not None:
+    @app.exception_handler(PoolTimeout)
+    async def database_busy(request: Request, error):
+        # Every connection stayed busy through the retry: transient. The
+        # console polls again in 3 s.
+        print(f"[db] {request.url.path}: pool still busy after a retry; answered 503",
+              flush=True)
+        return JSONResponse(
+            {"detail": "The database is busy. Try again in a few seconds."},
+            status_code=503, headers={"Retry-After": "3"},
+        )
 
 
 @app.get("/api/health")
@@ -802,11 +819,23 @@ def build_undetermined(payload):
         })
     elif extraction.get("status") == "partial":
         for item in failed:
-            entries.append({
+            entry = {
                 "item": f"Document details: {item.get('name') or 'document'}",
                 "reason": f"could not be read: {item.get('error') or 'unknown error'}",
                 "impact": "checks that need this document were not run",
-            })
+            }
+            if item.get("pages"):
+                # Some pages of a document read in chunks: the rest was kept.
+                pages = str(item["pages"])[2:]
+                words = f"page {pages}" if "-" not in pages else f"pages {pages}"
+                label = DOCUMENT_LABELS.get(item.get("doc_type"), "document").lower()
+                entry["reason"] = (
+                    f"{words} of {item.get('document') or 'the document'} could not be read: "
+                    f"{item.get('error') or 'unknown error'}"
+                )
+                entry["impact"] = "fields on those pages were not read"
+                _ask(entry, f"please send a clear photo of {words} of your {label}")
+            entries.append(entry)
 
     document_check = payload.get("document_check") or {}
     received = document_check.get("received") or {}
@@ -1539,12 +1568,23 @@ async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".j
     ]
     added = any(row_id is not None for row_id in row_ids)
     session = get_session(wa_id)
-    analysing = bool(session.get("analysing"))
+    analysing = bool(session.get("analysing")) or wa.is_analysing(wa_id)
+
+    if analysing:
+        if not added:
+            # The same bytes as rows being analysed: held, then the next claim.
+            for media_id, (_, _, kind, page) in zip(media_ids, items):
+                wa.defer_media(wa_id, media_id, kind, source_sha, page, source_bytes)
+        # One notice per analysis, however many items arrive.
+        if wa.take_busy_notice(wa_id):
+            await send_text(
+                wa_id,
+                wa.NEW_CLAIM_WHILE_BUSY if bucket == "photos" else wa.NEW_DOCUMENT_WHILE_BUSY,
+            )
+        return
 
     if not added:
-        if analysing:
-            await send_text(wa_id, wa.ANALYSIS_BUSY_REPLY)
-        elif bucket == "photos":
+        if bucket == "photos":
             await send_text(wa_id, _photo_receipt(len(session["photos"])))
         else:
             await send_text(wa_id, _document_receipt(session["doc_count"]))
@@ -1577,19 +1617,63 @@ async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".j
                 "Reply DONE when you are done.",
             )
         return
-    if analysing and bucket == "photos":
-        await send_text(wa_id, wa.NEW_CLAIM_WHILE_BUSY)
-        return
-    if analysing:
-        await send_text(
-            wa_id,
-            "Your previous claim is still being analysed — this document will start a new claim.",
-        )
-        return
     if bucket == "photos":
         await send_text(wa_id, _photo_receipt(len(session["photos"])))
         return
     await send_text(wa_id, _document_receipt(session["doc_count"], truncated_from))
+
+
+# A multi-photo send delivers one extra webhook event besides the photos
+# (production, 19 Oct: 4 events for 3 photos, twice). Such an event sent
+# within this many seconds of media from the same number, before or after
+# it, gets no reply. Times are the send times Meta stamps on each event, so
+# a slow database cannot push two events of one album apart. Reactions,
+# edits and similar events never get a reply.
+STRAY_EVENT_WINDOW = 15.0
+SILENT_TYPES = {"reaction", "edit", "revoke", "system", "ephemeral", "request_welcome"}
+_MEDIA_SEEN = {}
+
+
+def _sent_at(message):
+    """Meta's send time for an event (epoch seconds), else the arrival time."""
+    try:
+        return float(message.get("timestamp"))
+    except (TypeError, ValueError):
+        return time.time()
+
+
+def _note_media(wa_id, at):
+    seen = _MEDIA_SEEN.setdefault(wa_id, [])
+    seen.append(at)
+    del seen[:-20]
+
+
+def _media_near(wa_id, at):
+    return any(abs(seen - at) <= STRAY_EVENT_WINDOW for seen in _MEDIA_SEEN.get(wa_id, []))
+
+
+async def _answer_unhandled(wa_id, message_type, sent_at):
+    """An event that is not a photo, document, text or a known unsupported
+    type. Never the greeting to someone with media or an analysis running."""
+    if message_type in SILENT_TYPES:
+        return
+    if not _media_near(wa_id, sent_at):
+        # The extra event can arrive before the photos it belongs to.
+        await asyncio.sleep(STRAY_EVENT_WINDOW)
+    if _media_near(wa_id, sent_at):
+        print(f"[whatsapp] ignored a {message_type} event within "
+              f"{STRAY_EVENT_WINDOW:.0f}s of media from {wa.who(wa_id)}", flush=True)
+        return
+    if wa.is_analysing(wa_id):
+        return
+    session = get_session(wa_id)
+    if session["photos"] or session["docs"]:
+        await send_text(wa_id, wa.UNHANDLED_WITH_MEDIA_REPLY)
+        return
+    await send_text(
+        wa_id,
+        "Please send a photo of the damaged vehicle to start a claim. " + wa.ACCEPTED_MEDIA,
+    )
 
 
 async def handle_wa_message(message):
@@ -1601,9 +1685,21 @@ async def handle_wa_message(message):
         wa_id = message.get("from")
         if not wa_id:
             return
-        wa.record_inbound(wa_id, message.get("timestamp"))
+        sent_at = _sent_at(message)
         message_id = message.get("id")
         message_type = message.get("type")
+        if message_type in ("image", "document"):
+            # Before any database work: a stray event waiting on this number
+            # must see the media even when the database is slow.
+            _note_media(wa_id, sent_at)
+        wa.record_inbound(wa_id, message.get("timestamp"))
+        codes = ",".join(
+            str(error.get("code")) for error in message.get("errors") or []
+            if isinstance(error, dict)
+        )
+        # The type of every inbound message, never the number.
+        print(f"[whatsapp] inbound {message_type}{f' errors={codes}' if codes else ''} "
+              f"{wa.message_ref(message_id)} from {wa.who(wa_id)}", flush=True)
         wa.sweep_idle_sessions()
         expiry_notice = wa.take_expiry_notice(wa_id)
         if expiry_notice:
@@ -1627,6 +1723,10 @@ async def handle_wa_message(message):
             text = (message.get("text") or {}).get("body") or ""
             if await wa.handle_pending_choice(wa_id, text):
                 return
+            if wa.is_analysing(wa_id):
+                # DONE (or anything) mid-analysis: one line, never the greeting.
+                await send_text(wa_id, wa.ANALYSIS_BUSY_REPLY)
+                return
             session = get_session(wa_id)
             if session["photos"] or session["docs"]:
                 await process_session(
@@ -1645,11 +1745,7 @@ async def handle_wa_message(message):
         elif message_type in wa.UNSUPPORTED_REPLIES:
             await send_text(wa_id, wa.UNSUPPORTED_REPLIES[message_type])
         else:
-            await send_text(
-                wa_id,
-                "Please send a photo of the damaged vehicle to start a claim. "
-                + wa.ACCEPTED_MEDIA,
-            )
+            await _answer_unhandled(wa_id, message_type, sent_at)
     except Exception:
         print("[whatsapp] handle_wa_message failed:", flush=True)
         traceback.print_exc()

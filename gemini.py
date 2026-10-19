@@ -242,19 +242,39 @@ def _document(spec):
     return {"name": os.path.basename(str(spec)), "paths": [spec], "doc_type": None}
 
 
-def _document_parts(document):
+# Groq takes at most this many images per call, so a longer document is read
+# in chunks of this many pages: a 4-page form is pages 1-3, then page 4.
+CHUNK_PAGES = 3
+CHUNK_NOTE = (
+    "\nThese are pages {first} to {last} of {total} of this document; the other pages "
+    "are read separately. A field that is not on these pages is 'not_present'."
+)
+
+
+def _document_images(document):
     images = []
     for path in document["paths"]:
         part = _image_part(path)
         images.extend(part if isinstance(part, list) else [part])
+    return images
+
+
+def _document_parts(document, images=None, start=0, total=None):
+    """Labelled parts for images, numbered as pages of the whole document."""
+    images = _document_images(document) if images is None else images
+    total = len(images) if total is None else total
     parts = []
-    for index, image in enumerate(images, 1):
+    for index, image in enumerate(images, start + 1):
         label = f"Filename: {document['name']}"
-        if len(images) > 1:
-            label += f" (page {index} of {len(images)})"
+        if total > 1:
+            label += f" (page {index} of {total})"
         parts.append(("text", label))
         parts.append(image)
     return parts
+
+
+def page_range(first, last):
+    return f"p.{first}" if first == last else f"p.{first}-{last}"
 
 
 def _normalise_fields(raw, document):
@@ -282,8 +302,16 @@ def _normalise_fields(raw, document):
 
 
 def _extract_document(document):
-    parts = _document_parts(document)
-    if not parts:
+    """(fields, failed_pages) for one document.
+
+    A document longer than CHUNK_PAGES is read chunk by chunk; each chunk is
+    its own call, so each is Groq-eligible and cached on its own. Fields of
+    the chunks that were read are kept when another chunk fails; the failed
+    pages are returned as [{"pages": "p.4", "error"}]. Only when every chunk
+    fails does the document fail.
+    """
+    images = _document_images(document)
+    if not images:
         raise ValueError("document has no readable pages")
     prompt = (
         SINGLE_DOCUMENT_PROMPT.format(
@@ -293,11 +321,67 @@ def _extract_document(document):
         if document["doc_type"]
         else EXTRACT_PROMPT
     )
-    data = _generate(parts + [("text", prompt)], f"extract_fields({document['name']})")
-    fields = _normalise_fields(data.get("fields") if isinstance(data, dict) else None, document)
-    if not fields:
-        raise ValueError("the model returned no fields")
-    return fields
+    total = len(images)
+    if total <= CHUNK_PAGES:
+        parts = _document_parts(document, images)
+        data = _generate(parts + [("text", prompt)], f"extract_fields({document['name']})")
+        fields = _normalise_fields(data.get("fields") if isinstance(data, dict) else None, document)
+        if not fields:
+            raise ValueError("the model returned no fields")
+        return fields, []
+
+    read, failed, last_error = [], [], None
+    for start in range(0, total, CHUNK_PAGES):
+        chunk = images[start:start + CHUNK_PAGES]
+        pages = page_range(start + 1, start + len(chunk))
+        label = f"extract_fields({document['name']} {pages})"
+        note = CHUNK_NOTE.format(first=start + 1, last=start + len(chunk), total=total)
+        try:
+            data = _generate(
+                _document_parts(document, chunk, start, total) + [("text", prompt + note)], label
+            )
+            fields = _normalise_fields(
+                data.get("fields") if isinstance(data, dict) else None, document
+            )
+            if not fields:
+                raise ValueError("the model returned no fields")
+        except Exception as error:
+            last_error = error
+            print(f"[gemini] {label} failed: {_cause(error)}", flush=True)
+            failed.append({"pages": pages, "error": _cause(error)})
+            continue
+        for field in fields:
+            field["source_doc"] = f"{document['name']} {pages}"
+        read.append(fields)
+    if not read:
+        raise last_error
+    return _merge_chunks(read), failed
+
+
+def _merge_chunks(chunks):
+    """One entry per field for a document read in chunks: the highest-
+    confidence found value (an unscored one ranks lowest, the earlier chunk
+    wins a tie); for a field no chunk found, 'unreadable' over 'not_present'."""
+    order, best = [], {}
+    for fields in chunks:
+        for field in fields:
+            name = field.get("name")
+            if name not in best:
+                order.append(name)
+                best[name] = field
+                continue
+            current = best[name]
+            if field.get("status") == "found":
+                if current.get("status") != "found":
+                    best[name] = field
+                else:
+                    score = parse_confidence(field.get("confidence"))
+                    held = parse_confidence(current.get("confidence"))
+                    if (score if score is not None else -1) > (held if held is not None else -1):
+                        best[name] = field
+            elif current.get("status") == "not_present" and field.get("status") == "unreadable":
+                best[name] = field
+    return [best[name] for name in order]
 
 
 def _merge_fields(fields):
@@ -333,7 +417,10 @@ def extract_fields(documents):
 
     Returns {"status": ok|partial|failed|not_attempted, "fields", "documents",
     "read", "failed": [{"name", "doc_type", "error"}], "error"}. A failed
-    document never discards the fields of the others.
+    document never discards the fields of the others. A document read in
+    chunks whose chunk failed stays read; the failed pages are a "failed"
+    entry named "<document> p.4" with "document" and "pages" set, so a
+    whole-document check never mistakes it for an unread document.
     """
     docs = [_document(spec) for spec in documents or []]
     result = {
@@ -345,8 +432,25 @@ def extract_fields(documents):
     fields = []
     for document in docs:
         try:
-            fields.extend(_extract_document(document))
+            document_fields, failed_pages = _extract_document(document)
+            fields.extend(document_fields)
             result["read"].append(document["name"])
+            doc_type = document["doc_type"]
+            if failed_pages and doc_type is None:
+                # An untyped PDF: the pages that were read say what it is, so
+                # the customer is asked for "page 4 of your claim form".
+                from rules import infer_document_types
+
+                inferred = infer_document_types(document_fields)
+                doc_type = next(iter(inferred)) if len(inferred) == 1 else None
+            for item in failed_pages:
+                result["failed"].append({
+                    "name": f"{document['name']} {item['pages']}",
+                    "document": document["name"],
+                    "pages": item["pages"],
+                    "doc_type": doc_type,
+                    "error": item["error"],
+                })
         except Exception as error:
             print(f"[gemini] extract_fields failed for {document['name']}:", flush=True)
             traceback.print_exc()

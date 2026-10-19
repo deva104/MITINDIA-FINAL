@@ -15,7 +15,7 @@ from openai import OpenAI
 TEMPERATURE = 0.0
 # Every provider call is bounded. Without this the OpenAI SDK waits up to 600 s
 # and retries twice on its own; vision.generate_json already retries.
-VISION_TIMEOUT_SECONDS = float(os.getenv("VISION_TIMEOUT_SECONDS", "45") or 45)
+VISION_TIMEOUT_SECONDS = float(os.getenv("VISION_TIMEOUT_SECONDS", "20") or 20)
 
 KEY_PREFIXES = {
     "groq": "GROQ_API_KEY",

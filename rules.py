@@ -203,7 +203,14 @@ def establish_documents(classifications, extraction, unknown_documents, required
         if name in failed:
             unread += 1
             continue
-        own = [field for field in fields if isinstance(field, dict) and field.get("source_doc") == name]
+        # A document read in chunks names its source as "<name> p.1-3".
+        own = [
+            field for field in fields
+            if isinstance(field, dict) and (
+                field.get("source_doc") == name
+                or str(field.get("source_doc") or "").startswith(f"{name} p.")
+            )
+        ]
         for doc_type in infer_document_types(own):
             received[doc_type] = max(1, received[doc_type])
             sources[doc_type].append(name)

@@ -89,7 +89,23 @@ Storage:
     Never hold a loaded session across an `await` and then write it back.
   - Session media is media ids, never file paths.
 - Analysis snapshots the row ids it consumes. Rows that arrive during the
-  analysis have higher ids and become the next claim.
+  analysis have higher ids and become the next claim. Media byte-identical
+  to rows being analysed (the unique key refuses it) is held in
+  `whatsapp.DEFERRED_MEDIA` and added back as soon as the analysis releases
+  its rows, so it is the next claim too.
+- **During an analysis**, a text (DONE included) gets exactly one "Your claim
+  is still being analysed — you will get the result here." New media gets one
+  "Your previous claim is still being analysed — these photos will start a
+  new claim." per analysis, however many items arrive. The start-a-claim
+  greeting is never sent to a number with session media or a running
+  analysis.
+- **Stray events.** Every inbound message's type is logged (with
+  `errors=<code>` on `unsupported`), never the number. A 3-photo send in
+  production delivered 4 webhook events. An event that is not a photo,
+  document, text or a listed unsupported type gets no reply when media from
+  that number was sent within 15 s before or after it (`STRAY_EVENT_WINDOW`).
+  Times are Meta's send timestamps, so database latency cannot push one
+  album's events apart. Reactions and edits are never answered.
 - Photos over 2 MB are re-encoded to a JPEG of at most 2048px at quality 90,
   keeping EXIF. A lower quality is used only if 90 is still over the cap.
   Photos are never rejected for size.
@@ -105,6 +121,12 @@ Storage:
 - Neon suspends compute after 5 minutes idle. The pool checks each
   connection on checkout, recycles idle ones after 120s, and retries once
   when a connection dies before its first statement.
+- The pool holds up to `DB_POOL_MAX_SIZE` (default 20) connections. The worst
+  case in production is about 25 at once: an analysis holds one for its whole
+  run plus one nested, and each image the console shows is a `/media` read.
+  A `PoolTimeout` is retried once; then the console gets a 503 (it polls
+  again) and a WhatsApp customer gets "Reply DONE to try again", never an
+  error.
 
 Runtime:
 
@@ -112,8 +134,19 @@ Runtime:
   classification, image and PDF processing, blob writes and the webhook
   dedup run in threads (`asyncio.to_thread`).
 - `ANALYSIS_CONCURRENCY` (default 2) caps parallel analyses.
-- Vision calls time out after `VISION_TIMEOUT_SECONDS` (default 45), with no
-  SDK-level retries.
+- **Provider time limits.** Every single provider call is capped at 20 s by
+  wall clock (`VISION_CALL_TIMEOUT`; the SDK timeout `VISION_TIMEOUT_SECONDS`
+  is 20 too, with no SDK retries). No provider spends more than 25 s on one
+  vision call in total (`VISION_PROVIDER_BUDGET`). A timeout moves to the
+  next provider at once, with no retry. A gemini 5xx gets one retry after
+  2 s; other providers' 5xx move on at once. Every timeout and retry is
+  logged.
+- **Chunked documents.** A document of more than 3 pages (Groq's image limit)
+  is read in chunks of 3 pages, one call each, cached per chunk
+  (`extract_fields(<name> p.1-3)`). Per field, the highest-confidence found
+  value wins, with `source_doc` "<name> p.1-3". A failed chunk keeps the other
+  chunks' fields, becomes a `failed` entry named "<name> p.4" (with `pages`),
+  and the customer is asked for those pages.
 - Run exactly **one** uvicorn worker. `ANALYSING_IDS` is an in-process lock.
   `render.yaml` pins this, plus Python 3.10.11 and the Oregon region.
 - **Provider key pool** (`providers.discover_keys`, state in `vision.py`).

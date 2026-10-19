@@ -232,7 +232,7 @@ class DatabaseConnection:
                 self._raw.close()
             except Exception:
                 pass
-        self._raw = self._pool.getconn()
+        self._raw = _checkout(self._pool)
 
     def execute(self, sql, params=None):
         values = tuple(params or ())
@@ -340,6 +340,28 @@ def database_backend():
     return BACKEND
 
 
+# Worst case at once in production: 2 analyses holding an outer connection
+# plus a nested one (4), an intake classification (1), an album's webhook
+# handlers (about 4), two console tabs polling (about 4) and loading up to 6
+# images each (12): about 25. A normal demo needs about 12. Neon's pooled
+# endpoint accepts thousands of client connections.
+POOL_MAX_SIZE = max(1, int(os.getenv("DB_POOL_MAX_SIZE", "20") or 20))
+
+
+def _checkout(pool):
+    """A connection from the pool. A PoolTimeout means every connection was
+    busy for the whole wait: transient, so it is retried once before it is
+    raised."""
+    from psycopg_pool import PoolTimeout
+
+    try:
+        return pool.getconn()
+    except PoolTimeout:
+        print(f"[db] pool busy ({POOL_MAX_SIZE} connections in use); retrying once",
+              flush=True)
+        return pool.getconn()
+
+
 def _pool():
     global _POOL
     if not DB_URL:
@@ -350,7 +372,7 @@ def _pool():
         _POOL = ConnectionPool(
             DB_URL,
             min_size=1,
-            max_size=5,
+            max_size=POOL_MAX_SIZE,
             kwargs={
                 "autocommit": False,
                 "prepare_threshold": None,
@@ -384,7 +406,7 @@ def _is_connection_error(error):
 def get_conn():
     if BACKEND == "postgres":
         pool = _pool()
-        return DatabaseConnection(pool.getconn(), postgres=True, pool=pool)
+        return DatabaseConnection(_checkout(pool), postgres=True, pool=pool)
     raw = sqlite3.connect(DB_PATH, check_same_thread=False)
     raw.row_factory = sqlite3.Row
     return DatabaseConnection(raw, postgres=False)

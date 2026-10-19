@@ -1,3 +1,5 @@
+import concurrent.futures
+import contextvars
 import hashlib
 import os
 import re
@@ -179,17 +181,55 @@ def _next_utc_midnight(now):
     return midnight.timestamp()
 
 
+# A stuck provider costs at most this much before the next one is tried: a hard
+# cap on every single call, and a budget per provider for one vision call
+# (keys, retries and all).
+CALL_TIMEOUT_SECONDS = float(os.getenv("VISION_CALL_TIMEOUT", "20") or 20)
+PROVIDER_BUDGET_SECONDS = float(os.getenv("VISION_PROVIDER_BUDGET", "25") or 25)
+GEMINI_RETRY_DELAY = 2.0
+_CALL_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="vision-call")
+_TIMEOUT_NAMES = {"APITimeoutError", "Timeout", "TimeoutException", "ReadTimeout",
+                  "ConnectTimeout", "WriteTimeout", "PoolTimeout", "DeadlineExceeded"}
+
+
+class ProviderTimeout(Exception):
+    """A provider gave no answer within the per-call cap."""
+
+
+def _call_with_cap(call, parts, model, label, cap):
+    """Run one provider call with a wall-clock cap. The SDK timeout is the
+    same value, so a call that overran also ends on its own shortly after."""
+    context = contextvars.copy_context()  # carries the key in use
+    future = _CALL_POOL.submit(context.run, call, parts, model, label)
+    try:
+        return future.result(timeout=max(0.01, cap))
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise ProviderTimeout(f"no answer within {cap:.0f}s") from None
+
+
+def _is_timeout(error, lowered):
+    return (
+        isinstance(error, (ProviderTimeout, TimeoutError))
+        or type(error).__name__ in _TIMEOUT_NAMES
+        or "timed out" in lowered or "deadline exceeded" in lowered
+    )
+
+
 def classify_provider_error(error, now=None):
     """What a provider error means for the key that made the call:
     ("minute", until) rate limit, cool the key and try the next key;
     ("daily", until)  quota used, exhaust the key and try the next key;
     ("invalid", None) 401/403, the key is unusable for this process;
+    ("timeout", None) no answer in time: the next provider, no retry;
     ("server", None)  503/5xx/overloaded, the model is down for every key;
-    ("other", None)   anything else (bad output, timeout)."""
+    ("other", None)   anything else (bad output)."""
     now = time.time() if now is None else now
     status = _status_code(error)
     text = " ".join(str(error).split())
     lowered = text.lower()
+    if _is_timeout(error, lowered):
+        return "timeout", None
     if status in (401, 403) or (
         status == 400 and ("api key not valid" in lowered or "api_key_invalid" in lowered)
     ):
@@ -443,9 +483,10 @@ def _try_provider(provider, call, model, parts, label):
     """Try one provider, key by key. Returns (response|None, outcome, error,
     rate_limited) where rate_limited means every key ended up limited."""
     keys = providers.discover_keys(provider) if provider in providers.KEY_PREFIXES else []
+    deadline = time.monotonic() + PROVIDER_BUDGET_SECONDS
     if not keys:
         # No pool: behave as before, on the bare variable.
-        return _attempt(provider, call, model, parts, label, None)
+        return _attempt(provider, call, model, parts, label, None, deadline)
     now = time.time()
     usable = [(key_label, value) for key_label, value in keys
               if key_state(provider, key_label, now)[0] == "ok"]
@@ -456,7 +497,7 @@ def _try_provider(provider, call, model, parts, label):
         token = providers.use_key(provider, key_label, value)
         try:
             response, outcome, error, rate_limited = _attempt(
-                provider, call, model, parts, label, key_label
+                provider, call, model, parts, label, key_label, deadline
             )
         finally:
             providers.release_key(token)
@@ -473,13 +514,22 @@ def _try_provider(provider, call, model, parts, label):
     return None, ("failed", detail), last[2], not remaining
 
 
-def _attempt(provider, call, model, parts, label, key_label):
+def _attempt(provider, call, model, parts, label, key_label, deadline):
     """One key (or the bare variable): up to two tries for an ordinary
-    failure, none for a rate limit, an invalid key or a server outage."""
+    failure; none for a rate limit, an invalid key or a timeout; one retry
+    after 2 s for a gemini 5xx. Every try is capped at CALL_TIMEOUT_SECONDS
+    and all of them together by the provider's deadline."""
     outcome, error = ("failed", "no attempt"), None
-    for attempt in range(2):
+    tries, server_retried = 0, False
+    while tries < 2:
+        cap = min(CALL_TIMEOUT_SECONDS, deadline - time.monotonic())
+        if cap <= 0:
+            print(f"[vision] {label}: {provider} used its {PROVIDER_BUDGET_SECONDS:.0f}s "
+                  "budget; moving on", flush=True)
+            return None, ("failed", f"no answer within {PROVIDER_BUDGET_SECONDS:.0f}s"), \
+                error, False
         try:
-            return call(parts, model, label), ("ok", ""), None, False
+            return _call_with_cap(call, parts, model, label, cap), ("ok", ""), None, False
         except Exception as caught:
             error = caught
         key_env = PROVIDER_KEYS.get(provider)
@@ -500,10 +550,22 @@ def _attempt(provider, call, model, parts, label, key_label):
             return None, ("rotate", detail), error, False
         if kind in ("minute", "daily"):
             return None, ("failed", detail), error, True
+        if kind == "timeout":
+            print(f"[vision] {label}: {provider} timed out after {cap:.0f}s; "
+                  "moving on, no retry", flush=True)
+            return None, ("failed", f"timed out after {cap:.0f}s"), error, False
+        if kind == "server" and provider == "gemini" and not server_retried \
+                and deadline - time.monotonic() > GEMINI_RETRY_DELAY:
+            server_retried = True
+            print(f"[vision] {label}: gemini {detail}; retrying once in "
+                  f"{GEMINI_RETRY_DELAY:.0f}s", flush=True)
+            time.sleep(GEMINI_RETRY_DELAY)
+            continue
         if kind in ("server", "invalid"):
             return None, ("failed", detail), error, False
         outcome = ("failed", detail)
-        if attempt == 0:
+        tries += 1
+        if tries < 2:
             time.sleep(2)
     return None, outcome, error, False
 

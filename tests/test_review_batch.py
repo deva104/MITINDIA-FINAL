@@ -208,7 +208,7 @@ class PerDocumentExtractionTests(PipelineCase):
         self.assertFalse(any(item["item"] == "Primary vision provider"
                              for item in payload["undetermined"]))
 
-    def test_bundle_over_three_pages_falls_through_the_chain(self):
+    def test_bundle_over_three_pages_is_read_by_groq_in_chunks(self):
         document = fitz.open()
         for page in range(4):
             document.new_page().insert_text((72, 72), f"Claim form page {page + 1}")
@@ -223,10 +223,12 @@ class PerDocumentExtractionTests(PipelineCase):
         bench = ProviderBench(behaviour)
         payload = self.analyse(bench, photos=("damage.jpg",), docs=(pdf,))
 
+        # Pages 1-3 and page 4: each within Groq's limit of 3 images.
         self.assertEqual([(call["provider"], call["images"]) for call in bench.calls],
-                         [("gemini", 4)])
+                         [("groq", 3), ("groq", 1)])
         self.assertEqual(payload["documents_received"]["claim_form"], 1)
-        # Groq was skipped for capacity: routing, not uncertainty.
+        self.assertEqual({field["source_doc"] for field in payload["fields"]
+                          if field["name"] == "accident_date"}, {"bundle.pdf p.1-3"})
         self.assertFalse(any(item["item"] == "Primary vision provider"
                              for item in payload["undetermined"]))
 

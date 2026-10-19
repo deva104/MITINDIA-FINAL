@@ -185,7 +185,9 @@ class RotationTests(KeyPoolCase):
     def test_c_server_outage_moves_to_the_next_provider_without_rotating(self):
         self.behaviour[("gemini", "main")] = overloaded
         self.assertEqual(self.ask(), {"provider": "openrouter", "key": "main"})
-        self.assertEqual(self.calls, [("gemini", "main"), ("openrouter", "main")])
+        # One retry on the same key after 2 s (B), never another key.
+        self.assertEqual(self.calls,
+                         [("gemini", "main"), ("gemini", "main"), ("openrouter", "main")])
         self.assertEqual(self.states()["main"], "ok")
 
     def test_d_rejected_key_is_invalid_and_the_others_are_used(self):

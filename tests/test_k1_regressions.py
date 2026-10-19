@@ -89,9 +89,12 @@ class K1RegressionTests(unittest.IsolatedAsyncioTestCase):
         def classify(path):
             return {"doc_type": "vehicle_photo", "confidence": 0.95, "number_plate": None}
 
-        def extract(paths):
-            self.extracted.append([(path, Path(path).read_bytes()) for path in paths])
-            return []
+        def extract(documents):
+            pages = [path for document in documents for path in document["paths"]]
+            self.extracted.append([(path, Path(path).read_bytes()) for path in pages])
+            return {"status": "ok", "fields": [], "documents": len(documents),
+                    "read": [document["name"] for document in documents],
+                    "failed": [], "error": None}
 
         def assess(paths):
             self.assessed.append([Path(path).read_bytes() for path in paths])

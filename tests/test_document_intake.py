@@ -15,9 +15,9 @@ import main
 import whatsapp
 
 try:
-    from helpers import seed_session
+    from helpers import extraction_ok, seed_session
 except ImportError:
-    from tests.helpers import seed_session
+    from tests.helpers import extraction_ok, seed_session
 from rules import run_rules
 
 
@@ -121,9 +121,9 @@ class PipelineRoutingTests(unittest.TestCase):
         extracted_from = []
         assessed_from = []
 
-        def fake_extract(paths):
-            extracted_from.extend(paths)
-            return list(fields or [])
+        def fake_extract(documents):
+            extracted_from.extend(path for document in documents for path in document["paths"])
+            return extraction_ok(fields, documents)
 
         def fake_assess(paths):
             assessed_from.extend(paths)
@@ -356,13 +356,10 @@ class WhatsAppChecklistTests(unittest.IsolatedAsyncioTestCase):
         ), patch("db.save_file"):
             await whatsapp.process_session("user", skip_missing=True)
 
-        self.assertEqual(
-            analyse.await_args.kwargs["forced_review_reasons"],
-            [
-                "documents not provided: registration certificate, "
-                "driving licence, claim form"
-            ],
-        )
+        # The pipeline decides the missing-documents reason on every path
+        # (rules.document_requirements); SKIP no longer adds its own.
+        analyse.assert_awaited_once()
+        self.assertNotIn("forced_review_reasons", analyse.await_args.kwargs)
 
     async def test_rc_only_refuses_skip(self):
         seed_session("user", photos=1, awaiting_docs=True, updated=time.time())
@@ -439,7 +436,8 @@ class WhatsAppChecklistTests(unittest.IsolatedAsyncioTestCase):
             "confidence": 0.99,
             "number_plate": None,
         }), patch.object(
-            whatsapp, "extract_fields", return_value=found_fields()
+            whatsapp, "extract_fields",
+            return_value=extraction_ok(found_fields(), source_doc="document1.pdf"),
         ), patch.object(whatsapp, "send_text", sent), patch.object(
             main, "analyse_claim", analyse
         ), patch("db.save_file"):

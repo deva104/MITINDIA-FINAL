@@ -487,6 +487,35 @@ def save_file(claim_id, filename, kind, path, source_sha256=None, source_bytes=N
         conn.close()
 
 
+def find_document_reuse(claim_id, filenames):
+    """{filename: [earlier claim ids]} for this claim's files whose original
+    bytes (source_sha256) match a file in another claim."""
+    if not filenames:
+        return {}
+    conn = get_conn()
+    try:
+        out = {}
+        for filename in filenames:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT other.claim_id AS claim_id
+                FROM files AS mine
+                JOIN files AS other
+                  ON other.source_sha256 = mine.source_sha256
+                 AND other.claim_id <> mine.claim_id
+                WHERE mine.claim_id = ? AND mine.filename = ?
+                  AND mine.source_sha256 IS NOT NULL
+                ORDER BY other.claim_id
+                """,
+                (claim_id, filename),
+            ).fetchall()
+            if rows:
+                out[filename] = [row["claim_id"] for row in rows]
+        return out
+    finally:
+        conn.close()
+
+
 def delete_files_for_claim(claim_id):
     """Remove file rows of a claim that was never saved, so a retry of the same
     photos is not matched against them by the duplicate gate."""

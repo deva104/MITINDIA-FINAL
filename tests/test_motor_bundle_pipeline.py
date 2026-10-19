@@ -61,7 +61,7 @@ class MotorBundlePipelineTests(unittest.TestCase):
         ]
 
         def fake_generate(parts, label):
-            self.assertEqual(label, "extract_fields(1 docs)")
+            self.assertEqual(label, f"extract_fields({FIXTURE.name})")
             image_parts = [part for part in parts if part[0] == "image"]
             self.assertEqual(len(image_parts), 3)
             return {"fields": extracted_fields}

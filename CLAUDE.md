@@ -27,21 +27,41 @@ excluded or unavailable instead of failing silently.
 
 Pipeline (`main.analyse_claim`, shared by `/api/analyze` and WhatsApp):
 
-1. **Stage 0: duplicate gate.** Perceptual hash (`forensics.check_duplicates`)
-   against every earlier `files.phash`, run before any vision quota is spent.
-2. **Stage 0.5: document classification.** `gemini.classify_image` sorts each
-   image into vehicle photo, RC, DL, claim form, policy or other.
-3. **Stage 1: vision.** `extract_fields` (documents, PDFs via PyMuPDF) and
-   `assess_damage` (photos, grouped per vehicle).
-4. **Stage 2: forensics.** ELA, EXIF verdicts (including "unverifiable") and
-   the Sightengine AI-generation check, which is a signal only and is cached.
-5. **Stage 3: rules.** `rules.run_rules` runs the cross-document checks:
-   token-based name matching, day-first dates, plate vs RC.
-   `build_estimate` produces a per-vehicle estimate with dedup per part.
+1. **Stage 0: classification.** `gemini.classify_image` sorts every image
+   into vehicle photo, RC, DL, claim form, policy or other.
+   `rules.route_classification` routes it: an uncertain or unscored image is
+   kept as a vehicle photo.
+2. **Stage 0.5: duplicate gate, vehicle photos only.** Perceptual hash
+   (`forensics.check_duplicates`) against every earlier `files.phash`,
+   excluding this claim by `claim_id`. Documents are never gated, excluded or
+   grouped. A byte-identical document from an earlier claim is only noted as
+   `document_reuse` info.
+3. **Stage 1: vision.**
+   - `extract_fields` runs one call per document, with that document's own
+     pages and its own field subset. It returns a status: ok, partial,
+     failed or not_attempted.
+   - `assess_damage` grades the photos, grouped per vehicle.
+   - Confidence is parsed by `gemini.parse_confidence` and is **never
+     defaulted**. When the model omits it, the finding is kept as
+     unconfirmed and listed under undetermined.
+4. **Stage 2: forensics.**
+   - ELA is **informational only**. Calibration found no threshold that
+     separates genuine from edited photos; see `forensics.py`.
+   - EXIF verdicts, including "unverifiable".
+   - The Sightengine AI-generation check, a signal only, cached.
+5. **Stage 3: rules.**
+   - `rules.run_rules` runs the cross-document checks.
+   - `build_estimate` prices one line per part, for confirmed findings and
+     for the indicative range.
+   - `rules.establish_documents` is the **single source of truth** for
+     documents. The WhatsApp checklist, the Documents card, the
+     undetermined list and the decision reason all read its result.
 6. **Confidence decision.** `rules.assess_confidence` returns
-   `auto_assess` / `needs_review` / `reject`, plus "undetermined" findings.
-7. **Output.** A WhatsApp reply (with a vehicle-selection flow when there are
-   several vehicles) and the insurer console (`static/`, vanilla JS).
+   `auto_assess` / `needs_review` / `reject`. An escalated claim (AI
+   unavailable) is never `auto_assess`.
+7. **Output.** A WhatsApp reply and the insurer console (`static/`). Every
+   empty state in the console says whether nothing was found or nothing
+   was checked.
 
 Modules:
 

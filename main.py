@@ -30,6 +30,7 @@ from db import (
     database_backend,
     database_ok,
     delete_session_media,
+    find_document_reuse,
     get_claim,
     get_conn,
     init_db,
@@ -49,8 +50,16 @@ from gemini import (
     extract_fields,
     render_pdf_pages,
 )
-from rules import assess_confidence, build_estimate, run_rules
-from vision import fallbacks_used, reset_cache_tracking, stage_was_cached
+from rules import (
+    DOCUMENT_LABELS,
+    assess_confidence,
+    build_estimate,
+    establish_documents,
+    reported_confidence,
+    route_classification,
+    run_rules,
+)
+from vision import fallbacks_used, provider_status, reset_cache_tracking, stage_was_cached
 
 import whatsapp as wa
 from whatsapp import (
@@ -65,6 +74,7 @@ from whatsapp import (
 
 try:
     from forensics import (
+        ai_detection_status,
         build_photo_url_map,
         check_duplicates,
         fit_jpeg,
@@ -80,6 +90,9 @@ except ImportError:
 
     def fit_jpeg(data):
         return data
+
+    def ai_detection_status():
+        return {"enabled": False, "keys_configured": False}
 
     def prepare_uploaded_image(data):
         return data or None
@@ -100,11 +113,31 @@ IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".bmp", ".tif", ".tiff",
 }
 DOCUMENT_TYPES = {"rc", "driving_licence", "claim_form", "policy"}
-DOCUMENT_LABELS = {
-    "rc": "Registration certificate",
-    "driving_licence": "Driving licence",
-    "claim_form": "Claim form",
-    "policy": "Insurance policy",
+
+
+def document_reuse_notes(claim_id, filenames):
+    """Information, never an exclusion: a document byte-identical to one in an
+    earlier claim (an RC or licence is reused across claims all the time)."""
+    notes = []
+    try:
+        reused = find_document_reuse(claim_id, filenames)
+    except Exception as error:
+        print(f"[analyze] document reuse lookup failed: {type(error).__name__}", flush=True)
+        return notes
+    for filename, claims in reused.items():
+        notes.append({
+            "check": "document_reuse",
+            "verdict": "info",
+            "detail": f"{filename}: same file as submitted with claim {', '.join(claims)}",
+            "heatmap_url": None,
+            "source_photo": filename,
+        })
+    return notes
+
+
+NOT_EXTRACTED = {
+    "status": "not_attempted", "fields": [], "documents": 0,
+    "read": [], "failed": [], "error": None,
 }
 
 
@@ -117,33 +150,6 @@ def required_document_types():
         for value in configured.split(",")
         if value.strip().lower() in DOCUMENT_TYPES
     ]
-
-
-def infer_document_types(fields):
-    found = {
-        field.get("name")
-        for field in (fields or [])
-        if isinstance(field, dict)
-        and field.get("status") == "found"
-        and field.get("value") not in (None, "")
-    }
-    inferred = set()
-    if found & {
-        "owner_name_rc", "registration_number_rc",
-        "chassis_number", "engine_number", "vehicle_make_model",
-    }:
-        inferred.add("rc")
-    if found & {"holder_name_dl", "dl_number", "dl_expiry_date"}:
-        inferred.add("driving_licence")
-    if found & {
-        "insured_name_claim_form", "registration_number_claim_form",
-        "accident_date", "accident_time", "accident_location",
-        "accident_description",
-    }:
-        inferred.add("claim_form")
-    if found & {"policy_number", "policy_start_date", "policy_end_date"}:
-        inferred.add("policy")
-    return inferred
 
 
 def require_admin(x_admin_token: Optional[str] = Header(default=None)):
@@ -165,7 +171,24 @@ async def lifespan(app: FastAPI):
     init_db()
     if not os.getenv("ADMIN_TOKEN", "").strip():
         print("[auth] ADMIN_TOKEN is not set: admin endpoints refuse every request", flush=True)
+    log_provider_chain()
     yield
+
+
+def log_provider_chain():
+    """Print the vision chain this process will use; warn about gaps. No secrets."""
+    status = provider_status()
+    chain = " -> ".join(
+        f"{item['provider']} ({item.get('model')}, "
+        f"{'key set' if item.get('key_configured') else 'NO KEY'}, "
+        f"<= {item.get('max_images')} images)"
+        if item.get("supported", True) else f"{item['provider']} (unsupported)"
+        for item in status["chain"]
+    )
+    print(f"[vision] provider chain: {chain or 'none'}", flush=True)
+    for warning in status["warnings"]:
+        print(f"[vision] WARNING: {warning}", flush=True)
+    return status
 
 
 app = FastAPI(title="ClaimPilot", lifespan=lifespan)
@@ -181,7 +204,14 @@ app.add_middleware(
 @app.get("/api/health")
 def health():
     ok = database_ok()
-    return {"ok": ok, "db": database_backend(), "db_ok": ok}
+    return {
+        "ok": ok,
+        "db": database_backend(),
+        "db_ok": ok,
+        # Configuration only: provider names, models and whether keys are set.
+        "vision": provider_status(),
+        "ai_detection": ai_detection_status(),
+    }
 
 
 @app.get("/api/storage")
@@ -636,14 +666,17 @@ def build_undetermined(payload, provider_fallbacks=None):
     for item in payload.get("damage") or []:
         if not isinstance(item, dict):
             continue
-        try:
-            confidence = float(item.get("confidence"))
-        except (TypeError, ValueError):
-            confidence = 0.0
-        if confidence < 0.6:
-            part = str(item.get("part") or "Unknown part").replace("_", " ").title()
+        confidence = reported_confidence(item)
+        part = str(item.get("part") or "Unknown part").replace("_", " ")
+        if confidence is None:
             entries.append({
-                "item": f"{part} damage",
+                "item": f"{part.title()} damage",
+                "reason": f"model did not report confidence for {part}",
+                "impact": "excluded from the headline estimate until an assessor confirms it",
+            })
+        elif confidence < 0.6:
+            entries.append({
+                "item": f"{part.title()} damage",
                 "reason": "low model confidence",
                 "impact": "excluded from the headline estimate",
             })
@@ -651,25 +684,53 @@ def build_undetermined(payload, provider_fallbacks=None):
     for result in payload.get("classifications") or []:
         if not isinstance(result, dict):
             continue
-        try:
-            confidence = float(result.get("confidence"))
-        except (TypeError, ValueError):
-            confidence = 0.0
-        if confidence < 0.6:
+        confidence = reported_confidence(result)
+        if confidence is None or confidence < 0.6:
             entries.append({
                 "item": result.get("filename") or "Uploaded image",
-                "reason": f"low classification confidence ({confidence:.2f})",
+                "reason": (
+                    "classifier did not report confidence" if confidence is None
+                    else f"low classification confidence ({confidence:.2f})"
+                ),
                 "impact": "kept as a vehicle photo; document type not established",
             })
 
-    received = payload.get("documents_received") or {}
-    for doc_type in payload.get("required_documents") or []:
-        if not received.get(doc_type):
+    extraction = payload.get("extraction") or {}
+    failed = [item for item in extraction.get("failed") or [] if isinstance(item, dict)]
+    if extraction.get("status") == "failed":
+        count = int(extraction.get("documents") or len(failed) or 0)
+        noun = "document" if count == 1 else "documents"
+        entries.append({
+            "item": "Document details",
+            "reason": (
+                f"{count} {noun} received but could not be read: "
+                f"{extraction.get('error') or 'unknown error'}"
+            ),
+            "impact": (
+                "cross-document checks (name, registration, licence expiry) "
+                "were not run"
+            ),
+        })
+    elif extraction.get("status") == "partial":
+        for item in failed:
             entries.append({
-                "item": DOCUMENT_LABELS.get(doc_type, doc_type.replace("_", " ").title()),
-                "reason": "required document not provided",
-                "impact": "claim documentation incomplete",
+                "item": f"Document details: {item.get('name') or 'document'}",
+                "reason": f"could not be read: {item.get('error') or 'unknown error'}",
+                "impact": "checks that need this document were not run",
             })
+
+    document_check = payload.get("document_check") or {}
+    unread = int(document_check.get("unread_documents") or 0)
+    for doc_type in document_check.get("missing") or []:
+        entries.append({
+            "item": DOCUMENT_LABELS.get(doc_type, doc_type.replace("_", " ").title()),
+            "reason": (
+                f"not established: {unread} received document"
+                f"{'' if unread == 1 else 's'} could not be read"
+                if unread else "required document not provided"
+            ),
+            "impact": "claim documentation incomplete",
+        })
 
     vehicle_photos = [
         photo for photo in (payload.get("photos") or [])
@@ -694,6 +755,21 @@ def build_undetermined(payload, provider_fallbacks=None):
             "impact": "cannot confirm when or where photos were taken",
         })
 
+    if any(
+        isinstance(item, dict)
+        and item.get("check") == "ela"
+        and item.get("verdict") == "informational"
+        for item in (payload.get("forensics") or [])
+    ):
+        entries.append({
+            "item": "Photo editing",
+            "reason": (
+                "error-level analysis cannot tell recompression from editing "
+                "on these photos"
+            ),
+            "impact": "editing neither confirmed nor ruled out",
+        })
+
     for check in payload.get("forensics") or []:
         if not isinstance(check, dict) or check.get("check") != "ai_generated":
             continue
@@ -715,12 +791,19 @@ def build_undetermined(payload, provider_fallbacks=None):
             })
 
     for fallback in provider_fallbacks or []:
+        # A capacity skip ("4 images exceeds groq limit 3") is normal routing.
+        # Only a provider that failed changed who produced the result.
+        if fallback.get("reason", "failed") != "failed":
+            continue
+        detail = fallback.get("detail")
         entries.append({
             "item": "Primary vision provider",
             "reason": (
-                f"{fallback['from']} unavailable, fell back to {fallback['to']}"
+                f"{fallback['from']} unavailable"
+                + (f" ({detail})" if detail else "")
+                + f", fell back to {fallback['to']}"
             ),
-            "impact": "none — result verified by the fallback",
+            "impact": f"result produced by {fallback['to']} instead",
         })
 
     unique = []
@@ -845,7 +928,7 @@ def build_vehicle_groups(photos, damage, excluded, photo_urls=None):
 
 async def analyse_claim(
     claim_id, doc_paths, photo_paths, source="web", from_number=None,
-    forced_review_reasons=None, page_paths=None,
+    forced_review_reasons=None, page_documents=None,
 ):
     """Staged pipeline shared by the HTTP upload route and the WhatsApp webhook.
 
@@ -853,14 +936,15 @@ async def analyse_claim(
     in a worker thread. The context is copied, so current_claim_id and the
     vision cache/fallback trackers behave as before.
 
-    page_paths are pre-rendered PDF pages (WhatsApp stores pages, not PDFs).
-    They go straight to field extraction, like a PDF would, and are never
-    classified or counted against the image cap.
+    page_documents are pre-rendered PDFs (WhatsApp stores pages, not PDFs):
+    [{"name", "paths"}], one entry per source document. They go straight to
+    field extraction, like a PDF would, and are never classified or counted
+    against the image cap.
     """
     return await asyncio.to_thread(
         _analyse_claim_in_slot,
         claim_id, doc_paths, photo_paths, source, from_number,
-        forced_review_reasons, page_paths,
+        forced_review_reasons, page_documents,
     )
 
 
@@ -871,10 +955,16 @@ def _analyse_claim_in_slot(*args):
 
 def _analyse_claim_sync(
     claim_id, doc_paths, photo_paths, source="web", from_number=None,
-    forced_review_reasons=None, page_paths=None,
+    forced_review_reasons=None, page_documents=None,
 ):
     started = time.perf_counter()
-    page_paths = [path for path in list(page_paths or []) if path]
+    page_documents = [
+        {"name": str(document.get("name") or "document"),
+         "paths": [path for path in document.get("paths") or [] if path]}
+        for document in page_documents or []
+        if isinstance(document, dict)
+    ]
+    page_paths = [path for document in page_documents for path in document["paths"]]
     temp_inputs = [
         path for path in list(doc_paths or []) + list(photo_paths or []) + page_paths if path
     ]
@@ -882,10 +972,13 @@ def _analyse_claim_sync(
 
     original_doc_paths = list(doc_paths or [])
     photo_paths = list(photo_paths or [])
-    direct_doc_paths = [
-        path for path in original_doc_paths
+    # Documents of unknown type (PDFs and WhatsApp page sets): extracted with
+    # every field, one call per document. Their type comes from what was read.
+    direct_documents = [
+        {"name": os.path.basename(path), "paths": [path], "doc_type": None}
+        for path in original_doc_paths
         if os.path.splitext(path)[1].lower() not in IMAGE_EXTENSIONS
-    ] + page_paths
+    ] + [dict(document, doc_type=None) for document in page_documents]
     doc_image_paths = [
         path for path in original_doc_paths
         if os.path.splitext(path)[1].lower() in IMAGE_EXTENSIONS
@@ -911,6 +1004,8 @@ def _analyse_claim_sync(
     unclassified = []
     documents_received = {doc_type: 0 for doc_type in DOCUMENT_TYPES}
     required_documents = required_document_types()
+    extraction = dict(NOT_EXTRACTED)
+    document_check = None
     forced_review_reasons = [
         str(reason).strip()
         for reason in (forced_review_reasons or [])
@@ -942,6 +1037,10 @@ def _analyse_claim_sync(
             "required_documents": list(required_documents),
             "unclassified": list(unclassified),
             "fields": fields or [],
+            "extraction": {
+                key: value for key, value in extraction.items() if key != "fields"
+            },
+            "document_check": document_check,
             "damage": damage or [],
             "forensics": forensics or [],
             "flags": flags or [],
@@ -976,25 +1075,55 @@ def _analyse_claim_sync(
         _release_temp_uploads(temp_inputs)
         raise
     try:
-        # Stage 0 - duplicate screen, before spending any Gemini quota
+        # Stage 0 - classify every image first. Only vehicle photos go to the
+        # duplicate gate: an RC or licence reused across claims is normal.
+        photo_url_map = build_photo_url_map(kept_images)
         mark = time.perf_counter()
-        dup = check_duplicates(photo_paths, conn)  # excludes this claim via current_claim_id
+        reset_cache_tracking()
+        vehicle_paths = []
+        documents = list(direct_documents)
+        for path in photo_paths + doc_image_paths:
+            result = classify_image(path)
+            entry = {
+                "filename": os.path.basename(path),
+                "doc_type": result.get("doc_type"),
+                "confidence": reported_confidence(result),
+                "number_plate": result.get("number_plate"),
+                "url": photo_url_map.get(os.path.basename(path).lower()),
+            }
+            classifications.append(entry)
+            route = route_classification(entry)
+            if route == "vehicle_photo":
+                vehicle_paths.append(path)
+            elif route in DOCUMENT_TYPES:
+                documents.append({
+                    "name": os.path.basename(path), "paths": [path], "doc_type": route,
+                })
+            else:
+                unclassified.append(entry)
+        stage_done("stage0_5_classify", mark, cached=stage_was_cached())
+
+        # Stage 0.5 - duplicate screen on vehicle photos only, before any
+        # damage assessment is paid for.
+        mark = time.perf_counter()
+        dup = check_duplicates(vehicle_paths, conn)  # excludes this claim via current_claim_id
         stage_done("stage0_duplicate", mark)
+        reuse = document_reuse_notes(
+            claim_id, [document["name"] for document in documents]
+        )
 
         flagged = {d["photo_path"] for d in dup
                    if d.get("verdict") == "suspicious" and d.get("photo_path")}
-        dup_paths = [p for p in photo_paths if os.path.abspath(p) in flagged]
-        clean_paths = [p for p in photo_paths if os.path.abspath(p) not in flagged]
+        dup_paths = [p for p in vehicle_paths if os.path.abspath(p) in flagged]
+        clean_paths = [p for p in vehicle_paths if os.path.abspath(p) not in flagged]
         excluded_photos = [os.path.basename(p) for p in dup_paths]
-        photo_url_map = build_photo_url_map(kept_images)
 
-        # Only a bundle with nothing left to assess is rejected outright. A claim
-        # with at least one fresh photo is still worth analysing.
+        # Only a bundle with no fresh vehicle photo is rejected outright.
         if dup_paths and not clean_paths:
             vehicles = build_vehicle_groups(
                 [], [], excluded_photos, photo_url_map
             )
-            return finish(make_payload("rejected", "duplicate", forensics=dup,
+            return finish(make_payload("rejected", "duplicate", forensics=dup + reuse,
                                        vehicles=vehicles))
 
         bundle_flags = []
@@ -1003,54 +1132,27 @@ def _analyse_claim_sync(
                 "rule": "duplicate_photo_in_bundle",
                 "severity": "HIGH",
                 "message": (
-                    f"{len(dup_paths)} of {len(photo_paths)} submitted photos were already "
-                    "used in an earlier claim and have been excluded from this assessment."
+                    f"{len(dup_paths)} of {len(vehicle_paths)} submitted vehicle photos were "
+                    "already used in an earlier claim and have been excluded from this "
+                    "assessment."
                 ),
                 "evidence": list(excluded_photos),
             })
             print(f"[analyze] {claim_id} excluding {len(dup_paths)} duplicate photo(s): "
                   f"{', '.join(excluded_photos)}", flush=True)
 
-        # Stage 0.5 - classify each image independently, then route it.
-        mark = time.perf_counter()
-        reset_cache_tracking()
-        routed_photo_paths = []
-        routed_doc_paths = list(direct_doc_paths)
-        for path in clean_paths + doc_image_paths:
-            result = classify_image(path)
-            doc_type = result.get("doc_type")
-            try:
-                confidence = float(result.get("confidence"))
-            except (TypeError, ValueError):
-                confidence = 0.0
-            entry = {
-                "filename": os.path.basename(path),
-                "doc_type": doc_type,
-                "confidence": confidence,
-                "number_plate": result.get("number_plate"),
-                "url": photo_url_map.get(os.path.basename(path).lower()),
-            }
-            classifications.append(entry)
-            if confidence < 0.6 or doc_type == "vehicle_photo":
-                routed_photo_paths.append(path)
-            elif doc_type in DOCUMENT_TYPES:
-                routed_doc_paths.append(path)
-                documents_received[doc_type] += 1
-            else:
-                unclassified.append(entry)
-        clean_paths = routed_photo_paths
-        doc_paths = routed_doc_paths
-        stage_done("stage0_5_classify", mark, cached=stage_was_cached())
-
         # Stage 1 - Gemini extraction and damage assessment
         mark = time.perf_counter()
         reset_cache_tracking()
-        fields = extract_fields(doc_paths) if doc_paths else []
-        if direct_doc_paths:
-            for doc_type in infer_document_types(fields):
-                documents_received[doc_type] = max(
-                    1, documents_received.get(doc_type, 0)
-                )
+        extraction = extract_fields(documents) if documents else dict(NOT_EXTRACTED)
+        fields = extraction["fields"]
+        document_check = establish_documents(
+            classifications,
+            extraction,
+            [document["name"] for document in direct_documents],
+            required_documents,
+        )
+        documents_received.update(document_check["received"])
         result = assess_damage(clean_paths)
         provider_fallbacks = list(fallbacks_used())
         stage_done("stage1_gemini", mark, cached=stage_was_cached())
@@ -1121,7 +1223,7 @@ def _analyse_claim_sync(
         stage_done("stage3_rules", mark)
 
         return finish(make_payload("analysed", None, fields=fields, damage=damage,
-                                   forensics=dup + deep, flags=flags, estimate=estimate,
+                                   forensics=dup + reuse + deep, flags=flags, estimate=estimate,
                                    vehicle_description=description, photos=photos,
                                    vehicles=vehicles, claimable_count=claimable_count))
     finally:

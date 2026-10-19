@@ -129,6 +129,8 @@ Use EXACTLY these part names, never synonyms.
 damage_type MUST be one of: scratch, dent, crack, shatter, detached, paint_damage
 severity MUST be one of: minor, moderate, severe
 reasoning = one short sentence on what you observed.
+confidence MUST be a number between 0 and 1 (for example 0.85) on EVERY damage item.
+Never omit confidence and never use words or percentages for it.
 Only report damage you can actually see. Do not infer hidden damage."""
 
 CLASSIFY_PROMPT = """Classify this one uploaded image for an Indian motor insurance claim.
@@ -138,6 +140,7 @@ Use vehicle_photo for an exterior or interior motor-vehicle photograph, includin
 Use rc only for a Registration Certificate, driving_licence only for a driving licence,
 claim_form only for a motor claim form, and policy only for an insurance policy document.
 Use other_document for another readable document and other for everything else.
+confidence MUST be a number between 0 and 1.
 number_plate: read it only from a vehicle_photo when it is clearly legible. Otherwise null.
 Never guess a number plate."""
 
@@ -192,54 +195,173 @@ def classify_image(path):
         }
 
 
-def extract_fields(doc_paths):
-    if not doc_paths:
-        return []
-    try:
-        parts = []
-        for p in doc_paths:
-            image_parts = _image_part(p)
-            if isinstance(image_parts, list):
-                with fitz.open(p) as document:
-                    page_count = document.page_count
-                for index, image_part in enumerate(image_parts, 1):
-                    parts.append((
-                        "text",
-                        (
-                            f"Filename: {os.path.basename(p)} "
-                            f"(page {index} of {page_count})"
-                        ),
-                    ))
-                    parts.append(image_part)
-            else:
-                parts.append(("text", f"Filename: {os.path.basename(p)}"))
-                parts.append(image_parts)
-        parts.append(("text", EXTRACT_PROMPT))
-        data = _generate(parts, f"extract_fields({len(doc_paths)} docs)")
-        fields = data.get("fields", []) if isinstance(data, dict) else []
-        if not isinstance(fields, list):
-            return []
-        normalised = []
-        for field in fields:
-            if not isinstance(field, dict):
-                continue
-            entry = dict(field)
-            value = entry.get("value")
-            has_value = value is not None and str(value).strip().lower() not in NULL_WORDS
-            status = str(entry.get("status") or "").strip().lower()
-            if has_value:
-                entry["status"] = "found"
-            elif status in ("not_present", "unreadable"):
-                entry["status"] = status
-            else:
-                # If a provider omits status, do not claim the label was absent.
-                entry["status"] = "unreadable"
-            normalised.append(entry)
-        return normalised
-    except Exception:
-        print("[gemini] extract_fields failed:", flush=True)
-        traceback.print_exc()
-        return []
+# Fields each classified document type can carry. A document of known type is
+# asked only for its own fields, so a stray value is never attributed to it.
+DOCUMENT_FIELDS = {
+    "rc": (
+        "owner_name_rc", "registration_number_rc", "chassis_number",
+        "engine_number", "vehicle_make_model",
+    ),
+    "driving_licence": ("holder_name_dl", "dl_number", "dl_expiry_date"),
+    "claim_form": (
+        "insured_name_claim_form", "registration_number_claim_form",
+        "accident_date", "accident_time", "accident_location",
+        "accident_description",
+    ),
+    "policy": ("policy_number", "policy_start_date", "policy_end_date"),
+}
+DOCUMENT_TITLES = {
+    "rc": "Registration Certificate",
+    "driving_licence": "Driving Licence",
+    "claim_form": "motor claim form",
+    "policy": "insurance policy schedule",
+}
+SINGLE_DOCUMENT_PROMPT = """You are reading one {title} from an Indian motor insurance claim.
+Extract these fields. Return JSON: {{"fields":[{{"name","value","source_doc","confidence","status"}}]}}
+Field names to extract, exactly these keys:
+  {keys}
+Dates in ISO format YYYY-MM-DD. source_doc = the filename it came from.
+confidence = 0.0 to 1.0.
+If a field's label appears on the document but the value is blank, illegible or cut off,
+return status 'unreadable'. If the field does not appear on this document at all,
+return 'not_present'. Only use 'found' when you read an actual value.
+CRITICAL: never guess or infer a value; return value null and confidence 0 instead."""
+
+
+def _document(spec):
+    """{"name", "paths", "doc_type"} from a path or a partial dict."""
+    if isinstance(spec, dict):
+        paths = list(spec.get("paths") or ([spec["path"]] if spec.get("path") else []))
+        name = spec.get("name") or (os.path.basename(paths[0]) if paths else "document")
+        doc_type = spec.get("doc_type")
+        return {
+            "name": str(name),
+            "paths": paths,
+            "doc_type": doc_type if doc_type in DOCUMENT_FIELDS else None,
+        }
+    return {"name": os.path.basename(str(spec)), "paths": [spec], "doc_type": None}
+
+
+def _document_parts(document):
+    images = []
+    for path in document["paths"]:
+        part = _image_part(path)
+        images.extend(part if isinstance(part, list) else [part])
+    parts = []
+    for index, image in enumerate(images, 1):
+        label = f"Filename: {document['name']}"
+        if len(images) > 1:
+            label += f" (page {index} of {len(images)})"
+        parts.append(("text", label))
+        parts.append(image)
+    return parts
+
+
+def _normalise_fields(raw, document):
+    allowed = DOCUMENT_FIELDS.get(document["doc_type"])
+    normalised = []
+    for field in raw if isinstance(raw, list) else []:
+        if not isinstance(field, dict):
+            continue
+        if allowed and field.get("name") not in allowed:
+            continue
+        entry = dict(field)
+        value = entry.get("value")
+        has_value = value is not None and str(value).strip().lower() not in NULL_WORDS
+        status = str(entry.get("status") or "").strip().lower()
+        if has_value:
+            entry["status"] = "found"
+        elif status in ("not_present", "unreadable"):
+            entry["status"] = status
+        else:
+            # If a provider omits status, do not claim the label was absent.
+            entry["status"] = "unreadable"
+        entry["source_doc"] = document["name"]
+        normalised.append(entry)
+    return normalised
+
+
+def _extract_document(document):
+    parts = _document_parts(document)
+    if not parts:
+        raise ValueError("document has no readable pages")
+    prompt = (
+        SINGLE_DOCUMENT_PROMPT.format(
+            title=DOCUMENT_TITLES[document["doc_type"]],
+            keys=", ".join(DOCUMENT_FIELDS[document["doc_type"]]),
+        )
+        if document["doc_type"]
+        else EXTRACT_PROMPT
+    )
+    data = _generate(parts + [("text", prompt)], f"extract_fields({document['name']})")
+    fields = _normalise_fields(data.get("fields") if isinstance(data, dict) else None, document)
+    if not fields:
+        raise ValueError("the model returned no fields")
+    return fields
+
+
+def _merge_fields(fields):
+    """One list in document order. Where any document found a value for a field,
+    entries for it that found nothing are dropped, so a not_present from one
+    document never hides a value read from another."""
+    found = {field.get("name") for field in fields if field.get("status") == "found"}
+    merged, kept_missing = [], set()
+    for field in fields:
+        name = field.get("name")
+        if field.get("status") == "found":
+            merged.append(field)
+        elif name not in found and name not in kept_missing:
+            kept_missing.add(name)
+            merged.append(field)
+    return merged
+
+
+def _cause(error):
+    from vision import short_error
+
+    text = short_error(error, limit=400)
+    return text.split(": ", 1)[1] if text.startswith("VisionUnavailable: ") else text
+
+
+def extract_fields(documents):
+    """Extract fields one document at a time and say how that went.
+
+    documents: paths (one document each, type unknown) or dicts with name,
+    paths (a PDF, or the pages of one document) and doc_type from
+    classification. Each call carries only that document's pages, so most are
+    within Groq's image limit, and the vision cache works per document.
+
+    Returns {"status": ok|partial|failed|not_attempted, "fields", "documents",
+    "read", "failed": [{"name", "doc_type", "error"}], "error"}. A failed
+    document never discards the fields of the others.
+    """
+    docs = [_document(spec) for spec in documents or []]
+    result = {
+        "status": "not_attempted", "fields": [], "documents": len(docs),
+        "read": [], "failed": [], "error": None,
+    }
+    if not docs:
+        return result
+    fields = []
+    for document in docs:
+        try:
+            fields.extend(_extract_document(document))
+            result["read"].append(document["name"])
+        except Exception as error:
+            print(f"[gemini] extract_fields failed for {document['name']}:", flush=True)
+            traceback.print_exc()
+            result["failed"].append({
+                "name": document["name"],
+                "doc_type": document["doc_type"],
+                "error": _cause(error),
+            })
+    result["fields"] = _merge_fields(fields)
+    if not result["failed"]:
+        result["status"] = "ok"
+    else:
+        result["status"] = "partial" if result["read"] else "failed"
+        result["error"] = result["failed"][0]["error"]
+    return result
 
 
 VALID_SEVERITIES = ("minor", "moderate", "severe")
@@ -293,15 +415,48 @@ def _normalise_part(value):
     return name
 
 
-def _coerce_confidence(value):
+def parse_confidence(value):
+    """A model confidence as 0..1, or None when it was not reported or cannot
+    be read. Never a default: a made-up 0.5 looks like a judgement.
+
+    Accepts 0..1 numbers, 0..100 percentages (85, "85%", "85 %"), numeric
+    strings, confidence words ("high"), and {"value"|"score"|"confidence": x}.
+    """
+    if isinstance(value, dict):
+        for key in ("value", "score", "confidence", "probability"):
+            if key in value:
+                return parse_confidence(value[key])
+        return None
+    if value is None or isinstance(value, bool):
+        return None
+    percent = False
+    if isinstance(value, str):
+        text = value.strip().lower().replace("_", " ")
+        if not text:
+            return None
+        if text in CONFIDENCE_WORDS:
+            return CONFIDENCE_WORDS[text]
+        if text.endswith("%"):
+            percent = True
+            text = text[:-1].strip()
+        value = text
     try:
         number = float(value)
     except (TypeError, ValueError):
-        word = str(value).strip().lower().replace("_", " ") if value is not None else ""
-        number = CONFIDENCE_WORDS.get(word, 0.5)
-    if number != number:  # NaN
-        return 0.5
-    return max(0.0, min(1.0, number))
+        return None
+    if number != number or number in (float("inf"), float("-inf")) or number < 0:
+        return None
+    if percent or 1.0 < number <= 100.0:
+        number /= 100.0
+    if number > 1.0:
+        return None
+    return round(number, 4)
+
+
+def _coerce_confidence(value):
+    """Classification routing: an unreported confidence routes as uncertain."""
+    parsed = parse_confidence(value)
+    return parsed
 
 
 def _normalise_damage(items):
@@ -311,7 +466,8 @@ def _normalise_damage(items):
         if not isinstance(item, dict):
             continue
         entry = dict(item)
-        entry["confidence"] = _coerce_confidence(entry.get("confidence"))
+        entry["confidence"] = parse_confidence(entry.get("confidence"))
+        entry["confidence_reported"] = entry["confidence"] is not None
         severity = str(entry.get("severity") or "").strip().lower()
         entry["severity"] = severity if severity in VALID_SEVERITIES else "moderate"
         for key in ("part", "damage_type"):

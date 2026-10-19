@@ -176,6 +176,9 @@ class AiDetectionTests(unittest.TestCase):
             get_conn=lambda: FakeConnection(),
             check_duplicates=lambda paths, conn: duplicate_result,
             build_photo_url_map=lambda paths: {},
+            classify_image=lambda path: {
+                "doc_type": "vehicle_photo", "confidence": 0.95, "number_plate": None,
+            },
             save_claim=lambda claim_id, payload: None,
         ), patch.object(main, "run_deep_forensics") as deep:
             asyncio.run(main.analyse_claim(

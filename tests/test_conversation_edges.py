@@ -587,7 +587,12 @@ class HostileInputTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["status"], "error")
         self.assertEqual(payload["stopped_at"], "ai_unavailable")
-        self.assertEqual(payload["decision"], "auto_assess")
+        # An escalated claim is never auto-assessed.
+        self.assertEqual(payload["decision"], "needs_review")
+        self.assertIn(
+            "Automated assessment unavailable: escalated to an assessor",
+            payload["decision_reasons"],
+        )
         self.assertEqual(
             attempted,
             ["bogus-groq", "bogus-groq", "bogus-gemini", "bogus-gemini",

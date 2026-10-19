@@ -13,6 +13,12 @@ load_dotenv()
 
 import db
 from gemini import classify_image, extract_fields
+from rules import (
+    DOCUMENT_LABELS,
+    establish_documents,
+    reported_confidence,
+    route_classification,
+)
 
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
@@ -26,12 +32,6 @@ HTTP_TIMEOUT = 30.0
 MAX_PROCESSED = 500
 PENDING_CHOICE_TIMEOUT = 30 * 60
 MAX_IMAGES_PER_CLAIM = 8
-DOCUMENT_LABELS = {
-    "rc": "Registration certificate",
-    "driving_licence": "Driving licence",
-    "claim_form": "Claim form",
-    "policy": "Insurance policy",
-}
 
 PROCESSED = set()
 _PROCESSED_ORDER = deque()
@@ -534,12 +534,27 @@ def _stage_seconds(payload, stage):
     return None
 
 
+def indicative_range(estimate):
+    """Indicative (unconfirmed) range, one line per part as build_estimate set it.
+
+    Estimates stored before per-part dedup lack the totals; summing their
+    unconfirmed items is the only figure they carry.
+    """
+    estimate = estimate or {}
+    if "indicative_high" in estimate:
+        return estimate.get("indicative_low") or 0, estimate.get("indicative_high") or 0
+    unconfirmed = estimate.get("unconfirmed") or []
+    return (
+        sum(item.get("low") or 0 for item in unconfirmed),
+        sum(item.get("high") or 0 for item in unconfirmed),
+    )
+
+
 def _estimate_range(estimate):
     estimate = estimate or {}
     unconfirmed = estimate.get("unconfirmed") or []
     if not estimate.get("total_high") and unconfirmed:
-        low = sum(item.get("low") or 0 for item in unconfirmed)
-        high = sum(item.get("high") or 0 for item in unconfirmed)
+        low, high = indicative_range(estimate)
         return (
             f"No confirmed estimate yet; indicative range "
             f"{_rupees(low)} – {_rupees(high)}, pending assessor review"
@@ -622,8 +637,7 @@ def _single_vehicle_reply(claim_id, vehicle, excluded_count=0, total_photos=None
 
     unconfirmed = estimate.get("unconfirmed") or []
     if not estimate.get("total_high") and unconfirmed:
-        indicative_low = sum(item.get("low") or 0 for item in unconfirmed)
-        indicative_high = sum(item.get("high") or 0 for item in unconfirmed)
+        indicative_low, indicative_high = indicative_range(estimate)
         lines += [
             "",
             "*No confirmed estimate yet*",
@@ -895,63 +909,50 @@ def strict_docs_enabled():
     }
 
 
-def _infer_document_types(fields):
-    found = {
-        field.get("name")
-        for field in (fields or [])
-        if isinstance(field, dict)
-        and field.get("status") == "found"
-        and field.get("value") not in (None, "")
-    }
-    inferred = set()
-    if found & {
-        "owner_name_rc", "registration_number_rc",
-        "chassis_number", "engine_number", "vehicle_make_model",
-    }:
-        inferred.add("rc")
-    if found & {"holder_name_dl", "dl_number", "dl_expiry_date"}:
-        inferred.add("driving_licence")
-    if found & {
-        "insured_name_claim_form", "registration_number_claim_form",
-        "accident_date", "accident_time", "accident_location",
-        "accident_description",
-    }:
-        inferred.add("claim_form")
-    if found & {"policy_number", "policy_start_date", "policy_end_date"}:
-        inferred.add("policy")
-    return inferred
-
-
 def classify_session_intake(session):
+    """Decide whether to ask for documents before analysis.
+
+    Uses rules.establish_documents, the same function the pipeline uses, so
+    the checklist, the Documents card, the undetermined list and the decision
+    reason all describe one result. session["docs"] is a list of page
+    documents ({"name", "paths"}). A requirement that only an unread document
+    could satisfy is not asked for again: the customer did send something,
+    and the claim records it as not established.
+    """
     classifications = []
-    received = {doc_type: 0 for doc_type in DOCUMENT_LABELS}
     vehicle_count = 0
     for path in list(session.get("photos") or [])[:MAX_IMAGES_PER_CLAIM]:
         result = classify_image(path)
-        entry = {"path": path, **result}
+        entry = {
+            "path": path,
+            "filename": os.path.basename(str(path)),
+            **result,
+            "confidence": reported_confidence(result),
+        }
         classifications.append(entry)
-        try:
-            confidence = float(result.get("confidence"))
-        except (TypeError, ValueError):
-            confidence = 0.0
-        doc_type = result.get("doc_type")
-        if confidence < 0.6 or doc_type == "vehicle_photo":
+        if route_classification(entry) == "vehicle_photo":
             vehicle_count += 1
-        elif doc_type in received:
-            received[doc_type] += 1
 
-    document_paths = list(session.get("docs") or [])
-    if document_paths:
-        for doc_type in _infer_document_types(extract_fields(document_paths)):
-            received[doc_type] = max(1, received[doc_type])
-
-    required = required_docs()
-    missing = [doc_type for doc_type in required if not received[doc_type]]
+    documents = [
+        dict(document, doc_type=None)
+        for document in session.get("docs") or []
+        if isinstance(document, dict)
+    ]
+    extraction = extract_fields(documents) if documents else {
+        "status": "not_attempted", "fields": [], "failed": [],
+    }
+    check = establish_documents(
+        classifications, extraction, [document["name"] for document in documents],
+        required_docs(),
+    )
+    missing = [] if check["unverified"] else check["missing"]
     result = {
         "classifications": classifications,
-        "documents_received": received,
+        "documents_received": check["received"],
         "vehicle_count": vehicle_count,
         "missing": missing,
+        "unread_documents": check["unread_documents"],
+        "document_check": check,
     }
     session["intake"] = result
     session["missing_docs"] = missing
@@ -1044,14 +1045,16 @@ async def handle_pending_choice(wa_id, text):
 def _materialise_media(wa_id, rows):
     """Write session media to temp files for the pipeline. Ids stay in the DB.
 
-    Returns (photos, page_paths, created, documents, missing). photos is a
-    list of (path, sha256, source_bytes); documents lists one (filename,
-    sha256, source_bytes) per source PDF, in arrival order.
+    Returns (photos, page_documents, created, documents, missing). photos is
+    a list of (path, sha256, source_bytes); page_documents is one
+    {"name", "paths"} per source PDF; documents lists one (filename, sha256,
+    source_bytes) per source PDF, in arrival order.
     """
     from main import UPLOAD_DIR
 
     folder = os.path.join(UPLOAD_DIR, f"wa_{wa_id}")
-    photos, page_paths, created, documents = [], [], [], []
+    photos, created, documents = [], [], []
+    pages_by_name = {}
     document_numbers = {}
     missing = 0
     for row in rows:
@@ -1077,11 +1080,15 @@ def _materialise_media(wa_id, rows):
         with open(path, "wb") as handle:
             handle.write(data)
         if row["kind"] == "document_page":
-            page_paths.append(path)
+            pages_by_name.setdefault(f"document{document_numbers[row['sha256']]}.pdf", []).append(path)
         else:
             photos.append((path, row["sha256"], row.get("source_bytes")))
         created.append(path)
-    return photos, page_paths, created, documents, missing
+    page_documents = [
+        {"name": filename, "paths": pages_by_name.get(filename, [])}
+        for filename, _, _ in documents
+    ]
+    return photos, page_documents, created, documents, missing
 
 
 def _release_materialised(paths):
@@ -1132,11 +1139,11 @@ async def process_session(wa_id, skip_missing=False):
             analysis_cutoff=max((row["id"] for row in rows), default=0),
             updated=time.time(),
         )
-        photos, page_paths, temp_paths, documents, missing_media = await asyncio.to_thread(
+        photos, page_documents, temp_paths, documents, missing_media = await asyncio.to_thread(
             _materialise_media, wa_id, rows
         )
         photo_paths = [path for path, _, _ in photos]
-        view = {"photos": photo_paths, "docs": page_paths}
+        view = {"photos": photo_paths, "docs": page_documents}
         intake = await asyncio.to_thread(classify_session_intake, view)
         missing = list(intake.get("missing") or [])
         state = {"intake": intake, "missing_docs": missing}
@@ -1156,15 +1163,8 @@ async def process_session(wa_id, skip_missing=False):
             await send_text(wa_id, checklist_reply(intake))
             return
 
-        forced_review_reasons = []
-        if missing:
-            missing_names = ", ".join(
-                DOCUMENT_LABELS[doc_type].lower() for doc_type in missing
-            )
-            forced_review_reasons.append(
-                f"documents not provided: {missing_names}"
-            )
-
+        # Missing documents are decided by the pipeline (rules.establish_documents)
+        # from what it established, on every path, so SKIP adds no reason here.
         consumed = [row["id"] for row in rows]
         session.update(**state, awaiting_docs=False, updated=time.time())
         for notice in notices:
@@ -1185,8 +1185,7 @@ async def process_session(wa_id, skip_missing=False):
             photo_paths,
             source="whatsapp",
             from_number=wa_id,
-            forced_review_reasons=forced_review_reasons,
-            page_paths=page_paths,
+            page_documents=page_documents,
         )
         reply = format_reply(payload)
         vehicles = [

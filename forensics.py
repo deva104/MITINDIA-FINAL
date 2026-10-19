@@ -29,8 +29,21 @@ OUTPUT_DIR = BASE_DIR / "static_output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 ELA_QUALITY = 90
-ELA_HIGH = 60
-ELA_MEDIUM = 25
+# ELA is informational only. Calibration on 14 genuine photos, 42 WhatsApp-style
+# recompressions (<=1600px, q70-80) and 28 edited copies (spliced patch, painted
+# rectangle) found no threshold that separates them: the old "max difference >
+# 25" rule flagged 6/14 genuine originals and 6/42 genuine recompressions while
+# catching 0/28 edits, and the localised score overlapped too (genuine up to
+# 8.14, edits up to 6.42). Edits saved at q95 without WhatsApp also overlapped
+# genuine photos. These ceilings are the highest genuine values seen; a photo
+# above both is noted for an assessor to inspect, never called suspicious.
+ELA_GENUINE_MAX_DIFF = 41
+ELA_GENUINE_MAX_LOCAL = 8.14
+ELA_BLOCK = 16
+ELA_INFORMATIONAL_DETAIL = (
+    "informational only: recompression (for example by WhatsApp) and editing "
+    "produce overlapping error levels"
+)
 ELA_BOOST = 30.0
 ELA_CONTRAST = 2.5
 DUPLICATE_DISTANCE = 5
@@ -192,6 +205,17 @@ def _ai_detection_enabled():
     }
 
 
+def ai_detection_status():
+    """Whether the AI-generation check can run. Booleans only, never the keys."""
+    return {
+        "enabled": _ai_detection_enabled(),
+        "keys_configured": bool(
+            os.getenv("SIGHTENGINE_API_USER", "").strip()
+            and os.getenv("SIGHTENGINE_API_SECRET", "").strip()
+        ),
+    }
+
+
 def _ai_score_result(score):
     if score >= 0.85:
         return _result(
@@ -347,6 +371,22 @@ def run_ela(image, quality=ELA_QUALITY, boost=ELA_BOOST):
     ela_image = diff.point(lambda p: min(255, int(p * boost)))
     ela_image = ImageEnhance.Contrast(ela_image).enhance(ELA_CONTRAST)
     return ela_image, max_diff
+
+
+def ela_local_score(image, quality=ELA_QUALITY):
+    """How much the most error-heavy 0.5% of 16px blocks stand out from the
+    median block. A splice raises a few blocks; recompression raises all."""
+    original = image.convert("RGB")
+    buffer = io.BytesIO()
+    original.save(buffer, "JPEG", quality=quality)
+    buffer.seek(0)
+    diff = ImageChops.difference(original, Image.open(buffer)).convert("L")
+    width, height = diff.size
+    columns, rows = max(1, width // ELA_BLOCK), max(1, height // ELA_BLOCK)
+    means = sorted(diff.resize((columns, rows), Image.BOX).getdata())
+    median = means[len(means) // 2]
+    top = means[-max(1, len(means) // 200):]
+    return round((sum(top) / len(top)) / max(median, 0.5), 2)
 
 
 def _to_float(value):
@@ -585,13 +625,24 @@ def run_deep_forensics(photo_paths, conn=None, fields=None):
 
                 if _is_jpeg(path, image):
                     ela_image, max_diff = run_ela(image)
-                    level = "high" if max_diff > ELA_HIGH else ("medium" if max_diff > ELA_MEDIUM else "low")
+                    local = ela_local_score(image)
+                    detail = (
+                        f"{name}: error level max {max_diff}, localised {local} - "
+                        f"{ELA_INFORMATIONAL_DETAIL}"
+                    )
+                    if max_diff > ELA_GENUINE_MAX_DIFF and local > ELA_GENUINE_MAX_LOCAL:
+                        detail += (
+                            "; both scores are above the range seen in genuine "
+                            "test photos, inspect the heatmap"
+                        )
                     entry = _result(
                         "ela",
-                        "suspicious" if max_diff > ELA_MEDIUM else "clean",
-                        f"{name}: error level max difference {max_diff} ({level})",
+                        "informational",
+                        detail,
                         _store_processed(ela_image, "ela"),
                     )
+                    entry["score"] = local
+                    entry["max_diff"] = max_diff
                 else:
                     entry = _result("ela", "not_applicable", NOT_APPLICABLE_DETAIL, None)
                 entry["original_url"] = original_url

@@ -46,6 +46,17 @@ def seed_session(wa_id, photos=0, documents=0, **state):
     return photo_bytes, page_bytes
 
 
+def extraction_ok(fields, documents=None, source_doc=None):
+    """What gemini.extract_fields returns when every document was read."""
+    fields = [dict(field, source_doc=source_doc) if source_doc else dict(field)
+              for field in fields or []]
+    names = [document.get("name") for document in documents or [] if isinstance(document, dict)]
+    return {
+        "status": "ok", "fields": fields, "documents": len(names) or 1,
+        "read": names, "failed": [], "error": None,
+    }
+
+
 def read_all(paths):
     out = []
     for path in paths:

@@ -65,6 +65,128 @@ NARRATIVE_GROUPS = (
 )
 
 
+DOCUMENT_LABELS = {
+    "rc": "Registration certificate",
+    "driving_licence": "Driving licence",
+    "claim_form": "Claim form",
+    "policy": "Insurance policy",
+}
+
+
+def document_requirements(documents_received, required, unread_documents=0):
+    """The one place that decides what a claim is missing.
+
+    Every path (WhatsApp DONE or SKIP, console upload) calls this with the
+    documents the pipeline established. unread_documents counts documents of
+    unknown type that could not be read: a requirement they might satisfy is
+    "not established", never "not provided".
+    """
+    received = documents_received or {}
+    missing = [doc_type for doc_type in required or [] if not received.get(doc_type)]
+    names = ", ".join(DOCUMENT_LABELS.get(doc_type, doc_type).lower() for doc_type in missing)
+    if not missing:
+        reason = None
+    elif unread_documents:
+        noun = "document" if unread_documents == 1 else "documents"
+        reason = (
+            f"required documents not established: {names} "
+            f"({unread_documents} {noun} received could not be read)"
+        )
+    else:
+        reason = f"documents not provided: {names}"
+    return {
+        "missing": missing,
+        "unverified": bool(missing and unread_documents),
+        "unread_documents": int(unread_documents or 0),
+        "reason": reason,
+    }
+
+
+CLASSIFICATION_THRESHOLD = 0.6
+
+
+def route_classification(result):
+    """Where one classified image goes: "vehicle_photo", a document type, or
+    "unclassified". Uncertain or unscored images are kept as vehicle photos
+    so damage is never dropped; only a confident document is a document."""
+    result = result or {}
+    doc_type = result.get("doc_type")
+    confidence = reported_confidence(result)
+    if confidence is None or confidence < CLASSIFICATION_THRESHOLD or doc_type == "vehicle_photo":
+        return "vehicle_photo"
+    if doc_type in DOCUMENT_LABELS:
+        return doc_type
+    return "unclassified"
+
+
+def infer_document_types(fields):
+    """Document types a set of extracted fields shows was present."""
+    found = {
+        field.get("name")
+        for field in (fields or [])
+        if isinstance(field, dict)
+        and field.get("status") == "found"
+        and field.get("value") not in (None, "")
+    }
+    inferred = set()
+    if found & {
+        "owner_name_rc", "registration_number_rc",
+        "chassis_number", "engine_number", "vehicle_make_model",
+    }:
+        inferred.add("rc")
+    if found & {"holder_name_dl", "dl_number", "dl_expiry_date"}:
+        inferred.add("driving_licence")
+    if found & {
+        "insured_name_claim_form", "registration_number_claim_form",
+        "accident_date", "accident_time", "accident_location",
+        "accident_description",
+    }:
+        inferred.add("claim_form")
+    if found & {"policy_number", "policy_start_date", "policy_end_date"}:
+        inferred.add("policy")
+    return inferred
+
+
+def establish_documents(classifications, extraction, unknown_documents, required):
+    """The single source of truth for which documents a claim has.
+
+    The WhatsApp checklist, the console Documents card, the undetermined list
+    and the decision reason all read the object this returns, so they cannot
+    disagree.
+
+    classifications: one {"filename", "doc_type", "confidence"} per image.
+    extraction: what gemini.extract_fields returned (fields carry source_doc).
+    unknown_documents: names of documents of unknown type (PDFs, page sets),
+    whose type is whatever was read from them.
+    """
+    received = {doc_type: 0 for doc_type in DOCUMENT_LABELS}
+    sources = {doc_type: [] for doc_type in DOCUMENT_LABELS}
+    for item in classifications or []:
+        if not isinstance(item, dict):
+            continue
+        route = route_classification(item)
+        if route in received:
+            received[route] += 1
+            sources[route].append(item.get("filename") or item.get("path"))
+    extraction = extraction or {}
+    failed = {item.get("name") for item in extraction.get("failed") or [] if isinstance(item, dict)}
+    fields = extraction.get("fields") or []
+    unread = 0
+    for name in unknown_documents or []:
+        if name in failed:
+            unread += 1
+            continue
+        own = [field for field in fields if isinstance(field, dict) and field.get("source_doc") == name]
+        for doc_type in infer_document_types(own):
+            received[doc_type] = max(1, received[doc_type])
+            sources[doc_type].append(name)
+    check = document_requirements(received, required, unread)
+    check["received"] = received
+    check["sources"] = {key: value for key, value in sources.items() if value}
+    check["required"] = list(required or [])
+    return check
+
+
 def get_field(fields, name):
     for f in fields or []:
         if isinstance(f, dict) and f.get("name") == name:
@@ -370,6 +492,23 @@ def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None
     return flags
 
 
+def reported_confidence(item):
+    """The model's confidence, or None when it did not report one."""
+    try:
+        value = item.get("confidence")
+    except AttributeError:
+        return None
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if value != value:
+        return None
+    return max(0.0, min(1.0, value))
+
+
 def _damage_confidence(item):
     try:
         value = float(item.get("confidence"))
@@ -383,21 +522,22 @@ def assess_confidence(payload):
         item for item in (payload.get("damage") or [])
         if isinstance(item, dict)
     ]
-    confidence = (
-        sum(_damage_confidence(item) for item in damage) / len(damage)
-        if damage
-        else 0.0
-    )
+    # Averaged over findings the model scored; None when it scored none.
+    reported = [value for value in (reported_confidence(item) for item in damage)
+                if value is not None]
+    confidence = sum(reported) / len(reported) if reported else None
 
     if payload.get("status") == "rejected":
         stopped_at = payload.get("stopped_at") or "validation"
         return {
             "decision": "reject",
             "reasons": [f"Claim rejected at {stopped_at}"],
-            "confidence": round(confidence, 3),
+            "confidence": round(confidence, 3) if confidence is not None else None,
         }
 
     reasons = []
+    if payload.get("status") == "error":
+        reasons.append("Automated assessment unavailable: escalated to an assessor")
     for flag in payload.get("flags") or []:
         if isinstance(flag, dict) and str(flag.get("severity")).upper() == "HIGH":
             reasons.append(flag.get("message") or f"High-severity flag: {flag.get('rule')}")
@@ -413,13 +553,21 @@ def assess_confidence(payload):
         )
 
     for item in damage:
-        if _damage_confidence(item) < 0.6:
-            part = str(item.get("part") or "unknown part").replace("_", " ")
+        part = str(item.get("part") or "unknown part").replace("_", " ")
+        value = reported_confidence(item)
+        if value is None:
+            reasons.append(f"Model did not report confidence for {part}")
+        elif value < 0.6:
             reasons.append(f"Low-confidence damage finding: {part}")
 
     for field in payload.get("fields") or []:
         if isinstance(field, dict) and field.get("status") == "unreadable":
             reasons.append(f"Unreadable field: {field.get('name')}")
+
+    reasons.extend(extraction_reasons(payload.get("extraction")))
+    document_check = payload.get("document_check") or {}
+    if document_check.get("reason"):
+        reasons.append(document_check["reason"])
 
     if estimate.get("unpriced"):
         reasons.append("One or more confirmed damage items require manual pricing")
@@ -430,8 +578,28 @@ def assess_confidence(payload):
     return {
         "decision": "needs_review" if reasons else "auto_assess",
         "reasons": reasons,
-        "confidence": round(confidence, 3),
+        "confidence": round(confidence, 3) if confidence is not None else None,
     }
+
+
+def extraction_reasons(extraction):
+    """Decision reasons for documents that were received but not read."""
+    extraction = extraction or {}
+    failed = [item for item in extraction.get("failed") or [] if isinstance(item, dict)]
+    if extraction.get("status") == "failed":
+        count = int(extraction.get("documents") or len(failed) or 0)
+        noun = "document" if count == 1 else "documents"
+        return [
+            f"{count} {noun} received but could not be read: "
+            f"{extraction.get('error') or 'unknown error'}"
+        ]
+    if extraction.get("status") == "partial":
+        return [
+            f"{item.get('name') or 'A document'} could not be read: "
+            f"{item.get('error') or 'unknown error'}"
+            for item in failed
+        ]
+    return []
 
 
 def build_estimate(damage):
@@ -475,7 +643,7 @@ def build_estimate(damage):
                 "part": report_part,
                 "damage_type": report.get("damage_type"),
                 "severity": report_severity,
-                "confidence": _damage_confidence(report),
+                "confidence": reported_confidence(report),
             }
             if rate:
                 entry["low"], entry["high"] = rate
@@ -538,11 +706,47 @@ def build_estimate(damage):
         total_low += low
         total_high += high
 
+    # The indicative range follows the same rule as the confirmed one: a panel
+    # is priced once. One line per part, the most severe report wins, and a part
+    # that already has a confirmed line adds nothing.
+    confirmed_parts = {item.get("part") for item in line_items + unpriced}
+    chosen = {}
+    for entry in unconfirmed:
+        part = entry.get("part")
+        if part in confirmed_parts:
+            entry["counts_toward_indicative"] = False
+            entry["covered_by"] = "confirmed line for this part"
+            continue
+        if entry.get("low") is None:
+            entry["counts_toward_indicative"] = False
+            continue
+        current = chosen.get(part)
+        rank = (
+            severity_order.get(str(entry.get("severity") or "").strip().lower(), 0),
+            entry.get("high") or 0,
+        )
+        if current is None or rank > (
+            severity_order.get(str(current.get("severity") or "").strip().lower(), 0),
+            current.get("high") or 0,
+        ):
+            chosen[part] = entry
+    for entry in unconfirmed:
+        if entry.get("part") in confirmed_parts or entry.get("low") is None:
+            continue
+        counts = chosen.get(entry.get("part")) is entry
+        entry["counts_toward_indicative"] = counts
+        if not counts:
+            entry["covered_by"] = "more severe finding on this part"
+    indicative_low = sum(entry["low"] for entry in chosen.values())
+    indicative_high = sum(entry["high"] for entry in chosen.values())
+
     requires_survey = total_high > SURVEY_THRESHOLD
     return {
         "line_items": line_items,
         "unpriced": unpriced,
         "unconfirmed": unconfirmed,
+        "indicative_low": indicative_low,
+        "indicative_high": indicative_high,
         "total_low": total_low,
         "total_high": total_high,
         "requires_survey": requires_survey,

@@ -31,8 +31,37 @@ PROVIDER_MAX_IMAGES = {
     # application's eight-page PDF cap without claiming an undocumented maximum.
     "openrouter": 16,
 }
+PROVIDER_KEYS = {
+    "groq": "GROQ_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+}
 _CACHE_EVENTS = ContextVar("vision_cache_events", default=())
 _FALLBACK_EVENTS = ContextVar("vision_fallback_events", default=())
+
+
+class VisionUnavailable(RuntimeError):
+    """Every configured provider was skipped or failed. attempts lists why, in order."""
+
+    def __init__(self, label, attempts):
+        self.attempts = list(attempts)
+        # Providers that failed the same way are named together, so the cause
+        # stays short enough to show in full.
+        groups = {}
+        for provider, outcome, detail in self.attempts:
+            groups.setdefault((outcome, detail), []).append(provider)
+        summary = "; ".join(
+            f"{', '.join(names)} {outcome}: {detail}"
+            for (outcome, detail), names in groups.items()
+        )
+        super().__init__(f"no vision provider succeeded ({summary})")
+
+
+def short_error(error, limit=160):
+    """One line, bounded: safe to show an assessor and to log."""
+    text = " ".join(str(error).split())
+    name = type(error).__name__
+    return (f"{name}: {text}" if text else name)[:limit]
 
 
 def reset_cache_tracking():
@@ -130,30 +159,39 @@ def generate_json(parts, label) -> dict:
     )
 
     # Separate providers mean separate quota pools, so a 429 on one does not
-    # affect the other.
+    # affect the other. A capacity skip is normal routing; only a failure is
+    # recorded as one.
+    attempts = []
+    # Held back until a provider answers: a chain that fails as a whole is
+    # reported by the caller, and "fell back to X" would claim X produced it.
+    pending_fallbacks = []
     for provider_index, provider in enumerate(providers):
+        outcome = None
         try:
             call = PROVIDER_CALLS[provider]
             model = _model_for(provider)
             max_images = PROVIDER_MAX_IMAGES[provider]
         except KeyError:
             last_error = ValueError(f"unsupported vision provider: {provider}")
+            outcome = ("failed", f"unsupported provider '{provider}'")
         else:
             if image_count > max_images:
-                last_error = ValueError(
-                    f"{provider} supports at most {max_images} images, got {image_count}"
+                outcome = (
+                    "skipped",
+                    f"{image_count} images exceeds {provider} limit {max_images}",
                 )
-                print(
-                    f"[vision] {label}: skipping {provider}, {image_count} images "
-                    f"exceeds limit {max_images}",
-                    flush=True,
-                )
+                print(f"[vision] {label}: skipped {provider}: {outcome[1]}", flush=True)
             else:
                 for attempt in range(2):
                     try:
                         response = call(parts, model, label)
                     except Exception as error:
                         last_error = error
+                        key_env = PROVIDER_KEYS.get(provider)
+                        if isinstance(error, KeyError) and error.args[:1] == (key_env,):
+                            outcome = ("skipped", f"{key_env} is not set")
+                            break
+                        outcome = ("failed", short_error(error))
                         if attempt == 0:
                             time.sleep(2)
                         continue
@@ -171,21 +209,56 @@ def generate_json(parts, label) -> dict:
                                 f"[vision] {label}: cache write failed: {error}",
                                 flush=True,
                             )
+                    _FALLBACK_EVENTS.set(_FALLBACK_EVENTS.get() + tuple(pending_fallbacks))
                     return response
+        attempts.append((provider, outcome[0], outcome[1]))
 
         if provider_index + 1 < len(providers):
             next_provider = providers[provider_index + 1]
-            _FALLBACK_EVENTS.set(
-                _FALLBACK_EVENTS.get() + ({
-                    "from": provider,
-                    "to": next_provider,
-                },)
-            )
+            pending_fallbacks.append({
+                "from": provider,
+                "to": next_provider,
+                "reason": outcome[0],
+                "detail": outcome[1],
+            })
             print(
-                f"[vision] {label}: falling back from {provider} to {next_provider}",
+                f"[vision] {label}: {provider} {outcome[0]} ({outcome[1]}), "
+                f"falling back to {next_provider}",
                 flush=True,
             )
 
-    if last_error is not None:
-        raise last_error
+    if attempts:
+        raise VisionUnavailable(label, attempts) from last_error
     raise RuntimeError("No vision providers were configured")
+
+
+def provider_status():
+    """The resolved provider chain and which providers have keys. Never values."""
+    warnings = []
+    try:
+        providers = _configured_providers()
+    except ValueError as error:
+        return {"chain": [], "warnings": [str(error)]}
+    chain = []
+    for provider in providers:
+        if provider not in PROVIDER_CALLS:
+            chain.append({"provider": provider, "supported": False})
+            warnings.append(f"unknown provider '{provider}' in VISION_PROVIDERS")
+            continue
+        key_env = PROVIDER_KEYS[provider]
+        has_key = bool(os.getenv(key_env, "").strip())
+        chain.append({
+            "provider": provider,
+            "model": _model_for(provider),
+            "key_configured": has_key,
+            "max_images": PROVIDER_MAX_IMAGES[provider],
+        })
+        if not has_key:
+            warnings.append(f"{provider} is in VISION_PROVIDERS but {key_env} is not set")
+    for provider, key_env in PROVIDER_KEYS.items():
+        if provider not in providers and os.getenv(key_env, "").strip():
+            warnings.append(
+                f"{key_env} is set but {provider} is not in VISION_PROVIDERS, "
+                "so it is never used"
+            )
+    return {"chain": chain, "warnings": warnings}

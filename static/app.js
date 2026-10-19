@@ -82,7 +82,7 @@
   function confText(c) {
     if (typeof c === 'number' && isFinite(c)) return Math.round(c * 100) + '%';
     if (typeof c === 'string' && c) return c;
-    return '—';
+    return 'not reported';
   }
   
   function esc(s) {
@@ -94,6 +94,8 @@
   function verdictPill(v) {
     const cls = {
       clean: 'pill-ok',
+      informational: 'pill-mute',
+      info: 'pill-mute',
       suspicious: 'pill-warn',
       inconclusive: 'pill-warn',
       unavailable: 'pill-mute',
@@ -188,12 +190,36 @@
     return `<span class="source-badge">WhatsApp ···${esc(suffix)}</span>`;
   }
 
+  /* One indicative line per part, as the server computed it. Estimates saved
+     before per-part dedup carry no totals, so their items are summed. */
   function indicativeRange(estimate) {
+    if (estimate && estimate.indicative_high != null) {
+      return {
+        low: Number(estimate.indicative_low) || 0,
+        high: Number(estimate.indicative_high) || 0
+      };
+    }
     const items = list(estimate && estimate.unconfirmed);
     return {
       low: items.reduce((sum, item) => sum + (Number(item && item.low) || 0), 0),
       high: items.reduce((sum, item) => sum + (Number(item && item.high) || 0), 0)
     };
+  }
+
+  /* Every empty state says whether nothing was found or nothing was checked. */
+  function stoppedText(p) {
+    if (p.status === 'error') return 'the AI assessment was unavailable';
+    if (p.stopped_at === 'duplicate') return 'the claim stopped at the duplicate check';
+    if (p.stopped_at === 'not_a_vehicle') return 'the photos did not show a vehicle';
+    return p.stopped_at ? 'the claim stopped at ' + human(p.stopped_at) : '';
+  }
+
+  function extractionOf(p) {
+    return (p && p.extraction && typeof p.extraction === 'object') ? p.extraction : null;
+  }
+
+  function documentCount(n) {
+    return n + ' document' + (n === 1 ? '' : 's');
   }
   
   /* Backend may return raw payloads or DB rows holding payload_json. */
@@ -349,6 +375,9 @@
     if (typeof p.confidence === 'number' && isFinite(p.confidence)) {
       confidence.textContent = 'model confidence ' + p.confidence.toFixed(2);
       confidence.classList.remove('hidden');
+    } else if (list(p.damage).length) {
+      confidence.textContent = 'model confidence not reported';
+      confidence.classList.remove('hidden');
     } else {
       confidence.textContent = '';
       confidence.classList.add('hidden');
@@ -441,13 +470,21 @@
       return;
     }
 
-    const received = p.documents_received || {};
+    /* One source of truth: the pipeline's document_check. Older claims
+       without it fall back to documents_received. */
+    const check = p.document_check && typeof p.document_check === 'object' ? p.document_check : null;
+    const received = (check && check.received) || p.documents_received || {};
+    const unchecked = !check && 'document_check' in p;
     $('documentChecklist').innerHTML = required.map(docType => {
       const count = Number(received[docType] || 0);
+      let state = 'Missing';
+      if (count) state = '✓ Received' + (count > 1 ? ` (${count})` : '');
+      else if (unchecked) state = 'Not checked';
+      else if (check && check.unverified) state = 'Not established — a document could not be read';
       return `<div class="document-row">
         <span>${esc(DOCUMENT_LABELS[docType] || human(docType))}</span>
         <span class="document-state ${count ? 'is-received' : 'is-missing'}">
-          ${count ? '✓ Received' + (count > 1 ? ` (${count})` : '') : 'Missing'}
+          ${esc(state)}
         </span>
       </div>`;
     }).join('');
@@ -502,13 +539,16 @@
     </div>`;
   }
 
-  function vehicleDamageRows(vehicle) {
+  function vehicleDamageRows(vehicle, p) {
     const estimate = vehicle.estimate || {};
     const damage = list(vehicle.damage);
     const lines = list(estimate.line_items);
     const unconfirmed = list(estimate.unconfirmed);
     const unpriced = list(estimate.unpriced);
     if (!damage.length) {
+      if (p && p.status === 'error') {
+        return '<p class="empty">Damage not assessed — the AI assessment was unavailable.</p>';
+      }
       return '<p class="empty">No visible damage was detected for this vehicle.</p>';
     }
     return damage.map(item => {
@@ -531,7 +571,11 @@
       let price = 'Included in panel price';
       if (item.rejected) price = 'Excluded by assessor';
       else if (line) price = `${rupee(line.low)} – ${rupee(line.high)}`;
-      else if (uncertain && uncertain.low != null) {
+      else if (uncertain && uncertain.counts_toward_indicative === false && uncertain.covered_by) {
+        price = uncertain.covered_by === 'confirmed line for this part'
+          ? 'Same panel — already priced'
+          : 'Same panel — counted once';
+      } else if (uncertain && uncertain.low != null) {
         price = `${rupee(uncertain.low)} – ${rupee(uncertain.high)} indicative`;
       } else if (manual) price = 'Manual pricing';
       const classes = [
@@ -604,16 +648,19 @@
       const range = indicativeRange(estimate);
       const total = estimate.total_high
         ? `${rupee(estimate.total_low)} – ${rupee(estimate.total_high)}`
-        : list(estimate.unconfirmed).length
+          + (range.high ? ` + ${rupee(range.low)} – ${rupee(range.high)} indicative` : '')
+        : range.high
           ? `No confirmed estimate · ${rupee(range.low)} – ${rupee(range.high)} indicative`
-          : 'No estimate';
+          : list(estimate.unconfirmed).length
+            ? 'No confirmed estimate · unconfirmed findings need manual pricing'
+            : p.status === 'error' ? 'Not assessed' : 'No estimate';
       return `<div class="card vehicle-card">
         <div class="vehicle-head">
           <h2 class="vehicle-title">${esc(vehicle.label || 'Vehicle')}</h2>
           ${vehicleStatusPill(vehicle.status)}
         </div>
         ${photos ? `<div class="vehicle-photos">${photos}</div>` : ''}
-        <div class="vehicle-damage">${vehicleDamageRows(vehicle)}</div>
+        <div class="vehicle-damage">${vehicleDamageRows(vehicle, p)}</div>
         <div class="vehicle-total"><span>Group estimate</span><strong>${total}</strong></div>
       </div>`;
     }).join('');
@@ -655,7 +702,7 @@
     const out = $('pipelineCallout');
     if (p.stopped_at === 'duplicate') {
       const s = ((map['stage0_duplicate'] || {}).seconds || 0).toFixed(2);
-      out.textContent = `Rejected in ${s}s \u2014 no AI analysis performed`;
+      out.textContent = `Rejected at the duplicate check in ${s}s \u2014 no damage assessment performed`;
       out.classList.remove('hidden');
     } else {
       out.classList.add('hidden');
@@ -670,7 +717,11 @@
   
     if (!originals.length && !heats.length) {
       sw.classList.add('hidden');
-      box.innerHTML = '<p class="empty">No source images on this claim.</p>';
+      const ran = (p.timings || []).some(t => t && t.stage === 'stage2_deep_forensics');
+      const why = stoppedText(p);
+      box.innerHTML = ran
+        ? '<p class="empty">No photo was eligible for error-level analysis (JPEG vehicle photos only).</p>'
+        : `<p class="empty">Image forensics not run${why ? ' — ' + esc(why) : ''}.</p>`;
       return;
     }
   
@@ -716,13 +767,43 @@
     }).join('');
   }
   
+  function flagsNotice(p) {
+    const ex = extractionOf(p);
+    const why = stoppedText(p);
+    if (p.status === 'rejected' || (!ex && why)) {
+      return `Cross-document checks not run${why ? ' — ' + why : ''}.`;
+    }
+    if (ex && ex.status === 'failed') {
+      return 'Cross-document checks not run — documents could not be read.';
+    }
+    if (ex && ex.status === 'partial') {
+      const failed = list(ex.failed).length;
+      return `Some cross-document checks not run — ${documentCount(failed)} could not be read.`;
+    }
+    return '';
+  }
+
   function renderFlags(p) {
     const flags = Array.isArray(p.flags) ? p.flags : [];
+    const notice = flagsNotice(p);
+    const ex = extractionOf(p);
     if (!flags.length) {
-      $('flags').innerHTML = '<p class="empty">No inconsistencies detected.</p>';
+      let text = notice;
+      if (!text) {
+        if (ex && ex.status === 'ok') {
+          text = `No inconsistencies found across the ${documentCount(list(ex.read).length || Number(ex.documents) || 0)} read.`;
+        } else if (ex && ex.status === 'not_attempted') {
+          text = 'No cross-document checks — no documents were submitted.';
+        } else {
+          text = list(p.fields).length
+            ? 'No inconsistencies found in the document fields read.'
+            : 'No cross-document checks — no document fields were read.';
+        }
+      }
+      $('flags').innerHTML = `<p class="empty">${esc(text)}</p>`;
       return;
     }
-    $('flags').innerHTML = flags.map(f => {
+    $('flags').innerHTML = (notice ? `<p class="empty">${esc(notice)}</p>` : '') + flags.map(f => {
       const ev = Array.isArray(f.evidence) ? f.evidence : [];
       const chips = ev.length
         ? `<div class="chips">${ev.map(e => `<span class="chip">${esc(human(e))}</span>`).join('')}</div>`
@@ -733,13 +814,45 @@
     }).join('');
   }
   
+  function fieldsNotice(p) {
+    const ex = extractionOf(p);
+    if (!ex) return '';
+    if (ex.status === 'failed') {
+      return `${documentCount(Number(ex.documents) || list(ex.failed).length)} received — extraction failed: ${ex.error || 'unknown error'}`;
+    }
+    if (ex.status === 'partial') {
+      return list(ex.failed).map(item =>
+        `${item.name || 'A document'} could not be read: ${item.error || 'unknown error'}`
+      ).join(' · ');
+    }
+    return '';
+  }
+
   function renderFields(p) {
     const fields = Array.isArray(p.fields) ? p.fields : [];
+    const ex = extractionOf(p);
+    const notice = fieldsNotice(p);
     if (!fields.length) {
-      $('fields').innerHTML = '<p class="empty">No documents were submitted with this claim.</p>';
+      let text = notice;
+      if (!text) {
+        const why = stoppedText(p);
+        const anyReceived = Object.values(p.documents_received || {}).some(n => Number(n) > 0);
+        if (ex && ex.status === 'not_attempted' && why && p.status === 'rejected') {
+          text = `Document extraction not run — ${why}.`;
+        } else if (ex && ex.status === 'not_attempted') {
+          text = 'No documents were submitted with this claim.';
+        } else if (!ex && anyReceived) {
+          text = 'Documents were received but no fields were recorded for this claim.';
+        } else if (!ex && why) {
+          text = `Document extraction not run — ${why}.`;
+        } else {
+          text = 'No documents were submitted with this claim.';
+        }
+      }
+      $('fields').innerHTML = `<p class="empty">${esc(text)}</p>`;
       return;
     }
-    $('fields').innerHTML = fields.map(f => {
+    $('fields').innerHTML = (notice ? `<p class="empty">${esc(notice)}</p>` : '') + fields.map(f => {
       const empty = f.value == null || f.value === '';
       return `<div class="field ${empty ? 'is-null' : ''}">
         <span class="field-name">${esc(human(f.name))}</span>
@@ -755,7 +868,10 @@
     const dmg = Array.isArray(p.effective_damage)
       ? p.effective_damage : list(p.damage);
     if (!dmg.length) {
-      $('damage').innerHTML = '<p class="empty">No visible damage was detected.</p>';
+      const why = stoppedText(p);
+      $('damage').innerHTML = why
+        ? `<p class="empty">Damage not assessed — ${esc(why)}.</p>`
+        : '<p class="empty">No visible damage was detected.</p>';
       return;
     }
     const effectiveEstimate = p.effective_estimate || p.estimate || {};
@@ -802,13 +918,17 @@
     const headline = e.total_high
       ? `${rupee(e.total_low)} – ${rupee(e.total_high)}`
       : 'No confirmed estimate';
-    const indicativeLine = unconfirmedItems.length
+    const indicativeLine = indicative.high
       ? `<p class="est-indicative">+ ${rupee(indicative.low)} – ${rupee(indicative.high)} indicative, unconfirmed</p>`
-      : '';
+      : unconfirmedItems.length && !e.total_high
+        ? '<p class="est-indicative">Unconfirmed findings have no indicative price.</p>'
+        : '';
     const differs = Number(e.total_low || 0) !== Number(systemEstimate.total_low || 0)
       || Number(e.total_high || 0) !== Number(systemEstimate.total_high || 0);
     const systemLine = differs
-      ? `<p class="system-estimate">system estimate Rs ${Number(systemEstimate.total_low || 0).toLocaleString('en-IN')} – Rs ${Number(systemEstimate.total_high || 0).toLocaleString('en-IN')}</p>`
+      ? `<p class="system-estimate">${Number(systemEstimate.total_high || 0)
+          ? `System estimate: ${rupee(systemEstimate.total_low)} – ${rupee(systemEstimate.total_high)}`
+          : 'System estimate: no confirmed findings'}</p>`
       : '';
   
     $('estimate').innerHTML = `

@@ -1,4 +1,12 @@
-# ClaimPilot AI
+# InsureIT
+
+Formerly ClaimPilot. The product name is InsureIT everywhere a person sees
+it: console, WhatsApp messages, `/api/health` (`service`), the API title.
+These keep the old name on purpose and must not be renamed: the repo and its
+folder, env vars (`CLAIMPILOT_USE_TEST_DB`), tables, modules, storage keys
+(`claimpilot.db`, localStorage `claimpilot.*`, the `claimpilot-media-url:`
+signing salt), the Render service name in `render.yaml`, and the `CLM-`
+claim prefix.
 
 Automated motor-insurance claim assessment, built for an Indian hackathon.
 Final deadline: **Monday 19 October 2026, night (IST)**.

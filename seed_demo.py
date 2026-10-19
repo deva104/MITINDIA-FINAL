@@ -1,4 +1,4 @@
-"""Reset a ClaimPilot database and load the demo claims through the real pipeline.
+"""Reset an InsureIT database and load the demo claims through the real pipeline.
 
     python seed_demo.py --database-url URL --admin-token TOKEN \
         [--base-url https://mitindia-final.onrender.com] [--ai-image PATH] --yes

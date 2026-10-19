@@ -1,4 +1,4 @@
-/* ClaimPilot AI — frontend logic. Defensive by default: every field may be
+/* InsureIT — frontend logic. Defensive by default: every field may be
    null and every array may be empty on an early-exit payload. */
 
    const STAGES = [
@@ -173,12 +173,18 @@
       $('tokenNote').textContent = note;
       return;
     }
-    $('feed').innerHTML = `<form class="feed-empty token-form" id="tokenForm">
+    $('feed').innerHTML = `<form class="feed-empty token-form" id="tokenForm" autocomplete="off">
+        <span class="label">Assessor access</span>
         <span id="tokenNote">${esc(note)}</span>
-        <input id="tokenInput" type="password" autocomplete="current-password"
-               placeholder="Admin token" aria-label="Admin token">
-        <button type="submit" class="btn btn-primary btn-sm">Unlock</button>
+        <div class="token-row">
+          <input id="tokenInput" type="password" autocomplete="current-password"
+                 placeholder="Admin token" aria-label="Admin token">
+          <button type="submit" class="btn btn-primary" id="tokenUnlock" disabled>Unlock</button>
+        </div>
       </form>`;
+    $('tokenInput').oninput = event => {
+      $('tokenUnlock').disabled = !event.target.value.trim();
+    };
     $('tokenForm').onsubmit = event => {
       event.preventDefault();
       const value = String($('tokenInput').value || '').trim();
@@ -489,6 +495,9 @@
       );
     }
     $('verdictTitle').textContent = title;
+    $('verdictStatus').textContent = band.classList.contains('is-ok') ? 'Clear'
+      : band.classList.contains('is-rejected') ? 'Reject'
+      : escalated ? 'Escalated' : 'Review';
     $('verdictSub').textContent = sub;
   
     renderUndetermined(p);
@@ -747,11 +756,12 @@
     });
     const max = Math.max(0.01, ...Object.values(map).map(value => value.seconds));
   
-    $('bars').innerHTML = STAGES.map(s => {
+    $('bars').innerHTML = STAGES.map((s, i) => {
+      const chip = `<span class="num-chip">0${i + 1}</span>`;
       if (!(s.key in map)) {
         const skipped = p.stopped_at === 'duplicate' && s.key === 'stage1_gemini';
-        return `<div class="bar-row is-skipped">
-          <span class="bar-name">${s.label}</span>
+        return `<div class="bar-row is-skipped">${chip}
+          <div class="bar-label"><span class="bar-name">${s.label}</span></div>
           <div class="bar-skip">${skipped ? 'not required' : 'not reached'}</div>
           <span class="bar-time">\u2014</span></div>`;
       }
@@ -760,9 +770,10 @@
       const pct = Math.max(2, (sec / max) * 100);
       const slim = pct < 12 ? ' slim' : '';
       const cached = timing.cached === true;
-      const via = timing.via && timing.via !== 'cached' ? ` — ${esc(timing.via)}` : '';
-      return `<div class="bar-row ${cached ? 'is-cached' : ''}">
-        <span class="bar-name">${s.label}${cached ? ' — cached' : via}</span>
+      const via = timing.via && timing.via !== 'cached' ? esc(timing.via) : '';
+      const note = cached ? 'cached' : via;
+      return `<div class="bar-row ${cached ? 'is-cached' : ''}">${chip}
+        <div class="bar-label"><span class="bar-name">${s.label}</span>${note ? `<span class="bar-via">${note}</span>` : ''}</div>
         <div class="bar-track"><div class="bar-fill${slim}" style="width:${pct}%"></div></div>
         <span class="bar-time">${sec.toFixed(2)}s</span></div>`;
     }).join('');
@@ -1176,7 +1187,7 @@
     const paint = () => {
       $('workingStages').innerHTML = STAGES.map((s, n) => {
         const cls = n < i ? 'is-done' : n === i ? 'is-now' : '';
-        return `<li class="${cls}"><b>0${n + 1}</b>${s.label}</li>`;
+        return `<li class="${cls}"><span class="num-chip">0${n + 1}</span>${s.label}</li>`;
       }).join('');
     };
     paint();

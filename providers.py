@@ -141,8 +141,8 @@ def _get_openrouter_client():
         max_retries=0,
         default_headers={
             "Authorization": f"Bearer {key}",
-            "HTTP-Referer": "ClaimPilot",
-            "X-Title": "ClaimPilot",
+            "HTTP-Referer": "InsureIT",
+            "X-Title": "InsureIT",
         },
     ))
 

@@ -255,7 +255,10 @@ def log_provider_chain():
     return status
 
 
-app = FastAPI(title="ClaimPilot", lifespan=lifespan)
+# The product name. The repo, env vars, tables, modules, storage keys and
+# the CLM- prefix keep the old name, ClaimPilot.
+SERVICE_NAME = "InsureIT"
+app = FastAPI(title=SERVICE_NAME, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -286,6 +289,7 @@ if PoolTimeout is not None:
 def health():
     ok = database_ok()
     return {
+        "service": SERVICE_NAME,
         "ok": ok,
         "db": database_backend(),
         "db_ok": ok,
@@ -1855,7 +1859,7 @@ os.makedirs(STATIC_DIR, exist_ok=True)
 _index = os.path.join(STATIC_DIR, "index.html")
 if not os.path.exists(_index):
     with open(_index, "w", encoding="utf-8") as fh:
-        fh.write("<!doctype html><title>ClaimPilot</title><h1>ClaimPilot API is running.</h1>\n")
+        fh.write("<!doctype html><title>InsureIT</title><h1>InsureIT API is running.</h1>\n")
 
 STATIC_OUTPUT_DIR = os.path.join(BASE_DIR, "static_output")
 os.makedirs(STATIC_OUTPUT_DIR, exist_ok=True)

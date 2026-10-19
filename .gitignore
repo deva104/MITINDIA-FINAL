@@ -4,3 +4,4 @@ __pycache__/
 *.db
 uploads/
 static_output/
+data/private_registry_rows.json

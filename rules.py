@@ -361,8 +361,154 @@ def _claimed_photo_names(vehicles):
     }
 
 
+# Colour words as cameras and documents use them, grouped so lighting and
+# naming ("grey" vs "silver") do not count as a different colour.
+COLOUR_GROUPS = {
+    "silver": "silver", "grey": "silver", "gray": "silver",
+    "white": "white", "pearl": "white", "black": "black",
+    "red": "red", "maroon": "red", "wine": "red",
+    "blue": "blue", "navy": "blue", "brown": "brown", "beige": "brown", "gold": "brown",
+    "bronze": "brown", "green": "green", "orange": "orange", "yellow": "yellow",
+}
+BODY_GROUPS = {
+    "hatchback": "hatchback", "hatch": "hatchback", "sedan": "sedan", "saloon": "sedan",
+    "suv": "suv", "crossover": "suv", "muv": "muv", "mpv": "muv", "van": "muv",
+    "pickup": "pickup", "truck": "truck",
+}
+KNOWN_MAKES = {
+    "maruti", "suzuki", "hyundai", "tata", "mahindra", "honda", "toyota", "kia", "mg",
+    "skoda", "volkswagen", "renault", "nissan", "ford", "jeep", "bmw", "mercedes",
+    "audi", "citroen", "byd",
+}
+
+
+def _words(text):
+    return re.findall(r"[a-z0-9]+", str(text or "").lower())
+
+
+def _group(text, groups):
+    for word in _words(text):
+        if word in groups:
+            return groups[word]
+    return None
+
+
+def appearance_mismatch(registry, seen):
+    """("HIGH"|"MEDIUM", message) when the photographed vehicle differs from
+    the registered one, else None. Make or body type differing is HIGH;
+    colour alone is MEDIUM, because lighting changes how a colour photographs.
+    Anything the photos do not show is not compared."""
+    seen = seen or {}
+    seen_text = str(seen.get("make_model") or "")
+    seen_words = set(_words(seen_text))
+    registered = set(_words(f"{registry.get('make')} {registry.get('model')}"))
+    seen_makes = seen_words & KNOWN_MAKES
+    make_differs = bool(seen_makes) and not (seen_makes & registered)
+    body_seen = _group(seen.get("body_type"), BODY_GROUPS)
+    body_registered = _group(registry.get("body_type"), BODY_GROUPS)
+    body_differs = bool(body_seen and body_registered and body_seen != body_registered)
+    colour_seen = _group(seen.get("colour"), COLOUR_GROUPS)
+    colour_registered = _group(registry.get("colour"), COLOUR_GROUPS)
+    colour_differs = bool(colour_seen and colour_registered and colour_seen != colour_registered)
+    if not (make_differs or body_differs or colour_differs):
+        return None
+    shown = " ".join(str(part) for part in (seen.get("colour"), seen_text or seen.get("body_type"))
+                     if part)
+    on_record = " ".join(str(part) for part in (registry.get("colour"), registry.get("make"),
+                                                registry.get("model")) if part)
+    message = f"Photos show a {shown}; this plate is registered to a {on_record}."
+    return ("HIGH" if make_differs or body_differs else "MEDIUM"), message
+
+
+def registry_flags(fields, registry, seen=None, accident_date=None):
+    """Cross-checks against the vehicle's registration record."""
+    flags = []
+    plate = _norm_reg(registry.get("plate"))
+    reg_rc = get_field(fields, "registration_number_rc")
+    if reg_rc and _norm_reg(reg_rc) != plate:
+        flags.append({
+            "rule": "registry_rc_mismatch", "severity": "HIGH",
+            "message": f"The RC shows registration '{reg_rc}', but this claim is for {plate}.",
+            "evidence": ["registration_number_rc", "registry.plate"],
+        })
+    owner_rc = get_field(fields, "owner_name_rc")
+    owner = registry.get("owner_name")
+    if owner_rc and owner and name_match(owner_rc, owner) == "mismatch":
+        flags.append({
+            "rule": "registry_owner_mismatch", "severity": "HIGH",
+            "message": f"The RC owner ('{owner_rc}') is not the registered owner of {plate}.",
+            "evidence": ["owner_name_rc", "registry.owner_name"],
+        })
+    mismatch = appearance_mismatch(registry, seen)
+    if mismatch:
+        severity, message = mismatch
+        flags.append({
+            "rule": "registry_vehicle_mismatch", "severity": severity, "message": message,
+            "evidence": ["photos", "registry.make", "registry.colour", "registry.body_type"],
+        })
+    if registry.get("policy_type") == "third_party_only":
+        flags.append({
+            "rule": "policy_third_party_only", "severity": "HIGH",
+            "message": f"The policy on {plate} is third-party only; own damage is not covered.",
+            "evidence": ["registry.policy_type"],
+        })
+    elif accident_date:
+        start = parse_date(registry.get("policy_start"))[0]
+        end = parse_date(registry.get("policy_end"))[0]
+        if start and end and not (start <= accident_date <= end):
+            flags.append({
+                "rule": "policy_not_active", "severity": "HIGH",
+                "message": (
+                    f"Accident date {accident_date.isoformat()} falls outside the registered "
+                    f"policy period {start.isoformat()} to {end.isoformat()} "
+                    f"({registry.get('insurer')})."
+                ),
+                "evidence": ["accident_date", "registry.policy_start", "registry.policy_end"],
+            })
+    return flags
+
+
+def registry_notes(fields, registry):
+    """INFO about the registered owner: a partial name match."""
+    owner_rc = get_field(fields, "owner_name_rc")
+    owner = (registry or {}).get("owner_name")
+    if owner_rc and owner and name_match(owner_rc, owner) == "partial":
+        return [{
+            "rule": "registry_owner_partial_match", "severity": "INFO",
+            "message": (f"The RC owner ('{owner_rc}') matches the registered owner "
+                        f"('{owner}') in part."),
+            "evidence": ["owner_name_rc", "registry.owner_name"],
+        }]
+    return []
+
+
+def vehicle_matches_registry(registry, seen):
+    """How well a photographed vehicle matches the record: make +2, body and
+    colour +1 each (-1 when they differ); a different make is -10."""
+    if not registry or not seen:
+        return 0
+    seen_words = set(_words(seen.get("make_model")))
+    registered = set(_words(f"{registry.get('make')} {registry.get('model')}"))
+    seen_makes = seen_words & KNOWN_MAKES
+    score = 0
+    if seen_makes:
+        score += 2 if seen_makes & registered else -10
+    elif seen_words & registered:
+        score += 2
+    body = (_group(seen.get("body_type"), BODY_GROUPS), _group(registry.get("body_type"), BODY_GROUPS))
+    if all(body):
+        score += 1 if body[0] == body[1] else -1
+    colour = (_group(seen.get("colour"), COLOUR_GROUPS), _group(registry.get("colour"), COLOUR_GROUPS))
+    if all(colour):
+        score += 1 if colour[0] == colour[1] else -1
+    return score
+
+
 def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None,
-              vehicles=None, claimable_count: int = 0, forensics=None):
+              vehicles=None, claimable_count: int = 0, forensics=None, registry=None,
+              seen=None):
+    """registry: the plate's registration record (mock VAHAN), when known.
+    seen: {"colour", "make_model", "body_type"} of the claimed vehicle in the photos."""
     flags = []
     damage = damage or []
 
@@ -447,10 +593,13 @@ def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None
             "evidence": ["dl_expiry_date", "accident_date"],
         })
 
-    # 4. policy_not_active
+    # 4. policy_not_active. The registry is the source of truth for the
+    #    policy when there is one; the documents only without it.
     p_start = parsed_dates["policy_start_date"]
     p_end = parsed_dates["policy_end_date"]
-    if acc_date and (p_start or p_end):
+    if registry:
+        flags.extend(registry_flags(fields, registry, seen, acc_date))
+    elif acc_date and (p_start or p_end):
         if (p_start and acc_date < p_start) or (p_end and acc_date > p_end):
             flags.append({
                 "rule": "policy_not_active",

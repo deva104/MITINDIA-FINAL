@@ -22,9 +22,9 @@ import whatsapp
 from forensics import DUPLICATE_DISTANCE, prepare_uploaded_image
 
 try:
-    from helpers import read_all, seed_session
+    from helpers import guided, read_all, seed_session, stub_slots
 except ImportError:
-    from tests.helpers import read_all, seed_session
+    from tests.helpers import guided, read_all, seed_session, stub_slots
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -277,14 +277,17 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(old_id, session["photos"])
         self.assertFalse(session["analysing"])
 
-    async def test_photo_during_pending_choice_starts_over(self):
+    async def test_photo_during_pending_choice_is_not_added_to_the_assessed_claim(self):
+        # Changed with the guided flow: a pending choice belongs to an open,
+        # assessed claim, and a new photo cannot change that assessment.
         self._pending([
             {"label": "White Kia Sedan", "status": "claimable"},
             {"label": "Black SUV", "status": "claimable"},
         ], "choose")
+        whatsapp.get_session("user").update(stage="open_claim", claim_id="CLM-EDGE")
         sent = AsyncMock()
         with patch.object(main, "download_media", AsyncMock(return_value=jpeg_bytes())), \
-                patch.object(main, "send_text", sent):
+                patch.object(main, "send_text", sent), stub_slots():
             await main.handle_wa_message({
                 "from": "user",
                 "id": "fresh-photo",
@@ -292,10 +295,12 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
                 "image": {"id": "media"},
             })
 
-        sent.assert_awaited_once_with("user", whatsapp.CHOICE_CLEARED_REPLY)
+        sent.assert_awaited_once_with(
+            "user", "*CLM-EDGE* has already been assessed, so new damage photos cannot be "
+                    "added to it. Reply *MENU* to file a new claim.")
         session = whatsapp.SESSIONS["user"]
-        self.assertIsNone(session["pending_choice"])
-        self.assertEqual(len(session["photos"]), 1)
+        self.assertIsNotNone(session["pending_choice"])
+        self.assertEqual(len(session["photos"]), 0)
 
     async def test_stale_awaiting_docs_text_reports_the_expiry(self):
         seed_session(
@@ -304,7 +309,7 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
         )
         sent = AsyncMock()
         process = AsyncMock()
-        with patch.object(main, "send_text", sent), \
+        with patch.object(main, "send_text", sent), patch.object(whatsapp, "send_text", sent), \
                 patch.object(main, "process_session", process):
             await main.handle_wa_message({
                 "from": "user",
@@ -316,17 +321,20 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
         process.assert_not_awaited()
         sent.assert_awaited_once_with(
             "user",
-            "Your earlier photos and documents expired after 30 minutes. "
-            "Please send them again.",
+            "Your session timed out after 30 minutes of inactivity. The photos and "
+            "documents you sent were removed.\n\n" + whatsapp.WELCOME,
         )
-        self.assertNotIn("user", whatsapp.SESSIONS)
+        self.assertEqual(whatsapp.SESSIONS["user"].get("stage"), "menu")
+        self.assertEqual(db.list_session_media("user"), [])
 
     async def test_same_photo_twice_is_counted_once_without_a_fraud_flag(self):
         payload = jpeg_bytes()
         sent = AsyncMock()
         download = AsyncMock(return_value=payload)
+        guided("user")
         with patch.object(main, "download_media", download), \
-                patch.object(main, "send_text", sent):
+                patch.object(main, "send_text", sent), patch.object(whatsapp, "send_text", sent), \
+                stub_slots():
             await main.handle_wa_message({
                 "from": "user", "id": "tap-1", "type": "image", "image": {},
             })
@@ -341,7 +349,8 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent.await_count, 2)
         for call in sent.await_args_list:
             self.assertNotIn("duplicate", call.args[1].lower())
-            self.assertIn("Photo received (1 total)", call.args[1])
+        self.assertIn("Photo received (1 total)", sent.await_args_list[0].args[1])
+        self.assertEqual(sent.await_args_list[1].args[1], "You already sent that damage photo.")
 
         stored = db.media_get(session["photos"][0])
         self.assertIsNotNone(stored)
@@ -357,25 +366,28 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["verdict"], "clean")
 
     async def test_done_and_skip_phrases(self):
+        # Guided flow: SKIP at the last step, DONE after the photos; both
+        # analyse with whatever was sent (skip_missing is always True).
         process = AsyncMock()
-        for text, skip in (
-            ("skip", True),
-            ("Skip", True),
-            (" SKIP ", True),
-            ("हो गया", False),
-            ("ho gaya", False),
-            ("Done", False),
+        sent = AsyncMock()
+        for text, step in (
+            ("skip", 4), ("Skip", 4), (" SKIP ", 4), ("skip.", 4),
+            ("हो गया", 1), ("ho gaya", 1), ("Done", 1), ("DONE!", 1),
         ):
             seed_session("user", photos=1, updated=time.time())
-            with patch.object(main, "process_session", process):
+            guided("user", step=step, skip=("rc", "driving_licence") if step == 4
+                   else ("rc", "driving_licence", "claim_form"))
+            with patch.object(main, "process_session", process), \
+                    patch.object(whatsapp, "send_text", sent):
                 await main.handle_wa_message({
                     "from": "user",
                     "id": f"text-{text}",
                     "type": "text",
                     "text": {"body": text},
                 })
-            process.assert_awaited_with("user", skip_missing=skip)
+            process.assert_awaited_with("user", skip_missing=True)
             process.reset_mock()
+            whatsapp.SESSIONS.clear()
 
     async def test_two_senders_stay_isolated(self):
         (a,), _ = seed_session("aaa", photos=[jpeg_bytes(color=(1, 99, 1))], updated=time.time())
@@ -495,8 +507,10 @@ class HostileInputTests(unittest.IsolatedAsyncioTestCase):
         buffer = io.BytesIO()
         image.save(buffer, format="HEIF")
         sent = AsyncMock()
+        guided("user")
         with patch.object(main, "download_media", AsyncMock(return_value=buffer.getvalue())), \
-                patch.object(main, "send_text", sent):
+                patch.object(main, "send_text", sent), patch.object(whatsapp, "send_text", sent), \
+                stub_slots():
             await main.handle_wa_message({
                 "from": "user",
                 "id": "heic-doc",
@@ -644,17 +658,18 @@ class HostileInputTests(unittest.IsolatedAsyncioTestCase):
             ["bogus-groq", "bogus-groq", "bogus-gemini", "bogus-gemini",
              "bogus-openrouter", "bogus-openrouter"] * 2,
         )
-        self.assertEqual(
-            whatsapp.format_reply(payload),
-            "\n".join([
-                "*Analysis unavailable*",
-                "",
-                "We could not complete the automated assessment right now.",
-                "Your claim *CLM-DOWN* has been escalated to a human assessor.",
-                "",
-                "You do not need to resend anything.",
-            ]),
-        )
+        result = "\n".join([
+            "*Analysis unavailable*",
+            "",
+            "We could not complete the automated assessment right now.",
+            "Your claim *CLM-DOWN* has been escalated to a human assessor.",
+            "",
+            "You do not need to resend anything.",
+        ])
+        # Since the guided flow, every result ends with the tracking footer.
+        self.assertEqual(whatsapp.format_reply(payload),
+                         result + "\n\n" + whatsapp.case_footer(payload))
+        self.assertIn("Tracking ID: *CLM-DOWN*", whatsapp.format_reply(payload))
         saved = db.get_claim("CLM-DOWN")
         self.assertEqual(saved["status"], "error")
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")

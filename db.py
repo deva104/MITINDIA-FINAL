@@ -85,6 +85,23 @@ CREATE TABLE IF NOT EXISTS wa_session_media (
     received_at  REAL NOT NULL,
     UNIQUE (wa_id, sha256, page)
 );
+CREATE TABLE IF NOT EXISTS vehicle_registry (
+    plate      TEXT PRIMARY KEY,
+    record_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS claim_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id   TEXT NOT NULL,
+    event      TEXT NOT NULL,
+    detail     TEXT,
+    actor      TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS assessors (
+    id    TEXT PRIMARY KEY,
+    name  TEXT NOT NULL,
+    city  TEXT NOT NULL
+);
 """
 
 POSTGRES_SCHEMA = (
@@ -172,6 +189,29 @@ POSTGRES_SCHEMA = (
         UNIQUE (wa_id, sha256, page)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS vehicle_registry (
+        plate       TEXT PRIMARY KEY,
+        record_json TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS claim_events (
+        id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        claim_id   TEXT NOT NULL,
+        event      TEXT NOT NULL,
+        detail     TEXT,
+        actor      TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS assessors (
+        id   TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        city TEXT NOT NULL
+    )
+    """,
 )
 
 # Columns added after a table first shipped. CREATE TABLE IF NOT EXISTS does not
@@ -179,8 +219,13 @@ POSTGRES_SCHEMA = (
 ADDED_COLUMNS = (
     ("files", "source_sha256", "TEXT"),
     ("files", "source_bytes", "BIGINT"),
+    # The guided WhatsApp flow's slot for an item: photo, rc,
+    # driving_licence or claim_form. Set at insert, so albums cannot race.
+    ("wa_session_media", "slot", "TEXT"),
 )
 
+# Rows tests remove between cases. The registry and the assessors are
+# reference data, loaded at startup, and are not reset.
 TABLES = (
     "claims",
     "files",
@@ -191,6 +236,7 @@ TABLES = (
     "wa_sessions",
     "wa_last_inbound",
     "wa_session_media",
+    "claim_events",
 )
 
 
@@ -985,15 +1031,16 @@ def clear_last_inbound():
         conn.close()
 
 
-SESSION_MEDIA_COLUMNS = "id, wa_id, media_id, kind, sha256, page, source_bytes, received_at"
+SESSION_MEDIA_COLUMNS = "id, wa_id, media_id, kind, sha256, page, source_bytes, received_at, slot"
 
 
-def add_session_media(wa_id, media_id, kind, sha256, page=0, source_bytes=None, received_at=None):
+def add_session_media(wa_id, media_id, kind, sha256, page=0, source_bytes=None, received_at=None,
+                      slot=None):
     """Append one item to a WhatsApp session. Returns the row id, or None when
     the same content (wa_id, sha256, page) is already in the session."""
     values = (
         str(wa_id), media_id, kind, sha256, int(page), source_bytes,
-        time.time() if received_at is None else float(received_at),
+        time.time() if received_at is None else float(received_at), slot,
     )
     conn = get_conn()
     try:
@@ -1001,8 +1048,8 @@ def add_session_media(wa_id, media_id, kind, sha256, page=0, source_bytes=None, 
             row = conn.execute(
                 """
                 INSERT INTO wa_session_media
-                    (wa_id, media_id, kind, sha256, page, source_bytes, received_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (wa_id, media_id, kind, sha256, page, source_bytes, received_at, slot)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (wa_id, sha256, page) DO NOTHING
                 RETURNING id
                 """,
@@ -1013,8 +1060,8 @@ def add_session_media(wa_id, media_id, kind, sha256, page=0, source_bytes=None, 
             cursor = conn.execute(
                 """
                 INSERT INTO wa_session_media
-                    (wa_id, media_id, kind, sha256, page, source_bytes, received_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (wa_id, media_id, kind, sha256, page, source_bytes, received_at, slot)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (wa_id, sha256, page) DO NOTHING
                 """,
                 values,
@@ -1168,6 +1215,118 @@ def list_claims():
                 "claimable_count": payload.get("claimable_count"),
                 "flags": payload.get("flags", []),
                 "estimate": payload.get("estimate", {}),
+                "plate": (payload.get("registry") or {}).get("plate") or payload.get("plate"),
+                "assessor": payload.get("assessor"),
             }
         )
     return out
+
+
+# --- mock VAHAN registry, claim timeline, assessors -------------------------
+
+def registry_replace(records):
+    """Load the registry: every record keyed by its normalised plate."""
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM vehicle_registry")
+        records = list(records)
+        if records:
+            # One statement: a remote database pays one round trip, not one per row.
+            values = ", ".join("(?, ?)" for _ in records)
+            params = []
+            for record in records:
+                params += [record["plate"], json.dumps(record, default=str)]
+            conn.execute(f"INSERT INTO vehicle_registry (plate, record_json) VALUES {values}", params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def registry_get(plate):
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT record_json FROM vehicle_registry WHERE plate = ?", (plate,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return json.loads(row["record_json"]) if row else None
+
+
+def registry_count():
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT COUNT(*) AS total FROM vehicle_registry").fetchone()
+    finally:
+        conn.close()
+    return int(row["total"] or 0)
+
+
+def claim_event_add(claim_id, event, detail=None, actor=None, created_at=None):
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO claim_events (claim_id, event, detail, actor, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (claim_id, event, detail, actor, as_utc_iso(created_at) or utc_now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def claim_events_for(claim_id):
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT event, detail, actor, created_at FROM claim_events "
+            "WHERE claim_id = ? ORDER BY id",
+            (claim_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [{**dict(row), "created_at": as_utc_iso(row["created_at"])} for row in rows]
+
+
+def assessors_seed(assessors):
+    conn = get_conn()
+    try:
+        for item in assessors:
+            exists = conn.execute(
+                "SELECT id FROM assessors WHERE id = ?", (item["id"],)
+            ).fetchone()
+            if not exists:
+                conn.execute(
+                    "INSERT INTO assessors (id, name, city) VALUES (?, ?, ?)",
+                    (item["id"], item["name"], item["city"]),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def assessors_list():
+    conn = get_conn()
+    try:
+        rows = conn.execute("SELECT id, name, city FROM assessors ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def assessor_assignment_counts():
+    """{assessor_id: claims assigned so far}, from the timeline."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT actor, COUNT(*) AS total FROM claim_events "
+            "WHERE event = 'assessor_assigned' GROUP BY actor"
+        ).fetchall()
+    finally:
+        conn.close()
+    return {row["actor"]: int(row["total"]) for row in rows}
+
+
+def claims_for_number(wa_id):
+    """Every claim submitted from this WhatsApp number, newest first."""
+    return [claim for claim in list_claims() if str(claim.get("from_number") or "") == str(wa_id)]

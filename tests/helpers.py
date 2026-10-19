@@ -88,3 +88,24 @@ def read_all(paths):
         with open(path, "rb") as handle:
             out.append(handle.read())
     return out
+
+
+def guided(wa_id, step=1, skip=("rc", "driving_licence", "claim_form"), record=None):
+    """Put a number in the guided flow's collection step, as after MENU, 1,
+    a plate and YES. Steps 2-4 are skipped by default, so DONE after the
+    photos analyses at once, as the flow before the registry did."""
+    import whatsapp
+
+    whatsapp.get_session(wa_id).update(
+        stage="collect", step=step, skipped=list(skip), registry=record,
+        plate=(record or {}).get("plate"), updated=time.time(),
+    )
+
+
+def stub_slots():
+    """Slot classification without a provider: images are damage photos,
+    PDFs claim forms."""
+    import whatsapp
+
+    return patch.object(whatsapp, "classify_slot",
+                        lambda data, is_pdf, step: "claim_form" if is_pdf else "photo")

@@ -27,6 +27,8 @@ load_dotenv()
 from db import (
     audit_log_add,
     audit_log_for_claim,
+    claim_event_add,
+    claim_events_for,
     current_claim_id,
     database_backend,
     database_ok,
@@ -58,11 +60,16 @@ from rules import (
     assess_confidence,
     build_estimate,
     establish_documents,
+    get_field,
     reported_confidence,
+    registry_notes,
     route_classification,
     identity_notes,
     run_rules,
+    vehicle_matches_registry,
 )
+import assessors
+import registry as vahan
 from vision import (
     provenance,
     provider_status,
@@ -225,6 +232,12 @@ WARM_UP = {"thread": None}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    try:
+        # Reference data: the mock VAHAN registry and the assessors.
+        vahan.load()
+        assessors.seed()
+    except Exception as error:
+        print(f"[startup] registry or assessors not loaded: {type(error).__name__}", flush=True)
     # In the background: the server answers at once, the first claim does not
     # pay for scipy's import.
     WARM_UP["thread"] = threading.Thread(target=warm_up, name="warm-up", daemon=True)
@@ -346,6 +359,9 @@ OVERRIDE_ACTIONS = {
 }
 SEVERITY_VALUES = {"minor", "moderate", "severe"}
 DECISION_VALUES = {"approved", "rejected", "more_info"}
+DECISION_EVENTS = {
+    "approved": "approved", "rejected": "rejected", "more_info": "more_info_requested",
+}
 WHATSAPP_SERVICE_WINDOW_SECONDS = 24 * 60 * 60
 
 
@@ -492,6 +508,12 @@ def build_claim_response(payload):
             "at": row.get("created_at"),
             "reason": row.get("reason"),
         }
+    try:
+        response["events"] = claim_events_for(response.get("claim_id"))
+    except Exception:
+        response["events"] = []
+    response["next_step"] = next_step_text(
+        response, (response.get("final_decision") or {}).get("value"))
     return response
 
 
@@ -561,6 +583,9 @@ async def _notify_whatsapp_decision(
                 f"{reason.rstrip('.')}.\n"
                 "Reply here with the requested photos or documents."
             )
+        assessor = payload.get("assessor") or {}
+        if assessor.get("name"):
+            message += f"\nTracking ID: {claim_id} · Assessor: {assessor['name']}"
 
         sent = await send_text(wa_id, message)
         if sent:
@@ -649,6 +674,16 @@ async def override_claim(claim_id: str, request: OverrideRequest):
     await asyncio.to_thread(
         audit_log_add, claim_id, actor, action, target, before, after, reason
     )
+    # The customer-facing timeline: decisions by name, other overrides as one kind.
+    event = (
+        DECISION_EVENTS.get(after["value"], "decision_recorded") if action == "set_decision"
+        else "assessment_updated"
+    )
+    try:
+        await asyncio.to_thread(claim_event_add, claim_id, event, reason, actor)
+    except Exception as error:
+        print(f"[case] {claim_id}: timeline event not recorded: {type(error).__name__}",
+              flush=True)
     if action == "set_decision":
         await _notify_whatsapp_decision(
             claim_id, payload, actor, after["value"], reason
@@ -1063,9 +1098,76 @@ def build_vehicle_groups(photos, damage, excluded, photo_urls=None):
     return vehicles
 
 
+def seen_vehicle(vehicle, photos):
+    """{"colour", "make_model", "body_type"} of a vehicle group, from its photos."""
+    if not vehicle:
+        return None
+    names = {os.path.basename(str(name)).lower() for name in vehicle.get("photos") or []}
+    seen = {}
+    for photo in photos or []:
+        if not isinstance(photo, dict):
+            continue
+        if os.path.basename(str(photo.get("source_photo") or "")).lower() not in names:
+            continue
+        for key in ("colour", "make_model", "body_type"):
+            if photo.get(key) and not seen.get(key):
+                seen[key] = photo.get(key)
+    return seen or None
+
+
+def finalise_payload(payload, forced_review_reasons=None):
+    """Undetermined list, decision and reasons for a built payload."""
+    payload["undetermined"] = build_undetermined(payload)
+    assessment = assess_confidence(payload)
+    payload["decision"] = assessment["decision"]
+    payload["decision_reasons"] = assessment["reasons"]
+    payload["confidence"] = assessment["confidence"]
+    forced = [str(reason).strip() for reason in forced_review_reasons or [] if str(reason).strip()]
+    if forced and payload["decision"] != "reject":
+        payload["decision"] = "needs_review"
+        payload["decision_reasons"] = list(dict.fromkeys(forced + payload["decision_reasons"]))
+    payload["next_step"] = next_step_text(payload)
+    return payload
+
+
+def next_step_text(payload, final_decision=None):
+    """What happens next, and when, for the customer and the console."""
+    final = final_decision or (payload.get("final_decision") or {}).get("value")
+    if final == "approved":
+        return "Approved. The final amount is confirmed against the repair invoice."
+    if final == "rejected":
+        return "Not approved. Your assessor can explain the decision."
+    if final == "more_info":
+        return "Send the requested documents here and they will be added to this claim."
+    if (payload.get("estimate") or {}).get("requires_survey"):
+        # IRDAI Master Circular 2024: a surveyor is allocated within 24 hours.
+        return "A surveyor will contact you within 24 hours to inspect the vehicle."
+    if payload.get("decision") == "auto_assess":
+        return "Approval expected within 24 hours."
+    return "Your assessor will review this within 1 working day."
+
+
+def open_case(payload):
+    """Assign the assessor and write the claim's first timeline events."""
+    payload["tracking_id"] = payload["claim_id"]
+    claim_id = payload["claim_id"]
+    try:
+        assessor = assessors.assign((payload.get("registry") or {}).get("city"))
+        payload["assessor"] = assessor
+        claim_event_add(claim_id, "submitted", f"via {payload.get('source') or 'web'}")
+        claim_event_add(claim_id, "assessor_assigned", assessor["name"], actor=assessor["id"])
+        if (payload.get("estimate") or {}).get("requires_survey"):
+            claim_event_add(claim_id, "survey_scheduled", "surveyor to contact within 24 hours")
+    except Exception as error:
+        # The assessment stands without them; the console shows no assessor.
+        print(f"[case] {claim_id}: assessor or timeline not recorded: "
+              f"{type(error).__name__}", flush=True)
+        payload.setdefault("assessor", None)
+
+
 async def analyse_claim(
     claim_id, doc_paths, photo_paths, source="web", from_number=None,
-    forced_review_reasons=None, page_documents=None,
+    forced_review_reasons=None, page_documents=None, registry_record=None,
 ):
     """Staged pipeline shared by the HTTP upload route and the WhatsApp webhook.
 
@@ -1081,7 +1183,7 @@ async def analyse_claim(
     return await asyncio.to_thread(
         _analyse_claim_in_slot,
         claim_id, doc_paths, photo_paths, source, from_number,
-        forced_review_reasons, page_documents,
+        forced_review_reasons, page_documents, registry_record,
     )
 
 
@@ -1092,9 +1194,12 @@ def _analyse_claim_in_slot(*args):
 
 def _analyse_claim_sync(
     claim_id, doc_paths, photo_paths, source="web", from_number=None,
-    forced_review_reasons=None, page_documents=None,
+    forced_review_reasons=None, page_documents=None, registry_record=None,
 ):
+    """registry_record: the plate's mock-VAHAN record (WhatsApp passes the one
+    the customer confirmed); without it, the RC's registration is looked up."""
     started = time.perf_counter()
+    case = {"registry": registry_record, "selected_group": None, "notes": []}
     page_documents = [
         {"name": str(document.get("name") or "document"),
          "paths": [path for path in document.get("paths") or [] if path]}
@@ -1160,6 +1265,7 @@ def _analyse_claim_sync(
     def make_payload(status, stopped_at, fields=None, damage=None, forensics=None,
                      flags=None, estimate=None, vehicle_description="", photos=None,
                      vehicles=None, claimable_count=0):
+        record = case["registry"]
         payload = {
             "claim_id": claim_id,
             "created_at": utc_now_iso(),
@@ -1188,20 +1294,19 @@ def _analyse_claim_sync(
             "estimate": estimate if estimate is not None else build_estimate([]),
             "vehicles": vehicles or [],
             "claimable_count": claimable_count,
+            "registry": record,
+            "plate": (record or {}).get("plate") or vahan.normalise_plate(
+                get_field(fields or [], "registration_number_rc")) or None,
+            "selected_vehicle_group": case["selected_group"],
+            "direct_documents": [document["name"] for document in direct_documents],
+            "forced_review_reasons": list(forced_review_reasons),
         }
-        payload["undetermined"] = build_undetermined(payload)
-        assessment = assess_confidence(payload)
-        payload["decision"] = assessment["decision"]
-        payload["decision_reasons"] = assessment["reasons"]
-        payload["confidence"] = assessment["confidence"]
-        if forced_review_reasons and payload["decision"] != "reject":
-            payload["decision"] = "needs_review"
-            payload["decision_reasons"] = list(dict.fromkeys(
-                forced_review_reasons + payload["decision_reasons"]
-            ))
-        return payload
+        payload["notes"] = (payload["notes"] + registry_notes(fields or [], record)
+                            + case["notes"])
+        return finalise_payload(payload, forced_review_reasons)
 
     def finish(payload):
+        open_case(payload)
         save_claim(claim_id, payload)
         print(f"[analyze] {claim_id} status={payload['status']} "
               f"stopped_at={payload['stopped_at']} total {time.perf_counter() - started:.2f}s", flush=True)
@@ -1286,6 +1391,8 @@ def _analyse_claim_sync(
         reset_cache_tracking()
         extraction = extract_fields(documents) if documents else dict(NOT_EXTRACTED)
         fields = extraction["fields"]
+        if case["registry"] is None:
+            case["registry"] = vahan.lookup(get_field(fields, "registration_number_rc"))
         document_check = establish_documents(
             classifications,
             extraction,
@@ -1345,10 +1452,30 @@ def _analyse_claim_sync(
 
         # Stage 3 - rules and estimate
         mark = time.perf_counter()
-        primary_vehicle = next(
-            (vehicle for vehicle in vehicles if vehicle.get("status") == "claimable"),
-            None,
-        )
+        claimable = [vehicle for vehicle in vehicles if vehicle.get("status") == "claimable"]
+        primary_vehicle = claimable[0] if claimable else None
+        rules_claimable = claimable_count
+        if case["registry"] and len(claimable) > 1:
+            # The registered vehicle is the claim; another vehicle in the
+            # photos (the other party) is evidence. Ask only when unclear.
+            scored = sorted(
+                ((vehicle_matches_registry(case["registry"], seen_vehicle(vehicle, photos)), index)
+                 for index, vehicle in enumerate(claimable)),
+                reverse=True,
+            )
+            if scored[0][0] >= 2 and scored[0][0] > scored[1][0]:
+                primary_vehicle = claimable[scored[0][1]]
+                case["selected_group"] = primary_vehicle.get("group")
+                rules_claimable = 1
+                others = [vehicle.get("label") for vehicle in claimable if vehicle is not primary_vehicle]
+                case["notes"].append({
+                    "rule": "other_vehicle_in_photos", "severity": "INFO",
+                    "message": (
+                        f"The photos also show {', '.join(str(label) for label in others)}. "
+                        f"The claim is for the registered vehicle, {primary_vehicle.get('label')}."
+                    ),
+                    "evidence": others,
+                })
         damage = list(primary_vehicle.get("damage") or []) if primary_vehicle else []
         estimate = (
             primary_vehicle.get("estimate")
@@ -1358,8 +1485,9 @@ def _analyse_claim_sync(
         flags = bundle_flags + run_rules(fields, damage, photo_count=len(clean_paths),
                                          is_vehicle=result.get("is_vehicle"), photos=photos,
                                          vehicles=vehicles,
-                                         claimable_count=claimable_count,
-                                         forensics=deep)
+                                         claimable_count=rules_claimable,
+                                         forensics=deep, registry=case["registry"],
+                                         seen=seen_vehicle(primary_vehicle, photos))
         stage_done("stage3_rules", mark)
 
         return finish(make_payload("analysed", None, fields=fields, damage=damage,
@@ -1500,7 +1628,10 @@ def _document_receipt(count, truncated_from=None):
     return text
 
 
-async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".jpg"):
+async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".jpg",
+                         classify_step=None, on_stored=None):
+    """classify_step: the guided step, to put the item in its slot (photo,
+    rc, driving_licence, claim_form). on_stored(slot) replaces the receipt."""
     media_obj = media_obj or {}
     session = get_session(wa_id)
     if bucket == "photos" and len(session["photos"]) >= wa.MAX_IMAGES_PER_CLAIM:
@@ -1562,12 +1693,17 @@ async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".j
             wa.UNREADABLE_IMAGE_REPLY if bucket == "photos" else wa.UNREADABLE_PDF_REPLY,
         )
         return
+    slot = None
+    if classify_step is not None:
+        # Whatever step the customer is on, the item goes in its own slot.
+        slot = await asyncio.to_thread(
+            wa.classify_slot, items[0][0], bucket != "photos", classify_step)
 
     # From the inserts to the replies there is no await: appending media and
     # reading the session happen together, so concurrent arrivals cannot
     # interleave, and the unique (wa_id, sha256, page) key absorbs a resend.
     row_ids = [
-        wa.add_session_media(wa_id, media_id, kind, source_sha, page, source_bytes)
+        wa.add_session_media(wa_id, media_id, kind, source_sha, page, source_bytes, slot=slot)
         for media_id, (_, _, kind, page) in zip(media_ids, items)
     ]
     added = any(row_id is not None for row_id in row_ids)
@@ -1588,14 +1724,16 @@ async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".j
         return
 
     if not added:
-        if bucket == "photos":
+        if on_stored is not None:
+            await send_text(wa_id, f"You already sent that {wa.SLOT_LABELS.get(slot, 'file')}.")
+        elif bucket == "photos":
             await send_text(wa_id, _photo_receipt(len(session["photos"])))
         else:
             await send_text(wa_id, _document_receipt(session["doc_count"]))
         return
 
     choice_cleared = False
-    if session.get("pending_choice") and not analysing:
+    if session.get("pending_choice") and not analysing and on_stored is None:
         session = wa.reset_session(wa_id)
         choice_cleared = True
 
@@ -1611,6 +1749,9 @@ async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".j
                 await send_text(wa_id, wa.IMAGE_LIMIT_REPLY)
             return
 
+    if on_stored is not None:
+        await on_stored(slot)
+        return
     if choice_cleared:
         if bucket == "photos":
             await send_text(wa_id, wa.CHOICE_CLEARED_REPLY)
@@ -1674,10 +1815,178 @@ async def _answer_unhandled(wa_id, message_type, sent_at):
     if session["photos"] or session["docs"]:
         await send_text(wa_id, wa.UNHANDLED_WITH_MEDIA_REPLY)
         return
-    await send_text(
-        wa_id,
-        "Please send a photo of the damaged vehicle to start a claim. " + wa.ACCEPTED_MEDIA,
+    if session.get("stage") in (None, "menu"):
+        await wa.show_welcome(wa_id)
+
+
+async def _receive_media(wa_id, message_id, media_obj, bucket, fallback_ext):
+    """Media by conversation stage. Decisions are made before the first await,
+    so the photos of one album agree on what to do."""
+    session = get_session(wa_id)
+    stage = session.get("stage")
+    if wa.is_analysing(wa_id) or session.get("analysing"):
+        await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext)
+        return
+    if stage == "collect":
+        async def collected(slot):
+            await wa.guided_media_received(wa_id, slot, process_session)
+        await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext,
+                              classify_step=session.get("step") or 1, on_stored=collected)
+        return
+    if stage == "open_claim" and session.get("claim_id"):
+        claim_id = session["claim_id"]
+
+        async def attach(slot):
+            await _attach_pending_documents(wa_id, claim_id)
+        await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext,
+                              classify_step=0, on_stored=attach)
+        return
+    if stage == "confirm_attach":
+        async def held(slot):
+            return None
+        await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext,
+                              classify_step=0, on_stored=held)
+        return
+    claim_id = wa.more_info_claim(wa_id)
+    if claim_id:
+        wa.set_conversation(wa_id, stage="confirm_attach", attach_claim_id=claim_id)
+
+        async def ask(slot):
+            await send_text(wa_id, f"Add this to *{claim_id}*? Reply *YES* or *NO*.")
+        await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext,
+                              classify_step=0, on_stored=ask)
+        return
+    # START. What was sent is kept for the claim; the menu is shown once.
+    first = stage != "menu"
+    wa.set_conversation(wa_id, stage="menu")
+
+    async def welcome(slot):
+        if first:
+            await send_text(wa_id, wa.WELCOME)
+    await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext, on_stored=welcome)
+
+
+ATTACH_LOCKS = {}
+DOCUMENT_SLOT_LABELS = {
+    "rc": "registration certificate", "driving_licence": "driving licence",
+    "claim_form": "claim form", "policy": "policy document",
+}
+
+
+async def _attach_pending_documents(wa_id, claim_id):
+    """Documents sent after the result join that claim: extraction and rules
+    run again on everything; the damage assessment is reused."""
+    lock = ATTACH_LOCKS.setdefault(claim_id, asyncio.Lock())
+    async with lock:
+        rows = await asyncio.to_thread(list_session_media, wa_id)
+        def slot_of(row):
+            return row.get("slot") or ("photo" if row["kind"] == "photo" else "claim_form")
+        photo_rows = [row for row in rows if slot_of(row) == "photo"]
+        doc_rows = [row for row in rows if slot_of(row) != "photo"]
+        if photo_rows:
+            await asyncio.to_thread(delete_session_media, wa_id, [row["id"] for row in photo_rows])
+            await send_text(wa_id, f"*{claim_id}* has already been assessed, so new damage photos "
+                                   "cannot be added to it. Reply *MENU* to file a new claim.")
+        if not doc_rows:
+            return
+        try:
+            old, new, labels = await asyncio.to_thread(_reassess_from_rows, wa_id, claim_id, doc_rows)
+        finally:
+            await asyncio.to_thread(delete_session_media, wa_id, [row["id"] for row in doc_rows])
+        if new is None:
+            await send_text(wa_id, f"We could not find *{claim_id}*. Reply *MENU* to start again.")
+            return
+        await send_text(wa_id, wa.attach_reply(claim_id, old, new, labels))
+
+
+def _reassess_from_rows(wa_id, claim_id, rows):
+    photos, page_documents, created, _, _ = wa._materialise_media(wa_id, rows)
+    try:
+        documents, classifications, labels = [], [], []
+        photo_rows = [row for row in rows if row["kind"] == "photo"]
+        for index, (row, (path, _, _)) in enumerate(zip(photo_rows, photos), 1):
+            slot = row.get("slot") or "claim_form"
+            name = f"{slot}-added-{index}.jpg"
+            documents.append({"name": name, "paths": [path],
+                              "doc_type": slot if slot in DOCUMENT_TYPES else None})
+            # The customer sent it as this document (its step or its classification).
+            classifications.append({"filename": name, "doc_type": slot, "confidence": 0.9,
+                                    "number_plate": None, "url": None})
+            labels.append(DOCUMENT_SLOT_LABELS.get(slot, "document"))
+        page_slots = [row.get("slot") for row in rows if row["kind"] == "document_page"]
+        for document in page_documents:
+            documents.append(dict(document, doc_type=None))
+            labels.append(DOCUMENT_SLOT_LABELS.get(page_slots[0] if page_slots else None, "document"))
+        old, new = reassess_claim(claim_id, documents, classifications, labels)
+        return old, new, list(dict.fromkeys(labels))
+    finally:
+        wa._release_materialised(created)
+
+
+def reassess_claim(claim_id, documents, classifications=(), labels=()):
+    """Add documents to a saved claim: extract them, then run the document
+    check, the rules and the decision again. Photos and the damage
+    assessment are reused as they are. Returns (before, after)."""
+    from gemini import _merge_fields
+
+    payload = get_claim(claim_id)
+    if not payload:
+        return None, None
+    before = copy.deepcopy(payload)
+    token = current_claim_id.set(claim_id)
+    try:
+        added = extract_fields(documents) if documents else dict(NOT_EXTRACTED)
+    finally:
+        current_claim_id.reset(token)
+    previous = payload.get("extraction") or {}
+    fields = _merge_fields(list(payload.get("fields") or []) + list(added.get("fields") or []))
+    read = list(previous.get("read") or []) + list(added.get("read") or [])
+    failed = list(previous.get("failed") or []) + list(added.get("failed") or [])
+    extraction = {
+        "status": "ok" if read and not failed else ("partial" if read else (
+            "failed" if failed else "not_attempted")),
+        "documents": int(previous.get("documents") or 0) + int(added.get("documents") or 0),
+        "read": read, "failed": failed, "error": failed[0]["error"] if failed else None,
+    }
+    payload["classifications"] = list(payload.get("classifications") or []) + list(classifications)
+    direct = list(payload.get("direct_documents") or []) + [
+        document["name"] for document in documents if not document.get("doc_type")]
+    check = establish_documents(
+        payload["classifications"], {**extraction, "fields": fields}, direct,
+        payload.get("required_documents") or required_document_types(),
     )
+    record = payload.get("registry") or vahan.lookup(get_field(fields, "registration_number_rc"))
+    payload.update(fields=fields, extraction=extraction, document_check=check,
+                   documents_received=dict(check["received"]), direct_documents=direct,
+                   registry=record, plate=(record or {}).get("plate") or payload.get("plate"))
+    photos = payload.get("photos") or []
+    vehicles = payload.get("vehicles") or []
+    selected = payload.get("selected_vehicle_group")
+    claimable = [vehicle for vehicle in vehicles if vehicle.get("status") == "claimable"]
+    primary = next((vehicle for vehicle in claimable if vehicle.get("group") == selected),
+                   claimable[0] if claimable else None)
+    if payload.get("status") == "analysed":
+        kept = [flag for flag in payload.get("flags") or []
+                if flag.get("rule") == "duplicate_photo_in_bundle"]
+        is_vehicle = True if any(isinstance(photo, dict) and photo.get("is_vehicle") is True
+                                 for photo in photos) else None
+        payload["flags"] = kept + run_rules(
+            fields, payload.get("damage") or [], photo_count=len(photos), is_vehicle=is_vehicle,
+            photos=photos, vehicles=vehicles,
+            claimable_count=1 if selected is not None else (payload.get("claimable_count") or 0),
+            forensics=payload.get("forensics") or [], registry=record,
+            seen=seen_vehicle(primary, photos),
+        )
+    notes = [note for note in payload.get("notes") or [] if note.get("rule") == "other_vehicle_in_photos"]
+    payload["notes"] = identity_notes(fields) + registry_notes(fields, record) + notes
+    finalise_payload(payload, payload.get("forced_review_reasons"))
+    save_claim(claim_id, payload)
+    try:
+        claim_event_add(claim_id, "documents_added",
+                        ", ".join(dict.fromkeys(labels)) or "documents")
+    except Exception as error:
+        print(f"[case] {claim_id}: timeline event not recorded: {type(error).__name__}", flush=True)
+    return before, payload
 
 
 async def handle_wa_message(message):
@@ -1707,45 +2016,30 @@ async def handle_wa_message(message):
         wa.sweep_idle_sessions()
         expiry_notice = wa.take_expiry_notice(wa_id)
         if expiry_notice:
-            await send_text(wa_id, expiry_notice)
+            # Say it timed out, then START; the message itself is not acted on.
+            await wa.show_welcome(wa_id, prefix=expiry_notice)
+            return
 
         if message_type == "image":
-            await _store_wa_media(wa_id, message_id, message.get("image") or {}, "photos")
+            await _receive_media(wa_id, message_id, message.get("image") or {}, "photos", ".jpg")
         elif message_type == "document":
             document = message.get("document") or {}
             if _is_image_media(document):
-                await _store_wa_media(
-                    wa_id,
-                    message_id,
-                    document,
-                    "photos",
-                    fallback_ext=_media_extension(document, ".jpg"),
-                )
+                await _receive_media(wa_id, message_id, document, "photos",
+                                     _media_extension(document, ".jpg"))
             else:
-                await _store_wa_media(wa_id, message_id, document, "docs", fallback_ext=".bin")
+                await _receive_media(wa_id, message_id, document, "docs", ".bin")
         elif message_type == "text":
             text = (message.get("text") or {}).get("body") or ""
-            if await wa.handle_pending_choice(wa_id, text):
-                return
+            command = wa.command_of(text)
             if wa.is_analysing(wa_id):
                 # DONE (or anything) mid-analysis: one line, never the greeting.
-                await send_text(wa_id, wa.ANALYSIS_BUSY_REPLY)
+                await send_text(wa_id, wa.HELP_TEXT if command == "help" else wa.ANALYSIS_BUSY_REPLY)
                 return
-            session = get_session(wa_id)
-            if session["photos"] or session["docs"]:
-                await process_session(
-                    wa_id,
-                    skip_missing=wa.is_skip_command(text),
-                )
-            elif expiry_notice:
+            if command not in ("menu", "end", "help") and await wa.handle_pending_choice(wa_id, text):
                 return
-            else:
-                await send_text(
-                    wa_id,
-                    "Send a photo of the damaged vehicle to start a claim. "
-                    "You can also attach the claim form, RC or driving licence. "
-                    "Reply DONE when you are done.",
-                )
+            await wa.handle_conversation_text(wa_id, text, process_session,
+                                              _attach_pending_documents)
         elif message_type in wa.UNSUPPORTED_REPLIES:
             await send_text(wa_id, wa.UNSUPPORTED_REPLIES[message_type])
         else:

@@ -24,8 +24,15 @@ import forensics
 import main
 import whatsapp
 
+try:
+    from helpers import guided
+except ImportError:
+    from tests.helpers import guided
 
-EXPIRED_PHOTOS = "Your earlier photos expired after 30 minutes. Please send them again."
+# Each test enters the guided flow at step 1 (as after MENU, 1, a plate and
+# YES), with steps 2-4 skipped, so photos and DONE analyse as before.
+EXPIRED_PHOTOS = ("Your session timed out after 30 minutes of inactivity. "
+                  "The photos you sent were removed.\n\n" + whatsapp.WELCOME)
 
 
 def patterned_jpeg(color, size=(320, 240)):
@@ -181,8 +188,10 @@ class K1RegressionTests(unittest.IsolatedAsyncioTestCase):
     # paths repeat for the same number, photo and position.
     async def test_same_number_resubmitting_a_photo_is_rejected_as_duplicate(self):
         photo = patterned_jpeg((200, 30, 30))
+        guided("910000000001")
         await self.photo("910000000001", "a1", photo)
         await self.text("910000000001", "a2", "Done")
+        guided("910000000001")  # a second claim: MENU, 1, plate, YES
         await self.photo("910000000001", "a3", photo)
         await self.text("910000000001", "a4", "Done")
 
@@ -214,6 +223,7 @@ class K1RegressionTests(unittest.IsolatedAsyncioTestCase):
     # Regression 2: concurrent media arrivals overwrote each other's session copy.
     async def test_photos_arriving_together_are_all_kept(self):
         first, second = patterned_jpeg((10, 10, 200)), patterned_jpeg((10, 200, 200))
+        guided("910000000002")
         await asyncio.gather(
             self.photo("910000000002", "b1", first, delay=0.05),
             self.photo("910000000002", "b2", second, delay=0.10),
@@ -233,6 +243,7 @@ class K1RegressionTests(unittest.IsolatedAsyncioTestCase):
     async def test_photo_over_two_megabytes_is_reencoded_not_rejected(self):
         photo = noise_jpeg()
         self.assertGreater(len(photo), 2 * 1024 * 1024)
+        guided("910000000003")
         await self.photo("910000000003", "c1", photo)
         self.assertEqual(
             self.replies_to("910000000003"),
@@ -269,11 +280,14 @@ class K1RegressionTests(unittest.IsolatedAsyncioTestCase):
     async def test_pdf_over_two_megabytes_is_stored_as_rendered_pages(self):
         pdf = large_pdf()
         self.assertGreater(len(pdf), 2 * 1024 * 1024)
+        guided("910000000004")
         await self.document("910000000004", "d1", pdf, "claim-form.pdf", "application/pdf")
         await self.document("910000000004", "d2", pdf, "claim-form.pdf", "application/pdf")
+        # The guided flow names the slot the PDF filled; a resend is noticed.
         self.assertEqual(self.replies_to("910000000004"), [
-            "Document received (1 total). Reply DONE when you are done.",
-            "Document received (1 total). Reply DONE when you are done.",
+            "That looks like your claim form — added to step 4. "
+            "Send more damage photos, or reply *DONE*.",
+            "You already sent that claim form.",
         ])
         await self.photo("910000000004", "d3", patterned_jpeg((90, 90, 30)))
         await self.text("910000000004", "d4", "Done")
@@ -303,6 +317,7 @@ class K1RegressionTests(unittest.IsolatedAsyncioTestCase):
 
     # Regression 4: an idle session vanished without telling the customer.
     async def test_expired_photos_are_reported_and_deleted(self):
+        guided("910000000005")
         await self.photo("910000000005", "e1", patterned_jpeg((120, 60, 10)))
         later = time.time() + whatsapp.PENDING_CHOICE_TIMEOUT + 60
         with patch("time.time", return_value=later):
@@ -320,6 +335,7 @@ class K1RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(orphans, 0)
 
     async def test_demo_reset_clears_sessions_and_session_media(self):
+        guided("910000000006")
         await self.photo("910000000006", "f1", patterned_jpeg((5, 150, 75)))
         main.demo_reset()
 
@@ -335,7 +351,8 @@ class K1RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(count("wa_session_media"), 0)
         await self.text("910000000006", "f2", "Done")
         self.assertEqual(self.assessed, [])
-        self.assertIn("Send a photo of the damaged vehicle", self.replies_to("910000000006")[-1])
+        # No session left: any message gets the START menu.
+        self.assertEqual(self.replies_to("910000000006")[-1], whatsapp.WELCOME)
 
 
 if __name__ == "__main__":

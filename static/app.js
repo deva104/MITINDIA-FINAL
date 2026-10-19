@@ -389,7 +389,7 @@
           <span class="claim-id">${esc(c.claim_id)}</span>
           ${claimPill(c)}
         </div>
-        <span class="claim-time">${esc(relTime(c.created_at))}</span>
+        <span class="claim-time">${esc(relTime(c.created_at))}${c.plate ? ` · <span class="mono">${esc(c.plate)}</span>` : ''}</span>
         <p class="claim-sum">${esc(summarise(c))}</p>
         ${c.source === 'whatsapp' ? `<div class="claim-source">${whatsappBadge(c)}</div>` : ''}
       </div>`).join('');
@@ -502,6 +502,7 @@
   
     renderUndetermined(p);
     renderDocuments(p);
+    renderCase(p);
     renderBars(p);
     renderVehicles(p);
     renderEvidence(p);
@@ -530,6 +531,68 @@
         ${item.impact ? `<span class="undetermined-impact">· ${esc(item.impact)}</span>` : ''}
       </div>`).join('');
     card.classList.remove('hidden');
+  }
+
+  /* ---------- case: registry record, assessor, timeline ---------- */
+  const EVENT_LABELS = {
+    submitted: 'Claim submitted',
+    assessor_assigned: 'Assessor assigned',
+    survey_scheduled: 'Survey scheduled',
+    documents_added: 'Documents added',
+    more_info_requested: 'More information requested',
+    approved: 'Approved',
+    rejected: 'Not approved',
+    assessment_updated: 'Assessment updated'
+  };
+
+  function kv(rows) {
+    return '<dl class="kv">' + rows.filter(r => r && r[1] != null && r[1] !== '').map(([k, v, cls]) =>
+      `<dt>${esc(k)}</dt><dd${cls ? ` class="${cls}"` : ''}>${v}</dd>`).join('') + '</dl>';
+  }
+
+  function shortDate(value) {
+    if (!value) return '';
+    const d = new Date(String(value).length <= 10 ? value + 'T00:00:00' : value);
+    return isNaN(d) ? String(value) : d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+  }
+
+  function renderCase(p) {
+    const r = p.registry;
+    if (r && r.plate) {
+      const policy = r.policy_type === 'third_party_only' ? 'Third party only' : 'Comprehensive';
+      const mobile = r.owner_mobile && p.from_number
+        ? (String(r.owner_mobile).slice(-10) === String(p.from_number).replace(/\D/g, '').slice(-10)
+          ? ['WhatsApp number', 'matches the registered mobile', 'ok']
+          : ['WhatsApp number', 'not the registered mobile', 'warn'])
+        : null;
+      $('registry').innerHTML = kv([
+        ['Plate', `<span class="mono">${esc(r.plate)}</span>`],
+        ['Owner', esc(r.owner_name)],
+        ['Vehicle', esc([r.colour, r.make, r.model, r.variant].filter(Boolean).join(' '))],
+        ['Body · fuel', esc([r.body_type, r.fuel].filter(Boolean).join(' · '))],
+        ['RTO · city', esc([r.rto, r.city].filter(Boolean).join(' · '))],
+        ['Chassis · engine', `<span class="mono">…${esc(r.chassis_last5 || '')} · …${esc(r.engine_last5 || '')}</span>`],
+        ['Insurer', esc(r.insurer)],
+        ['Policy', `<span class="mono">${esc(r.policy_number)}</span> · ${esc(policy)}`],
+        ['Valid', `${esc(shortDate(r.policy_start))} – ${esc(shortDate(r.policy_end))}`],
+        ['IDV · NCB', `${rupee(r.idv)} · ${esc(r.ncb_percent)}%`],
+        mobile
+      ]);
+    } else {
+      $('registry').innerHTML = '<p class="empty">Not checked — no registration number was confirmed or read for this claim.</p>';
+    }
+    const a = p.assessor || {};
+    $('caseDetails').innerHTML = kv([
+      ['Tracking ID', `<span class="mono">${esc(p.tracking_id || p.claim_id)}</span>`],
+      ['Assessor', a.name ? esc(a.name + (a.city ? ' · ' + a.city : '') + (a.phone ? ' · ' + a.phone : '')) : 'not assigned'],
+      ['Next step', esc(p.next_step || '')]
+    ]);
+    const events = list(p.events);
+    $('timeline').innerHTML = events.length
+      ? events.map(e => `<li><span class="when">${esc(new Date(e.created_at).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }))}</span>
+          <span class="what">${esc(EVENT_LABELS[e.event] || e.event)}</span>
+          <span class="detail">${esc(e.detail || '')}</span></li>`).join('')
+      : '<li><span class="what">No timeline events recorded for this claim.</span></li>';
   }
 
   function renderDocuments(p) {

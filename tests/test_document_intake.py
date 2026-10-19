@@ -359,7 +359,9 @@ class WhatsAppChecklistTests(unittest.IsolatedAsyncioTestCase):
         # The pipeline decides the missing-documents reason on every path
         # (rules.document_requirements); SKIP no longer adds its own.
         analyse.assert_awaited_once()
-        self.assertNotIn("forced_review_reasons", analyse.await_args.kwargs)
+        # Forced reasons are now always passed (the registered-mobile check
+        # uses them); SKIP still adds none.
+        self.assertEqual(analyse.await_args.kwargs.get("forced_review_reasons"), [])
 
     async def test_rc_only_refuses_skip(self):
         seed_session("user", photos=1, awaiting_docs=True, updated=time.time())

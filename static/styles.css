@@ -463,3 +463,18 @@ button,input,select,textarea{font-family:inherit}
   .bar-row{grid-template-columns:40px 170px minmax(0,1fr) 64px}
   .brand-tag{display:none}
 }
+
+/* ---------- case: registry, assessor, timeline ---------- */
+.case-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+.case-grid .card{margin-bottom:0}
+.kv{display:grid;grid-template-columns:minmax(110px,auto) 1fr;gap:6px 14px;font-size:14px;margin:0}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;color:var(--ink);overflow-wrap:anywhere}
+.kv .ok{color:var(--ok-fg)}
+.kv .warn{color:var(--review-fg)}
+.timeline{list-style:none;margin:14px 0 0;padding:0;border-top:1px solid var(--line)}
+.timeline li{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;padding:10px 0;border-bottom:1px solid var(--line);font-size:14px}
+.timeline .when{font-family:var(--mono);font-size:12px;color:var(--muted);grid-row:span 2}
+.timeline .what{color:var(--ink)}
+.timeline .detail{color:var(--text);font-size:13px}
+@media (max-width:900px){.case-grid{grid-template-columns:1fr}}

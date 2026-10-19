@@ -202,6 +202,43 @@ Runtime:
   4 s on Render's CPU. `forensics.warm_up` runs it in a thread at startup
   and logs `[forensics] warm-up: phash ready in …s`.
 
+## WhatsApp conversation (guided flow)
+
+- **START** (no active session): "Welcome to InsureIT", *1* file a claim, *2*
+  track a claim. MENU, END and HELP work at any point (case and punctuation
+  ignored); during an analysis a text gets the one busy line.
+- **File a claim:**
+  - The plate is normalised and validated (standard and BH series), then
+    looked up in the mock VAHAN registry (`registry.lookup`, where the VAHAN
+    API call goes in production). Expired or third-party-only policies end
+    the claim path.
+  - Steps 1–4: damage photos (DONE; cannot be skipped), RC, licence, claim
+    form (SKIP allowed). Every item is classified into its own slot
+    (`wa_session_media.slot`) whatever the step.
+  - The result adds tracking ID, assessor and next step. The claim then
+    stays **open** (`stage = open_claim`): documents sent in the session
+    attach to it (`main.reassess_claim`: extraction and rules again, damage
+    assessment reused, a `documents_added` event).
+  - A document for a claim in `more_info` asks "Add this to CLM-…?" first.
+- **Track:** a tracking ID or ALL, only this number's claims.
+- **END** clears the session and repeats the tracking ID. 30 minutes idle:
+  the next message says the session timed out, then START.
+- **Registry data.** `data/mock_vahan_registry.xlsx` (100 fictitious rows,
+  `scripts/generate_registry.py`). Rows from real test documents are never
+  committed (the repo is public): `data/private_registry_rows.json`
+  (gitignored) or `REGISTRY_PRIVATE_ROWS`.
+- **Registry cross-checks** (`rules.registry_flags`): plate vs RC, owner vs
+  RC owner (name matcher), make/body vs the photos HIGH and colour alone
+  MEDIUM, policy on the accident date from the registry. With two vehicles
+  in the photos, the one matching the registration is chosen
+  (`selected_vehicle_group`); the customer is asked only when none clearly
+  matches.
+- **Assessors and timeline.** Six mock assessors (`assessors.py`), assigned
+  by registry city, round robin, phone `ASSESSOR_CONTACT`. `claim_events`
+  holds the timeline (submitted, assessor_assigned, survey_scheduled,
+  documents_added, more_info_requested, approved, rejected,
+  assessment_updated).
+
 ## Domain and presentation rules
 
 - **Timestamps.** Every stored timestamp is timezone-aware UTC

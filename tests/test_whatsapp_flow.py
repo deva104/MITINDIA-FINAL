@@ -28,9 +28,9 @@ import vision
 import whatsapp
 
 try:
-    from helpers import fresh_key_state, provider_keys
+    from helpers import fresh_key_state, guided, provider_keys, stub_slots
 except ImportError:
-    from tests.helpers import fresh_key_state, provider_keys
+    from tests.helpers import fresh_key_state, guided, provider_keys, stub_slots
 
 WA_ID = "919800000031"
 COLOURS = {"vehicle_photo": (200, 30, 30), "rc": (30, 200, 30), "driving_licence": (30, 30, 200)}
@@ -186,15 +186,19 @@ class LiveSequenceTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "send_text", self.send), \
                 patch.object(whatsapp, "send_text", self.send), \
                 patch.object(main, "run_deep_forensics", paused_forensics):
+            guided(WA_ID, skip=())
             album = [self.message("image", "car"), self.message("image", "rc"),
                      self.message("image", "dl"), self.message("unsupported")]
             await self.deliver(*album)
             await self.deliver(self.message("document", "pdf"))
             self.assertEqual(self.sent, [
                 "Photo received (1 total). Reply DONE when you are done.",
-                "Photo received (2 total). Reply DONE when you are done.",
-                "Photo received (3 total). Reply DONE when you are done.",
-                "Document received (1 total). Reply DONE when you are done.",
+                "That looks like your registration certificate — added to step 2. "
+                "Send more damage photos, or reply *DONE*.",
+                "That looks like your driving licence — added to step 3. "
+                "Send more damage photos, or reply *DONE*.",
+                "That looks like your claim form — added to step 4. "
+                "Send more damage photos, or reply *DONE*.",
             ])
 
             done = asyncio.create_task(main.handle_wa_message(self.message("text", body="Done")))
@@ -249,22 +253,23 @@ class LiveSequenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(whatsapp.DEFERRED_MEDIA, {})
 
     async def test_an_unsupported_event_alone_gets_the_greeting_after_the_window(self):
+        # The greeting is the START menu since the guided flow.
         with patch.object(main, "STRAY_EVENT_WINDOW", 0.05), \
-                patch.object(main, "send_text", self.send):
+                patch.object(main, "send_text", self.send), \
+                patch.object(whatsapp, "send_text", self.send):
             await self.deliver(self.message("unsupported"))
-        self.assertEqual(self.sent, [
-            "Please send a photo of the damaged vehicle to start a claim. "
-            + whatsapp.ACCEPTED_MEDIA])
+        self.assertEqual(self.sent, [whatsapp.WELCOME])
 
     async def test_an_unsupported_event_before_its_photos_is_silent(self):
         async def download(media_obj):
             return self.media[media_obj["id"]]
 
         # Wider than a remote database round trip, far under the real 15 s.
+        guided(WA_ID)
         with patch.object(main, "STRAY_EVENT_WINDOW", 3.0), \
                 patch.object(main, "download_media", download), \
                 patch.object(main, "send_text", self.send), \
-                patch.object(whatsapp, "send_text", self.send):
+                patch.object(whatsapp, "send_text", self.send), stub_slots():
             stray = asyncio.create_task(main.handle_wa_message(self.message("unsupported")))
             await asyncio.sleep(0.05)
             await self.deliver(self.message("image", "car"))
@@ -277,10 +282,11 @@ class LiveSequenceTests(unittest.IsolatedAsyncioTestCase):
 
         later = self.message("unsupported")
         later["timestamp"] = "1760900100"  # sent 100 s after the photo
+        guided(WA_ID)
         with patch.object(main, "STRAY_EVENT_WINDOW", 0.05), \
                 patch.object(main, "download_media", download), \
                 patch.object(main, "send_text", self.send), \
-                patch.object(whatsapp, "send_text", self.send):
+                patch.object(whatsapp, "send_text", self.send), stub_slots():
             await self.deliver(self.message("image", "car"), later)
         self.assertEqual(self.sent, ["Photo received (1 total). Reply DONE when you are done.",
                                      whatsapp.UNHANDLED_WITH_MEDIA_REPLY])

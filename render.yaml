@@ -42,6 +42,13 @@ services:
         sync: false
       - key: SIGHTENGINE_API_SECRET
         sync: false
+      # The one phone number shown for every mock assessor.
+      - key: ASSESSOR_CONTACT
+        sync: false
+      # Registry rows built from real test documents (a JSON list); kept out
+      # of the public repo. See registry.py.
+      - key: REGISTRY_PRIVATE_ROWS
+        sync: false
       # Optional, with code defaults: VISION_PROVIDERS, GROQ_VISION_MODEL,
       # GEMINI_VISION_MODEL, OPENROUTER_VISION_MODEL, CACHE_ENABLED,
       # AI_DETECTION_ENABLED, REQUIRED_DOCS, STRICT_DOCS,

@@ -208,6 +208,8 @@ def health():
         "ok": ok,
         "db": database_backend(),
         "db_ok": ok,
+        # Render sets RENDER_GIT_COMMIT on every deploy.
+        "commit": (os.getenv("RENDER_GIT_COMMIT") or "")[:7] or None,
         # Configuration only: provider names, models and whether keys are set.
         "vision": provider_status(),
         "ai_detection": ai_detection_status(),

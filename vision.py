@@ -1,5 +1,6 @@
 import hashlib
 import os
+import re
 import time
 from contextvars import ContextVar
 
@@ -57,10 +58,29 @@ class VisionUnavailable(RuntimeError):
         super().__init__(f"no vision provider succeeded ({summary})")
 
 
+def _status_code(error):
+    for attribute in ("status_code", "code"):
+        value = getattr(error, attribute, None)
+        if isinstance(value, int) and 100 <= value <= 599:
+            return value
+    return None
+
+
+def is_rate_limited(error):
+    return _status_code(error) == 429 or "RateLimit" in type(error).__name__
+
+
 def short_error(error, limit=160):
-    """One line, bounded: safe to show an assessor and to log."""
-    text = " ".join(str(error).split())
+    """One line, bounded, and free of provider payloads: safe to show an
+    assessor or log. HTTP errors become "Name (HTTP 503)"; a raw provider body
+    (which can carry account ids) is never repeated."""
     name = type(error).__name__
+    status = _status_code(error)
+    if status is not None:
+        return f"{name} (HTTP {status})"
+    text = " ".join(str(error).split())
+    text = re.split(r"[{\[]", text, maxsplit=1)[0].strip(" -:.,")
+    text = re.sub(r"\borg_[A-Za-z0-9]+", "org_…", text)
     return (f"{name}: {text}" if text else name)[:limit]
 
 
@@ -192,6 +212,10 @@ def generate_json(parts, label) -> dict:
                             outcome = ("skipped", f"{key_env} is not set")
                             break
                         outcome = ("failed", short_error(error))
+                        if is_rate_limited(error):
+                            # The provider has said when to come back; a 2 s
+                            # retry only fails again. Use the next provider.
+                            break
                         if attempt == 0:
                             time.sleep(2)
                         continue

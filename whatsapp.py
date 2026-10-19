@@ -580,6 +580,9 @@ def _undetermined_lines(items):
         "value present but illegible": "illegible on the document",
         "metadata stripped in transit": "metadata removed in transit",
     }
+    items = [item for item in items if item.get("item") != "Primary vision provider"]
+    if not items:
+        return []
     lines = ["", "*Could not determine:*"]
     for item in items:
         reason = reason_labels.get(item.get("reason"), item.get("reason"))

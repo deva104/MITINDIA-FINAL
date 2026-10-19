@@ -28,9 +28,9 @@ import vision
 import whatsapp
 
 try:
-    from helpers import seed_session
+    from helpers import fresh_key_state, provider_keys, seed_session
 except ImportError:
-    from tests.helpers import seed_session
+    from tests.helpers import fresh_key_state, provider_keys, seed_session
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -90,6 +90,8 @@ class ProviderBench:
 
     def patches(self):
         return [
+            provider_keys(),
+            fresh_key_state(),
             patch.dict(vision.PROVIDER_CALLS, {
                 name: self.provider(name) for name in ("groq", "gemini", "openrouter")
             }),
@@ -260,7 +262,7 @@ class ProviderReportingTests(unittest.TestCase):
     def test_recovered_failure_is_provenance_not_undetermined(self):
         def behaviour(provider, label):
             if provider == "groq":
-                raise RuntimeError("rate limited")
+                raise RuntimeError("connection reset by peer")
             return {"ok": provider}
 
         result, fallbacks = self.run_chain(behaviour, images=1)
@@ -510,12 +512,7 @@ class StartupCheckTests(unittest.TestCase):
                 self.assertNotIn(value, text)
 
     def test_listed_provider_without_key_and_unused_key_are_warned(self):
-        with patch.dict(os.environ, {
-            "VISION_PROVIDERS": "groq,gemini",
-            "GROQ_API_KEY": "",
-            "GEMINI_API_KEY": "x",
-            "OPENROUTER_API_KEY": "y",
-        }):
+        with provider_keys(groq=0, gemini=1, openrouter=1, VISION_PROVIDERS="groq,gemini"):
             warnings = vision.provider_status()["warnings"]
         self.assertIn("groq is in VISION_PROVIDERS but GROQ_API_KEY is not set", warnings)
         self.assertIn(

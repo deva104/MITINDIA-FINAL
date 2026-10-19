@@ -116,6 +116,23 @@ Runtime:
   SDK-level retries.
 - Run exactly **one** uvicorn worker. `ANALYSING_IDS` is an in-process lock.
   `render.yaml` pins this, plus Python 3.10.11 and the Oregon region.
+- **Provider key pool** (`providers.discover_keys`, state in `vision.py`).
+  - Keys: `GEMINI_API_KEY` (label `main`) first, then every non-empty
+    `GEMINI_API_KEY_<suffix>` in alphabetical order, labelled by the suffix
+    in lower case. The same for `GROQ_API_KEY*` and `OPENROUTER_API_KEY*`.
+  - 429 per minute: that key cools for the retry-after (default 60 s) and
+    the next key is tried at once. 429 daily: exhausted until the stated
+    reset, else 00:00 UTC. 401/403: invalid until restart, with a WARNING
+    naming the label. Limited keys are skipped without a call.
+  - 503 / overloaded / 5xx: no key rotation; the chain moves to the next
+    provider. Only when every key of a provider is limited does a 429 move
+    the chain on.
+  - Logs and `/api/health` show labels and states only. **Never log or
+    return a key value or any prefix of one.** Error text passes through
+    `providers.redact`.
+  - The live pipeline never waits for a key. `seed_demo.py` calls
+    `vision.wait_for_keys(True)`: when every key of every provider is
+    limited it sleeps until the soonest one returns (at most 60 s a step).
 - Admin endpoints (`/api/demo/reset`, `/api/claims/{id}/override`,
   `/api/whatsapp/subscribe`, `/api/whatsapp/status`) require the
   `X-Admin-Token` header to equal `ADMIN_TOKEN`. When `ADMIN_TOKEN` is unset,
@@ -184,9 +201,17 @@ What this shows, for Q&A:
 ### Groq free tier
 
 Groq's free tier allows about 7,000 input tokens per minute. One image call
-is about 2,200 tokens, so roughly three image calls a minute. Beyond that the
-call returns 429 and the chain moves straight to Gemini (no retry). The
-claim still completes, with the result produced by the fallback.
+is about 2,200 tokens, so roughly three image calls a minute per key. Beyond
+that the call returns 429, the key cools, and the next Groq key is tried
+(no retry, no wait). When every Groq key is cooling the chain moves to
+Gemini. The claim still completes, with the result produced by the fallback.
+
+### Gemini free tier
+
+The free tier allows 20 requests per day per model, counted **per Google
+Cloud project**, not per key. Several keys only add capacity when each one
+belongs to a different project; keys from the same project share one daily
+cap and all hit 429 together.
 
 ## Known limitations
 
@@ -194,6 +219,9 @@ claim still completes, with the result produced by the fallback.
   customer's original bytes, for any photo over 2 MB.
 - Original PDF files are not retained. Only the rendered pages and the
   original's sha256 and size are kept.
+- Key cool-downs live in memory. After a restart (a Render spin-down
+  included) a limited key is tried once more, gets its 429 again and is
+  marked again. This is deliberate: nothing is persisted.
 
 ## Tests
 
@@ -207,6 +235,11 @@ before `db` is imported:
   as a production `DATABASE_URL`.
 
 New test files must keep that import first.
+
+Tests that touch the provider chain must not see the developer's real keys
+or another test's cool-downs. Wrap them in `helpers.provider_keys()` (strips
+every real `*_API_KEY*`, sets fakes) and `helpers.fresh_key_state()`. The
+suite must report 0 real provider calls.
 
 SQLite suite (fast, around 10 s):
 

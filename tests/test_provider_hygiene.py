@@ -11,6 +11,11 @@ from unittest.mock import patch
 import vision
 import whatsapp
 
+try:
+    from helpers import fresh_key_state, provider_keys
+except ImportError:
+    from tests.helpers import fresh_key_state, provider_keys
+
 
 class RateLimitError(Exception):
     def __init__(self, message, status_code):
@@ -49,7 +54,9 @@ class ProviderHygieneTests(unittest.TestCase):
             calls.append("gemini")
             return {"ok": True}
 
-        with patch.dict(vision.PROVIDER_CALLS, {"groq": groq, "gemini": gemini}), \
+        # One groq key: the 429 cools it and the chain moves on, no sleep, no retry.
+        with provider_keys(groq=1, gemini=1), fresh_key_state(), \
+                patch.dict(vision.PROVIDER_CALLS, {"groq": groq, "gemini": gemini}), \
                 patch.dict(os.environ, {"VISION_PROVIDERS": "groq,gemini",
                                         "CACHE_ENABLED": "false"}), \
                 patch.object(vision.time, "sleep") as sleep:

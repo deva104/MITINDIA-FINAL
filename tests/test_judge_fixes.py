@@ -21,6 +21,11 @@ import rules
 import vision
 import whatsapp
 
+try:
+    from helpers import fresh_key_state, provider_keys
+except ImportError:
+    from tests.helpers import fresh_key_state, provider_keys
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -209,7 +214,8 @@ class ProviderProvenanceTests(unittest.TestCase):
             def close(self):
                 pass
 
-        with patch.dict(vision.PROVIDER_CALLS, {"groq": groq, "gemini": gemini}), \
+        with provider_keys(), fresh_key_state(), \
+                patch.dict(vision.PROVIDER_CALLS, {"groq": groq, "gemini": gemini}), \
                 patch.dict(os.environ, {"VISION_PROVIDERS": "groq,gemini", "CACHE_ENABLED": "false",
                                         "REQUIRED_DOCS": "", "AI_DETECTION_ENABLED": "false"}), \
                 patch.multiple(main, get_conn=lambda: Conn(),

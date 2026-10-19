@@ -2,7 +2,9 @@
 media as stored blobs plus append-only wa_session_media rows."""
 import hashlib
 import io
+import os
 import time
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -55,6 +57,29 @@ def extraction_ok(fields, documents=None, source_doc=None):
         "status": "ok", "fields": fields, "documents": len(names) or 1,
         "read": names, "failed": [], "error": None,
     }
+
+
+KEY_PREFIXES = ("GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY")
+
+
+def provider_keys(groq=1, gemini=1, openrouter=1, **extra):
+    """Patch the environment so tests never see the developer's real keys:
+    every real provider key is removed and `n` fake ones are set per provider."""
+    env = {name: value for name, value in os.environ.items()
+           if not name.upper().startswith(KEY_PREFIXES)}
+    for prefix, count in zip(KEY_PREFIXES, (groq, gemini, openrouter)):
+        for index in range(count):
+            name = prefix if index == 0 else f"{prefix}_K{index}"
+            env[name] = f"fake-{prefix.lower()}-{index}-000000000000"
+    env.update(extra)
+    return patch.dict(os.environ, env, clear=True)
+
+
+def fresh_key_state():
+    """Key cool-downs are process-wide; each test starts with none."""
+    import vision
+
+    return patch.dict(vision._KEY_STATE, {}, clear=True)
 
 
 def read_all(paths):

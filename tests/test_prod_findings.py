@@ -26,9 +26,9 @@ import vision
 import whatsapp
 
 try:
-    from helpers import seed_session
+    from helpers import fresh_key_state, provider_keys, seed_session
 except ImportError:
-    from tests.helpers import seed_session
+    from tests.helpers import fresh_key_state, provider_keys, seed_session
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -91,7 +91,7 @@ class ConfidenceTests(unittest.TestCase):
             def close(self):
                 pass
 
-        with patch.dict(vision.PROVIDER_CALLS, {
+        with provider_keys(), fresh_key_state(), patch.dict(vision.PROVIDER_CALLS, {
             "groq": lambda parts, model, label: json.loads(json.dumps(PRODUCTION_RESPONSE)),
         }), patch.dict(os.environ, {"VISION_PROVIDERS": "groq", "CACHE_ENABLED": "false",
                                     "REQUIRED_DOCS": ""}), \

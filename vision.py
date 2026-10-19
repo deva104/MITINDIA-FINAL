@@ -1,7 +1,9 @@
 import hashlib
 import os
 import re
+import threading
 import time
+from datetime import datetime, timedelta, timezone
 from contextvars import ContextVar
 
 from dotenv import load_dotenv
@@ -9,6 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from db import cache_get, cache_put
+import providers
 from providers import call_gemini, call_groq, call_openrouter
 
 DEFAULT_PROVIDERS = "groq,gemini,openrouter"
@@ -80,10 +83,126 @@ def short_error(error, limit=160):
     status = _status_code(error)
     if status is not None:
         return f"{name} (HTTP {status})"
-    text = " ".join(str(error).split())
+    text = providers.redact(" ".join(str(error).split()))
     text = re.split(r"[{\[]", text, maxsplit=1)[0].strip(" -:.,")
     text = re.sub(r"\borg_[A-Za-z0-9]+", "org_…", text)
     return (f"{name}: {text}" if text else name)[:limit]
+
+
+# Per-key state, in memory. After a restart a limited key is tried once more;
+# the provider then answers 429 again and the key is marked again. Nothing
+# is persisted on purpose.
+_KEY_LOCK = threading.Lock()
+_KEY_STATE = {}  # (provider, label) -> {"state": cooling|exhausted|invalid, "until": epoch|None}
+DEFAULT_COOLDOWN_SECONDS = 60
+# Seed only: wait for a cooling key instead of failing when every key is limited.
+_WAIT = {"enabled": False, "max_total": 15 * 60, "max_step": 60}
+
+
+def reset_key_states():
+    with _KEY_LOCK:
+        _KEY_STATE.clear()
+
+
+def wait_for_keys(enabled=True, max_total=15 * 60):
+    """Batch jobs (the demo seed) wait for the soonest key; the live pipeline
+    never waits and falls through to the next provider at once."""
+    _WAIT["enabled"] = bool(enabled)
+    _WAIT["max_total"] = max_total
+
+
+def key_state(provider, label, now=None):
+    """("ok"|"cooling"|"exhausted"|"invalid", until-epoch-or-None)."""
+    now = time.time() if now is None else now
+    with _KEY_LOCK:
+        entry = _KEY_STATE.get((provider, label))
+        if not entry:
+            return "ok", None
+        if entry["state"] == "invalid":
+            return "invalid", None
+        if entry["until"] is not None and entry["until"] <= now:
+            del _KEY_STATE[(provider, label)]
+            return "ok", None
+        return entry["state"], entry["until"]
+
+
+def _mark_key(provider, label, state, until):
+    with _KEY_LOCK:
+        _KEY_STATE[(provider, label)] = {"state": state, "until": until}
+
+
+def _clock(epoch):
+    moment = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    if moment - datetime.now(timezone.utc) > timedelta(hours=20):
+        return moment.strftime("%Y-%m-%d %H:%MZ")
+    return moment.strftime("%H:%MZ")
+
+
+def _iso(epoch):
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat() if epoch else None
+
+
+_DAILY_MARKERS = (
+    "perday", "per day", "per_day", "(rpd)", "(tpd)", "daily",
+    "free-models-per-day", "requests per day", "tokens per day",
+)
+_RETRY_DELAY = re.compile(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s", re.I)
+_RETRY_IN = re.compile(
+    r"(?:retry|try again)\s+in\s+((?:\d+(?:\.\d+)?\s*[hms]\s*)+)", re.I)
+
+
+def _retry_seconds(error, text):
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            value = headers.get("retry-after")
+            if value is not None:
+                return float(value)
+        except (TypeError, ValueError, AttributeError):
+            pass
+    match = _RETRY_DELAY.search(text)
+    if match:
+        return float(match.group(1))
+    match = _RETRY_IN.search(text)
+    if match:
+        total = 0.0
+        for number, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([hms])", match.group(1)):
+            total += float(number) * {"h": 3600, "m": 60, "s": 1}[unit]
+        return total or None
+    return None
+
+
+def _next_utc_midnight(now):
+    moment = datetime.fromtimestamp(now, tz=timezone.utc)
+    midnight = (moment + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.timestamp()
+
+
+def classify_provider_error(error, now=None):
+    """What a provider error means for the key that made the call:
+    ("minute", until) rate limit, cool the key and try the next key;
+    ("daily", until)  quota used, exhaust the key and try the next key;
+    ("invalid", None) 401/403, the key is unusable for this process;
+    ("server", None)  503/5xx/overloaded, the model is down for every key;
+    ("other", None)   anything else (bad output, timeout)."""
+    now = time.time() if now is None else now
+    status = _status_code(error)
+    text = " ".join(str(error).split())
+    lowered = text.lower()
+    if status in (401, 403) or (
+        status == 400 and ("api key not valid" in lowered or "api_key_invalid" in lowered)
+    ):
+        return "invalid", None
+    if status == 429 or "resource_exhausted" in lowered or "rate limit" in lowered:
+        delay = _retry_seconds(error, text)
+        if any(marker in lowered for marker in _DAILY_MARKERS):
+            return "daily", (now + delay) if delay else _next_utc_midnight(now)
+        return "minute", now + (delay if delay else DEFAULT_COOLDOWN_SECONDS)
+    if (status is not None and 500 <= status <= 599) or "overloaded" in lowered \
+            or "unavailable" in lowered:
+        return "server", None
+    return "other", None
 
 
 def reset_cache_tracking():
@@ -117,7 +236,7 @@ def _record_provenance(label, provider, fallbacks, cached=False):
 def _why(fallback):
     detail = str(fallback.get("detail") or "")
     name = fallback.get("from")
-    if "(HTTP 429)" in detail or "RateLimit" in detail:
+    if "(HTTP 429)" in detail or "RateLimit" in detail or "keys limited" in detail:
         return f"{name} rate-limited"
     if "exceeds" in detail:
         return f"{name} skipped: image limit"
@@ -197,9 +316,9 @@ def _configured_providers():
 
 
 def generate_json(parts, label) -> dict:
-    providers = _configured_providers()
+    chain = _configured_providers()
     last_error = None
-    first_provider = providers[0]
+    first_provider = chain[0]
     try:
         first_model = _model_for(first_provider)
     except KeyError:
@@ -227,16 +346,62 @@ def generate_json(parts, label) -> dict:
         isinstance(part, tuple) and len(part) == 3 and part[0] == "image"
         for part in parts
     )
+    waited = 0.0
+    while True:
+        result = _run_chain(parts, label, chain, image_count)
+        if result[0] == "ok":
+            _, response, provider, model, fallbacks = result
+            if use_cache:
+                try:
+                    cache_put(content_hash, label.split("(", 1)[0], response, provider, model)
+                except Exception as error:
+                    print(f"[vision] {label}: cache write failed: {short_error(error)}", flush=True)
+            _FALLBACK_EVENTS.set(_FALLBACK_EVENTS.get() + tuple(fallbacks))
+            _record_provenance(label, provider, fallbacks)
+            return response
+        _, attempts, last_error, all_limited = result
+        pause = _seconds_until_a_key_returns(chain) if all_limited else None
+        if (
+            _WAIT["enabled"] and pause is not None
+            and waited + pause <= _WAIT["max_total"]
+        ):
+            step = max(1.0, min(pause, _WAIT["max_step"]))
+            print(f"[vision] {label}: every key is limited; waiting {step:.0f}s", flush=True)
+            time.sleep(step)
+            waited += step
+            continue
+        if attempts:
+            # From None: the provider's own error text can carry account ids.
+            raise VisionUnavailable(label, attempts) from None
+        raise RuntimeError("No vision providers were configured")
 
-    # Separate providers mean separate quota pools, so a 429 on one does not
-    # affect the other. A capacity skip is normal routing; only a failure is
-    # recorded as one.
+
+def _seconds_until_a_key_returns(providers_):
+    now = time.time()
+    soonest = None
+    for provider in providers_:
+        if provider not in PROVIDER_CALLS:
+            continue
+        for label, _ in providers.discover_keys(provider):
+            state, until = key_state(provider, label, now)
+            if state == "ok":
+                return 0.0
+            if state in ("cooling", "exhausted") and until is not None:
+                soonest = until if soonest is None else min(soonest, until)
+    return None if soonest is None else max(0.0, soonest - now)
+
+
+def _run_chain(parts, label, providers_, image_count):
+    """One pass over the provider chain, rotating keys inside each provider.
+    ("ok", response, provider, model, fallbacks) or
+    ("fail", attempts, last_error, every_provider_was_rate_limited)."""
+    last_error = None
     attempts = []
     # Held back until a provider answers: a chain that fails as a whole is
     # reported by the caller, and "fell back to X" would claim X produced it.
     pending_fallbacks = []
-    for provider_index, provider in enumerate(providers):
-        outcome = None
+    limited_only = True
+    for provider_index, provider in enumerate(providers_):
         try:
             call = PROVIDER_CALLS[provider]
             model = _model_for(provider)
@@ -244,6 +409,7 @@ def generate_json(parts, label) -> dict:
         except KeyError:
             last_error = ValueError(f"unsupported vision provider: {provider}")
             outcome = ("failed", f"unsupported provider '{provider}'")
+            limited_only = False
         else:
             if image_count > max_images:
                 outcome = (
@@ -252,86 +418,134 @@ def generate_json(parts, label) -> dict:
                 )
                 print(f"[vision] {label}: skipped {provider}: {outcome[1]}", flush=True)
             else:
-                for attempt in range(2):
-                    try:
-                        response = call(parts, model, label)
-                    except Exception as error:
-                        last_error = error
-                        key_env = PROVIDER_KEYS.get(provider)
-                        if isinstance(error, KeyError) and error.args[:1] == (key_env,):
-                            outcome = ("skipped", f"{key_env} is not set")
-                            break
-                        outcome = ("failed", short_error(error))
-                        if is_rate_limited(error):
-                            # The provider has said when to come back; a 2 s
-                            # retry only fails again. Use the next provider.
-                            break
-                        if attempt == 0:
-                            time.sleep(2)
-                        continue
-                    if use_cache:
-                        try:
-                            cache_put(
-                                content_hash,
-                                label.split("(", 1)[0],
-                                response,
-                                provider,
-                                model,
-                            )
-                        except Exception as error:
-                            print(
-                                f"[vision] {label}: cache write failed: {error}",
-                                flush=True,
-                            )
-                    _FALLBACK_EVENTS.set(_FALLBACK_EVENTS.get() + tuple(pending_fallbacks))
-                    _record_provenance(label, provider, pending_fallbacks)
-                    return response
+                response, outcome, error, rate_limited = _try_provider(
+                    provider, call, model, parts, label
+                )
+                if error is not None:
+                    last_error = error
+                if response is not None:
+                    return "ok", response, provider, model, pending_fallbacks
+                if not rate_limited:
+                    limited_only = False
         attempts.append((provider, outcome[0], outcome[1]))
-
-        if provider_index + 1 < len(providers):
-            next_provider = providers[provider_index + 1]
+        if provider_index + 1 < len(providers_):
+            next_provider = providers_[provider_index + 1]
             pending_fallbacks.append({
-                "from": provider,
-                "to": next_provider,
-                "reason": outcome[0],
-                "detail": outcome[1],
+                "from": provider, "to": next_provider,
+                "reason": outcome[0], "detail": outcome[1],
             })
-            print(
-                f"[vision] {label}: {provider} {outcome[0]} ({outcome[1]}), "
-                f"falling back to {next_provider}",
-                flush=True,
-            )
+            print(f"[vision] {label}: {provider} {outcome[0]} ({outcome[1]}), "
+                  f"falling back to {next_provider}", flush=True)
+    return "fail", attempts, last_error, limited_only and bool(attempts)
 
-    if attempts:
-        raise VisionUnavailable(label, attempts) from last_error
-    raise RuntimeError("No vision providers were configured")
+
+def _try_provider(provider, call, model, parts, label):
+    """Try one provider, key by key. Returns (response|None, outcome, error,
+    rate_limited) where rate_limited means every key ended up limited."""
+    keys = providers.discover_keys(provider) if provider in providers.KEY_PREFIXES else []
+    if not keys:
+        # No pool: behave as before, on the bare variable.
+        return _attempt(provider, call, model, parts, label, None)
+    now = time.time()
+    usable = [(key_label, value) for key_label, value in keys
+              if key_state(provider, key_label, now)[0] == "ok"]
+    if not usable:
+        return None, ("skipped", f"all {len(keys)} {provider} keys limited"), None, True
+    last = (None, ("failed", "no key answered"), None, True)
+    for key_label, value in usable:
+        token = providers.use_key(provider, key_label, value)
+        try:
+            response, outcome, error, rate_limited = _attempt(
+                provider, call, model, parts, label, key_label
+            )
+        finally:
+            providers.release_key(token)
+        if response is not None:
+            return response, outcome, error, False
+        last = (None, outcome, error, rate_limited)
+        if outcome[0] == "rotate":
+            continue
+        return last
+    remaining = sum(1 for key_label, _ in keys if key_state(provider, key_label)[0] == "ok")
+    detail = last[1][1]
+    if not remaining and len(keys) > 1:
+        detail = f"all {len(keys)} {provider} keys limited (last: {detail})"
+    return None, ("failed", detail), last[2], not remaining
+
+
+def _attempt(provider, call, model, parts, label, key_label):
+    """One key (or the bare variable): up to two tries for an ordinary
+    failure, none for a rate limit, an invalid key or a server outage."""
+    outcome, error = ("failed", "no attempt"), None
+    for attempt in range(2):
+        try:
+            return call(parts, model, label), ("ok", ""), None, False
+        except Exception as caught:
+            error = caught
+        key_env = PROVIDER_KEYS.get(provider)
+        if isinstance(error, KeyError) and error.args[:1] == (key_env,):
+            return None, ("skipped", f"{key_env} is not set"), error, False
+        kind, until = classify_provider_error(error)
+        detail = short_error(error)
+        if kind in ("minute", "daily") and key_label is not None:
+            state = "cooling" if kind == "minute" else "exhausted"
+            _mark_key(provider, key_label, state, until)
+            print(f"[vision] {provider} key '{key_label}' {state} until {_clock(until)}, "
+                  "rotating", flush=True)
+            return None, ("rotate", detail), error, True
+        if kind == "invalid" and key_label is not None:
+            _mark_key(provider, key_label, "invalid", None)
+            print(f"[vision] WARNING: {provider} key '{key_label}' was rejected "
+                  f"({detail}); marked invalid until restart, rotating", flush=True)
+            return None, ("rotate", detail), error, False
+        if kind in ("minute", "daily"):
+            return None, ("failed", detail), error, True
+        if kind in ("server", "invalid"):
+            return None, ("failed", detail), error, False
+        outcome = ("failed", detail)
+        if attempt == 0:
+            time.sleep(2)
+    return None, outcome, error, False
 
 
 def provider_status():
-    """The resolved provider chain and which providers have keys. Never values."""
+    """The resolved provider chain, each provider's key labels and their
+    state. Labels and states only, never a key value."""
     warnings = []
     try:
-        providers = _configured_providers()
+        configured = _configured_providers()
     except ValueError as error:
         return {"chain": [], "warnings": [str(error)]}
     chain = []
-    for provider in providers:
+    for provider in configured:
         if provider not in PROVIDER_CALLS:
             chain.append({"provider": provider, "supported": False})
             warnings.append(f"unknown provider '{provider}' in VISION_PROVIDERS")
             continue
         key_env = PROVIDER_KEYS[provider]
-        has_key = bool(os.getenv(key_env, "").strip())
+        keys = providers.discover_keys(provider)
+        now = time.time()
+        key_states = []
+        for key_label, _ in keys:
+            state, until = key_state(provider, key_label, now)
+            entry = {"label": key_label, "state": state}
+            if until is not None:
+                entry["until"] = _iso(until)
+            key_states.append(entry)
+            if state == "invalid":
+                warnings.append(f"{provider} key '{key_label}' was rejected (invalid)")
         chain.append({
             "provider": provider,
             "model": _model_for(provider),
-            "key_configured": has_key,
+            "key_configured": bool(keys),
+            "key_count": len(keys),
+            "keys": key_states,
             "max_images": PROVIDER_MAX_IMAGES[provider],
         })
-        if not has_key:
+        if not keys:
             warnings.append(f"{provider} is in VISION_PROVIDERS but {key_env} is not set")
     for provider, key_env in PROVIDER_KEYS.items():
-        if provider not in providers and os.getenv(key_env, "").strip():
+        if provider not in configured and providers.discover_keys(provider):
             warnings.append(
                 f"{key_env} is set but {provider} is not in VISION_PROVIDERS, "
                 "so it is never used"

@@ -187,13 +187,14 @@ async def lifespan(app: FastAPI):
 def log_provider_chain():
     """Print the vision chain this process will use; warn about gaps. No secrets."""
     status = provider_status()
-    chain = " -> ".join(
-        f"{item['provider']} ({item.get('model')}, "
-        f"{'key set' if item.get('key_configured') else 'NO KEY'}, "
-        f"<= {item.get('max_images')} images)"
-        if item.get("supported", True) else f"{item['provider']} (unsupported)"
-        for item in status["chain"]
-    )
+    def describe(item):
+        if not item.get("supported", True):
+            return f"{item['provider']} (unsupported)"
+        labels = ", ".join(key["label"] for key in item.get("keys") or [])
+        keys = f"{item.get('key_count', 0)} key(s): {labels}" if labels else "NO KEY"
+        return f"{item['provider']} ({item.get('model')}, {keys}, <= {item.get('max_images')} images)"
+
+    chain = " -> ".join(describe(item) for item in status["chain"])
     print(f"[vision] provider chain: {chain or 'none'}", flush=True)
     for warning in status["warnings"]:
         print(f"[vision] WARNING: {warning}", flush=True)

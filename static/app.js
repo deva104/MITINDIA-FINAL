@@ -1,4 +1,4 @@
-/* ClaimPilot AI — frontend logic. Defensive by default: every field may be
+/* InsureIT — frontend logic. Defensive by default: every field may be
    null and every array may be empty on an early-exit payload. */
 
    const STAGES = [
@@ -162,10 +162,34 @@
     }
   }
 
+  /* One input and an Unlock button. Resolves to the entered token, or ''
+     when dismissed (Escape or a click outside). */
+  let tokenResolve = null;
+  function requestAdminToken(note) {
+    if (tokenResolve) tokenResolve('');
+    return new Promise(resolve => {
+      tokenResolve = resolve;
+      $('tokenModalNote').textContent = note;
+      $('tokenInput').value = '';
+      $('tokenUnlock').disabled = true;
+      $('tokenModal').classList.remove('hidden');
+      $('tokenInput').focus();
+    });
+  }
+
+  function finishTokenRequest(value) {
+    $('tokenModal').classList.add('hidden');
+    const resolve = tokenResolve;
+    tokenResolve = null;
+    if (resolve) resolve(String(value || '').trim());
+  }
+
   async function adminFetch(url, options) {
     for (let attempt = 0; attempt < 2; attempt++) {
       if (!adminToken) {
-        const entered = String(prompt('Admin token (needed for assessor actions):') || '').trim();
+        const entered = await requestAdminToken(attempt
+          ? 'That token was rejected. Enter the admin token again.'
+          : 'Needed for overrides and demo reset. Kept in this browser only.');
         if (!entered) throw new Error('Admin token required');
         rememberAdminToken(entered);
       }
@@ -427,6 +451,9 @@
       );
     }
     $('verdictTitle').textContent = title;
+    $('verdictStatus').textContent = band.classList.contains('is-ok') ? 'Clear'
+      : band.classList.contains('is-rejected') ? 'Reject'
+      : escalated ? 'Escalated' : 'Review';
     $('verdictSub').textContent = sub;
   
     renderUndetermined(p);
@@ -685,11 +712,12 @@
     });
     const max = Math.max(0.01, ...Object.values(map).map(value => value.seconds));
   
-    $('bars').innerHTML = STAGES.map(s => {
+    $('bars').innerHTML = STAGES.map((s, i) => {
+      const chip = `<span class="num-chip">0${i + 1}</span>`;
       if (!(s.key in map)) {
         const skipped = p.stopped_at === 'duplicate' && s.key === 'stage1_gemini';
-        return `<div class="bar-row is-skipped">
-          <span class="bar-name">${s.label}</span>
+        return `<div class="bar-row is-skipped">${chip}
+          <div class="bar-label"><span class="bar-name">${s.label}</span></div>
           <div class="bar-skip">${skipped ? 'not required' : 'not reached'}</div>
           <span class="bar-time">\u2014</span></div>`;
       }
@@ -698,9 +726,10 @@
       const pct = Math.max(2, (sec / max) * 100);
       const slim = pct < 12 ? ' slim' : '';
       const cached = timing.cached === true;
-      const via = timing.via && timing.via !== 'cached' ? ` — ${esc(timing.via)}` : '';
-      return `<div class="bar-row ${cached ? 'is-cached' : ''}">
-        <span class="bar-name">${s.label}${cached ? ' — cached' : via}</span>
+      const via = timing.via && timing.via !== 'cached' ? esc(timing.via) : '';
+      const note = cached ? 'cached' : via;
+      return `<div class="bar-row ${cached ? 'is-cached' : ''}">${chip}
+        <div class="bar-label"><span class="bar-name">${s.label}</span>${note ? `<span class="bar-via">${note}</span>` : ''}</div>
         <div class="bar-track"><div class="bar-fill${slim}" style="width:${pct}%"></div></div>
         <span class="bar-time">${sec.toFixed(2)}s</span></div>`;
     }).join('');
@@ -1114,7 +1143,7 @@
     const paint = () => {
       $('workingStages').innerHTML = STAGES.map((s, n) => {
         const cls = n < i ? 'is-done' : n === i ? 'is-now' : '';
-        return `<li class="${cls}"><b>0${n + 1}</b>${s.label}</li>`;
+        return `<li class="${cls}"><span class="num-chip">0${n + 1}</span>${s.label}</li>`;
       }).join('');
     };
     paint();
@@ -1166,6 +1195,19 @@
   });
   $('overrideReason').addEventListener('input', event => {
     $('overrideSubmit').disabled = !event.target.value.trim();
+  });
+  $('tokenInput').addEventListener('input', event => {
+    $('tokenUnlock').disabled = !event.target.value.trim();
+  });
+  $('tokenForm').addEventListener('submit', event => {
+    event.preventDefault();
+    if ($('tokenInput').value.trim()) finishTokenRequest($('tokenInput').value);
+  });
+  $('tokenModal').addEventListener('click', event => {
+    if (event.target === $('tokenModal')) finishTokenRequest('');
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && tokenResolve) finishTokenRequest('');
   });
   $('overrideCancel').onclick = closeOverride;
   $('overrideSubmit').onclick = submitOverride;

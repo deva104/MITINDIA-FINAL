@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ClaimPilot AI — Motor Claim Assessment</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23133646'/%3E%3Ctext x='16' y='21' text-anchor='middle' font-family='Arial' font-size='12' font-weight='700' fill='white'%3ECP%3C/text%3E%3C/svg%3E">
+<title>InsureIT — Motor Claim Assessment</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23172A45'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='Arial' font-size='16' font-weight='800' fill='white'%3EI%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -16,8 +16,7 @@
 
   <header class="topbar">
     <div class="brand">
-      <span class="brand-mark">CP</span>
-      <span class="brand-name">ClaimPilot<span class="brand-ai">AI</span></span>
+      <span class="brand-name">InsureIT</span>
       <span class="brand-tag">Motor claim assessment</span>
     </div>
     <div class="topbar-actions">
@@ -26,8 +25,8 @@
         <input id="assessorName" type="text" maxlength="80" placeholder="Your name">
       </label>
       <span class="health" id="health"><i></i><span>Checking</span></span>
-      <button class="btn btn-ghost" id="btnNew">New claim</button>
       <button class="btn btn-outline" id="btnReset">Reset demo</button>
+      <button class="btn btn-primary" id="btnNew">New claim</button>
     </div>
   </header>
 
@@ -89,7 +88,10 @@
           <span class="source-badge hidden" id="verdictSource"></span>
           <span class="verdict-confidence hidden" id="verdictConfidence"></span>
         </div>
-        <h1 class="verdict-title" id="verdictTitle"></h1>
+        <div class="verdict-head">
+          <h1 class="verdict-title" id="verdictTitle"></h1>
+          <span class="status-pill" id="verdictStatus"></span>
+        </div>
         <p class="verdict-sub" id="verdictSub"></p>
         <div class="decision-actions" id="decisionActions">
           <button class="btn btn-verdict override-control" data-action="set_decision" data-value="approved">Approve</button>
@@ -177,6 +179,18 @@
       <button class="btn btn-primary" id="overrideSubmit" disabled>Submit override</button>
     </div>
   </div>
+</div>
+
+<div class="modal-backdrop hidden" id="tokenModal" role="dialog" aria-modal="true" aria-labelledby="tokenModalTitle">
+  <form class="modal" id="tokenForm" autocomplete="off">
+    <span class="label">Assessor access</span>
+    <h2 id="tokenModalTitle">Admin token</h2>
+    <p id="tokenModalNote">Needed for overrides and demo reset. Kept in this browser only.</p>
+    <div class="token-row">
+      <input id="tokenInput" type="password" aria-label="Admin token" placeholder="Admin token">
+      <button class="btn btn-primary" id="tokenUnlock" type="submit" disabled>Unlock</button>
+    </div>
+  </form>
 </div>
 
 <script src="app.js"></script>

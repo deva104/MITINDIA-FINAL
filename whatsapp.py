@@ -565,33 +565,22 @@ def _estimate_range(estimate):
     )
 
 
-def _is_authenticity_signal(value):
-    text = str(value or "").lower()
-    return any(term in text for term in (
-        "ai generation", "ai-generation", "ai_generated",
-        "generated image", "artificially generated", "fraud",
-    ))
-
-
 def _undetermined_lines(items):
-    if not items:
+    """What the customer can do to complete the claim. Only entries marked
+    customer_actionable are shown, as requests; forensics, provider and model
+    details are for the assessor console only."""
+    requests = []
+    for item in items or []:
+        if not isinstance(item, dict) or item.get("audience") != "customer_actionable":
+            continue
+        request = str(item.get("request") or "").strip()
+        if request and request not in requests:
+            requests.append(request)
+    if not requests:
         return []
-    reason_labels = {
-        "value present but illegible": "illegible on the document",
-        "metadata stripped in transit": "metadata removed in transit",
-    }
-    items = [item for item in items if item.get("item") != "Primary vision provider"]
-    if not items:
-        return []
-    lines = ["", "*Could not determine:*"]
-    for item in items:
-        reason = reason_labels.get(item.get("reason"), item.get("reason"))
-        label = item.get("item")
-        if _is_authenticity_signal(label) or _is_authenticity_signal(reason):
-            label = "Photo authenticity"
-            reason = "independent verification unavailable"
-        lines.append(f"- {label} — {reason}")
-    return lines
+    return ["", "*To complete your claim:*"] + [
+        f"- {request[0].upper()}{request[1:].rstrip('.')}." for request in requests
+    ]
 
 
 def _single_vehicle_reply(claim_id, vehicle, excluded_count=0, total_photos=None,
@@ -653,12 +642,9 @@ def _single_vehicle_reply(claim_id, vehicle, excluded_count=0, total_photos=None
         lines += ["", f"*Estimate: {_estimate_range(estimate)}*"]
     lines += _undetermined_lines(undetermined)
     if decision == "needs_review":
-        reasons = decision_reasons or []
-        if any(_is_authenticity_signal(reason) for reason in reasons):
-            first_reason = "photo authenticity requires verification"
-        else:
-            first_reason = reasons[0] if reasons else "automated checks require review"
-        lines += ["", f"Flagged for manual review: {first_reason.rstrip('.')}."]
+        # The reasons stay in the console: they can name forensic checks a
+        # customer must not see. What the customer can fix is listed above.
+        lines += ["", "Flagged for manual review. An assessor will check your claim."]
     elif excluded_count:
         lines += ["", "Flagged for manual review."]
     return "\n".join(lines)

@@ -116,6 +116,7 @@ class ConfidenceTests(unittest.TestCase):
             "item": "Front Left Door damage",
             "reason": "model did not report confidence for front left door",
             "impact": "excluded from the headline estimate until an assessor confirms it",
+            "audience": "internal",
         }, payload["undetermined"])
         self.assertIn("Model did not report confidence for front left door",
                       payload["decision_reasons"])

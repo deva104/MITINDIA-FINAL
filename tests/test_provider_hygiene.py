@@ -66,14 +66,15 @@ class ProviderHygieneTests(unittest.TestCase):
         lines = whatsapp._undetermined_lines([
             {"item": "Primary vision provider",
              "reason": "groq unavailable (RateLimitError (HTTP 429)), fell back to gemini",
-             "impact": "result produced by gemini instead"},
+             "impact": "result produced by gemini instead", "audience": "internal"},
             {"item": "Claim form", "reason": "required document not provided",
-             "impact": "claim documentation incomplete"},
+             "impact": "claim documentation incomplete",
+             "audience": "customer_actionable", "request": "please send your claim form"},
         ])
         text = "\n".join(lines)
         self.assertNotIn("vision provider", text)
         self.assertNotIn("groq", text)
-        self.assertIn("Claim form", text)
+        self.assertIn("Please send your claim form.", text)
         self.assertEqual(whatsapp._undetermined_lines([
             {"item": "Primary vision provider", "reason": "x", "impact": "y"},
         ]), [])

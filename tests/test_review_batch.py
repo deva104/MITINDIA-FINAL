@@ -243,19 +243,21 @@ class ProviderReportingTests(unittest.TestCase):
                 result = vision.generate_json(parts + [("text", "x")], "probe")
             except vision.VisionUnavailable as error:
                 result = error
+            self.calls = list(vision.provenance())
             return result, list(vision.fallbacks_used())
         finally:
             for stub in reversed(stubs):
                 stub.stop()
 
-    def test_capacity_skip_is_not_undetermined(self):
+    def test_capacity_skip_is_routing_shown_in_the_trace(self):
         result, fallbacks = self.run_chain(lambda provider, label: {"ok": provider}, images=4)
         self.assertEqual(result, {"ok": "gemini"})
         self.assertEqual(fallbacks[0]["reason"], "skipped")
         self.assertEqual(fallbacks[0]["detail"], "4 images exceeds groq limit 3")
-        self.assertEqual(main.build_undetermined({}, fallbacks), [])
+        self.assertEqual(vision.summarise_provenance(self.calls),
+                         "via gemini (groq skipped: image limit)")
 
-    def test_real_failure_is_undetermined_with_its_cause(self):
+    def test_recovered_failure_is_provenance_not_undetermined(self):
         def behaviour(provider, label):
             if provider == "groq":
                 raise RuntimeError("rate limited")
@@ -264,9 +266,10 @@ class ProviderReportingTests(unittest.TestCase):
         result, fallbacks = self.run_chain(behaviour, images=1)
         self.assertEqual(result, {"ok": "gemini"})
         self.assertEqual(fallbacks[0]["reason"], "failed")
-        entries = main.build_undetermined({}, fallbacks)
-        self.assertEqual(entries[0]["item"], "Primary vision provider")
-        self.assertIn("groq unavailable (RuntimeError: rate limited)", entries[0]["reason"])
+        # A fallback that still produced a result is provenance, not uncertainty.
+        self.assertEqual(vision.summarise_provenance(self.calls),
+                         "via gemini (groq unavailable)")
+        self.assertEqual(main.build_undetermined({}), [])
 
     def test_exhausted_chain_names_every_provider(self):
         def behaviour(provider, label):
@@ -473,6 +476,7 @@ class ElaCalibrationTests(unittest.TestCase):
             "item": "Photo editing",
             "reason": "error-level analysis cannot tell recompression from editing on these photos",
             "impact": "editing neither confirmed nor ruled out",
+            "audience": "internal",
         }, entries)
 
 

@@ -40,9 +40,11 @@ from db import (
     media_put,
     save_claim,
     save_file,
+    utc_now_iso,
     storage_stats,
 )
 from gemini import (
+    DOCUMENT_FIELDS,
     MAX_PDF_PAGES,
     assign_damage_ids,
     assess_damage,
@@ -57,9 +59,16 @@ from rules import (
     establish_documents,
     reported_confidence,
     route_classification,
+    identity_notes,
     run_rules,
 )
-from vision import fallbacks_used, provider_status, reset_cache_tracking, stage_was_cached
+from vision import (
+    provenance,
+    provider_status,
+    reset_cache_tracking,
+    stage_was_cached,
+    summarise_provenance,
+)
 
 import whatsapp as wa
 from whatsapp import (
@@ -578,6 +587,9 @@ RULE_FIELD_IMPACTS = {
     "insured_name_claim_form": (
         "Insured name", "identity consistency not verified"
     ),
+    "driver_name_claim_form": (
+        "Driver name", "driver not matched to the licence holder"
+    ),
     "owner_name_rc": (
         "Registered owner name", "identity consistency not verified"
     ),
@@ -641,7 +653,7 @@ def format_vehicle_label(parts):
     return " ".join(words)
 
 
-def build_undetermined(payload, provider_fallbacks=None):
+def build_undetermined(payload):
     entries = []
     for field in payload.get("fields") or []:
         if not isinstance(field, dict):
@@ -659,11 +671,15 @@ def build_undetermined(payload, provider_fallbacks=None):
             reason = "not present in submitted documents"
         else:
             continue
-        entries.append({
+        entry = {
             "item": field_info[0],
             "reason": reason,
             "impact": field_info[1],
-        })
+        }
+        document = _document_label_for_field(field.get("name"))
+        if status == "unreadable" and document:
+            _ask(entry, f"please send a clearer photo of your {document}")
+        entries.append(entry)
 
     for item in payload.get("damage") or []:
         if not isinstance(item, dict):
@@ -722,28 +738,44 @@ def build_undetermined(payload, provider_fallbacks=None):
             })
 
     document_check = payload.get("document_check") or {}
+    received = document_check.get("received") or {}
+    holder_read = any(
+        isinstance(field, dict) and field.get("name") == "holder_name_dl"
+        and field.get("status") == "found"
+        for field in payload.get("fields") or []
+    )
+    if document_check and holder_read and not received.get("claim_form"):
+        entries.append({
+            "item": "Driver identity",
+            "reason": "no claim form, so the licence cannot be matched to the driver",
+            "impact": "driver identity not verified",
+        })
     unread = int(document_check.get("unread_documents") or 0)
     for doc_type in document_check.get("missing") or []:
-        entries.append({
-            "item": DOCUMENT_LABELS.get(doc_type, doc_type.replace("_", " ").title()),
+        label = DOCUMENT_LABELS.get(doc_type, doc_type.replace("_", " ").title())
+        entries.append(_ask({
+            "item": label,
             "reason": (
                 f"not established: {unread} received document"
                 f"{'' if unread == 1 else 's'} could not be read"
                 if unread else "required document not provided"
             ),
             "impact": "claim documentation incomplete",
-        })
+        }, (
+            f"please send a clear photo of each page of your {label.lower()}"
+            if unread else f"please send your {label.lower()}"
+        )))
 
     vehicle_photos = [
         photo for photo in (payload.get("photos") or [])
         if isinstance(photo, dict) and photo.get("is_vehicle") is True
     ]
     if vehicle_photos and any(not photo.get("number_plate") for photo in vehicle_photos):
-        entries.append({
+        entries.append(_ask({
             "item": "Number plate",
             "reason": "not legible in photos",
             "impact": "vehicle identity not verified from the photographs",
-        })
+        }, "please send a clear photo of the number plate"))
 
     if any(
         isinstance(item, dict)
@@ -792,30 +824,29 @@ def build_undetermined(payload, provider_fallbacks=None):
                 "impact": "photo authenticity not independently checked",
             })
 
-    for fallback in provider_fallbacks or []:
-        # A capacity skip ("4 images exceeds groq limit 3") is normal routing.
-        # Only a provider that failed changed who produced the result.
-        if fallback.get("reason", "failed") != "failed":
-            continue
-        detail = fallback.get("detail")
-        entries.append({
-            "item": "Primary vision provider",
-            "reason": (
-                f"{fallback['from']} unavailable"
-                + (f" ({detail})" if detail else "")
-                + f", fell back to {fallback['to']}"
-            ),
-            "impact": f"result produced by {fallback['to']} instead",
-        })
-
     unique = []
     seen = set()
     for entry in entries:
+        entry.setdefault("audience", "internal")
         key = (entry["item"], entry["reason"], entry["impact"])
         if key not in seen:
             seen.add(key)
             unique.append(entry)
     return unique
+
+
+def _document_label_for_field(name):
+    for doc_type, field_names in DOCUMENT_FIELDS.items():
+        if name in field_names:
+            return DOCUMENT_LABELS.get(doc_type, doc_type).lower()
+    return None
+
+
+def _ask(entry, request):
+    """Mark an undetermined entry as something the customer can fix."""
+    entry["audience"] = "customer_actionable"
+    entry["request"] = request
+    return entry
 
 
 def build_vehicle_groups(photos, damage, excluded, photo_urls=None):
@@ -1000,7 +1031,6 @@ def _analyse_claim_sync(
 
     timings = []
     excluded_photos = []
-    provider_fallbacks = []
     photo_url_map = {}
     classifications = []
     unclassified = []
@@ -1014,9 +1044,13 @@ def _analyse_claim_sync(
         if str(reason).strip()
     ]
 
-    def stage_done(name, since, cached=False):
+    def stage_done(name, since, cached=False, calls=None):
         elapsed = round(time.perf_counter() - since, 2)
-        timings.append({"stage": name, "seconds": elapsed, "cached": bool(cached)})
+        entry = {"stage": name, "seconds": elapsed, "cached": bool(cached)}
+        if calls:
+            entry["providers"] = list(calls)
+            entry["via"] = summarise_provenance(calls)
+        timings.append(entry)
         print(f"[analyze] {claim_id} {name}: {elapsed:.2f}s", flush=True)
 
     def make_payload(status, stopped_at, fields=None, damage=None, forensics=None,
@@ -1024,7 +1058,7 @@ def _analyse_claim_sync(
                      vehicles=None, claimable_count=0):
         payload = {
             "claim_id": claim_id,
-            "created_at": datetime.now().isoformat(),
+            "created_at": utc_now_iso(),
             "source": source,
             "from_number": from_number,
             "status": status,
@@ -1043,6 +1077,7 @@ def _analyse_claim_sync(
                 key: value for key, value in extraction.items() if key != "fields"
             },
             "document_check": document_check,
+            "notes": identity_notes(fields or []),
             "damage": damage or [],
             "forensics": forensics or [],
             "flags": flags or [],
@@ -1050,9 +1085,7 @@ def _analyse_claim_sync(
             "vehicles": vehicles or [],
             "claimable_count": claimable_count,
         }
-        payload["undetermined"] = build_undetermined(
-            payload, provider_fallbacks
-        )
+        payload["undetermined"] = build_undetermined(payload)
         assessment = assess_confidence(payload)
         payload["decision"] = assessment["decision"]
         payload["decision_reasons"] = assessment["reasons"]
@@ -1103,7 +1136,8 @@ def _analyse_claim_sync(
                 })
             else:
                 unclassified.append(entry)
-        stage_done("stage0_5_classify", mark, cached=stage_was_cached())
+        stage_done("stage0_5_classify", mark, cached=stage_was_cached(),
+                   calls=provenance())
 
         # Stage 0.5 - duplicate screen on vehicle photos only, before any
         # damage assessment is paid for.
@@ -1156,8 +1190,8 @@ def _analyse_claim_sync(
         )
         documents_received.update(document_check["received"])
         result = assess_damage(clean_paths)
-        provider_fallbacks = list(fallbacks_used())
-        stage_done("stage1_gemini", mark, cached=stage_was_cached())
+        stage_done("stage1_gemini", mark, cached=stage_was_cached(),
+                   calls=provenance())
 
         description = result.get("vehicle_description") or ""
         photos = result.get("photos") or []

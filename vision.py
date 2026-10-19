@@ -39,6 +39,8 @@ PROVIDER_KEYS = {
 }
 _CACHE_EVENTS = ContextVar("vision_cache_events", default=())
 _FALLBACK_EVENTS = ContextVar("vision_fallback_events", default=())
+# Which provider answered each call, and why earlier ones did not.
+_PROVENANCE = ContextVar("vision_provenance", default=())
 
 
 class VisionUnavailable(RuntimeError):
@@ -87,6 +89,7 @@ def short_error(error, limit=160):
 def reset_cache_tracking():
     _CACHE_EVENTS.set(())
     _FALLBACK_EVENTS.set(())
+    _PROVENANCE.set(())
 
 
 def stage_was_cached():
@@ -96,6 +99,52 @@ def stage_was_cached():
 
 def fallbacks_used():
     return _FALLBACK_EVENTS.get()
+
+
+def provenance():
+    return _PROVENANCE.get()
+
+
+def _record_provenance(label, provider, fallbacks, cached=False):
+    _PROVENANCE.set(_PROVENANCE.get() + ({
+        "call": label.split("(", 1)[0],
+        "provider": provider,
+        "cached": cached,
+        "fallbacks": [dict(item) for item in fallbacks],
+    },))
+
+
+def _why(fallback):
+    detail = str(fallback.get("detail") or "")
+    name = fallback.get("from")
+    if "(HTTP 429)" in detail or "RateLimit" in detail:
+        return f"{name} rate-limited"
+    if "exceeds" in detail:
+        return f"{name} skipped: image limit"
+    if detail.endswith("is not set"):
+        return f"{name} not configured"
+    return f"{name} unavailable"
+
+
+def summarise_provenance(events):
+    """One line for the pipeline trace, e.g. "via gemini (groq rate-limited)".
+    None when the stage made no vision call."""
+    events = list(events or [])
+    if not events:
+        return None
+    if all(event.get("cached") for event in events):
+        return "cached"
+    providers, reasons = [], []
+    for event in events:
+        provider = "cache" if event.get("cached") else event.get("provider")
+        if provider and provider not in providers:
+            providers.append(provider)
+        for fallback in event.get("fallbacks") or []:
+            reason = _why(fallback)
+            if reason not in reasons:
+                reasons.append(reason)
+    text = "via " + ", ".join(providers)
+    return text + (f" ({'; '.join(reasons)})" if reasons else "")
 
 
 def _record_cache_event(cached):
@@ -170,6 +219,7 @@ def generate_json(parts, label) -> dict:
                 f"({cached['provider']}/{cached['model']})",
                 flush=True,
             )
+            _record_provenance(label, cached.get("provider"), [], cached=True)
             return cached["response"]
     _record_cache_event(False)
 
@@ -234,6 +284,7 @@ def generate_json(parts, label) -> dict:
                                 flush=True,
                             )
                     _FALLBACK_EVENTS.set(_FALLBACK_EVENTS.get() + tuple(pending_fallbacks))
+                    _record_provenance(label, provider, pending_fallbacks)
                     return response
         attempts.append((provider, outcome[0], outcome[1]))
 

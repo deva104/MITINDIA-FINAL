@@ -4,7 +4,7 @@ import os
 import sqlite3
 import time
 from contextvars import ContextVar
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -316,6 +316,26 @@ else:
     print("[db] backend=sqlite", flush=True)
 
 
+def utc_now_iso():
+    """Every stored timestamp: timezone-aware UTC, e.g. 2026-10-19T05:51:43+00:00.
+    Browsers then render it in the viewer's local time."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def as_utc_iso(value):
+    """Rows written before timestamps were zoned are naive; the server ran in
+    UTC, so they are read as UTC. Anything unparseable is returned unchanged."""
+    if not value or not isinstance(value, str):
+        return value
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 def database_backend():
     return BACKEND
 
@@ -433,7 +453,7 @@ def _json(value):
 
 
 def save_claim(claim_id, payload_dict):
-    created_at = payload_dict.get("created_at") or datetime.now().isoformat()
+    created_at = as_utc_iso(payload_dict.get("created_at")) or utc_now_iso()
     payload = json.dumps(payload_dict, ensure_ascii=False)
     conn = get_conn()
     try:
@@ -536,7 +556,10 @@ def get_claim(claim_id):
         ).fetchone()
         if not row:
             return None
-        return json.loads(row["payload_json"])
+        payload = json.loads(row["payload_json"])
+        if isinstance(payload, dict) and payload.get("created_at"):
+            payload["created_at"] = as_utc_iso(payload["created_at"])
+        return payload
     finally:
         conn.close()
 
@@ -568,7 +591,7 @@ def audit_log_add(
     conn = get_conn()
     try:
         _ensure_audit_log(conn)
-        timestamp = created_at or datetime.now().isoformat()
+        timestamp = as_utc_iso(created_at) or utc_now_iso()
         values = (
             claim_id,
             actor,
@@ -620,7 +643,7 @@ def audit_log_for_claim(claim_id):
             """,
             (claim_id,),
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [dict(row, created_at=as_utc_iso(row["created_at"])) for row in rows]
     finally:
         conn.close()
 
@@ -689,7 +712,7 @@ def cache_put(content_hash, label, response, provider, model):
             json.dumps(response, ensure_ascii=False),
             provider,
             model,
-            datetime.now().isoformat(),
+            utc_now_iso(),
         )
         if BACKEND == "postgres":
             conn.execute(
@@ -788,7 +811,7 @@ def media_put(data, mime, kind, claim_id):
             kind,
             mime,
             data,
-            datetime.now().isoformat(),
+            utc_now_iso(),
         )
         # Same bytes stored again keep the first row, but a claim id is adopted so
         # session cleanup never deletes a blob a claim now points at.
@@ -1046,7 +1069,9 @@ SESSION_MEDIA_KINDS = ("photo", "document", "document_page")
 def purge_orphan_session_media(older_than_seconds):
     """Delete session blobs (claim_id NULL) that no session row references and
     that are older than the given age. Returns the number of blobs removed."""
-    cutoff = datetime.fromtimestamp(time.time() - older_than_seconds).isoformat()
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
+    ).isoformat()
     marks = ", ".join("?" for _ in SESSION_MEDIA_KINDS)
     conn = get_conn()
     try:
@@ -1110,7 +1135,7 @@ def list_claims():
         out.append(
             {
                 "claim_id": r["claim_id"],
-                "created_at": r["created_at"],
+                "created_at": as_utc_iso(r["created_at"]),
                 "status": payload.get("status"),
                 "stopped_at": payload.get("stopped_at"),
                 "decision": payload.get("decision"),

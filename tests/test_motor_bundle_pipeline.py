@@ -19,6 +19,8 @@ PHOTO_NAME = "synthetic_damage.jpg"
 
 FIELD_VALUES = {
     "insured_name_claim_form": "R. K. Sharma",
+    # "Driver Name & Driving Licence Number: R. K. Sharma" on the claim form.
+    "driver_name_claim_form": "R. K. Sharma",
     "owner_name_rc": "RAJESH KUMAR SHARMA",
     "holder_name_dl": "RAJESH KUMAR SHARMA",
     "registration_number_claim_form": "MH-12-AB-1234",
@@ -124,13 +126,19 @@ class MotorBundlePipelineTests(unittest.TestCase):
             )
 
         fields = payload["fields"]
-        self.assertEqual(len(fields), 17)
+        self.assertEqual(len(fields), 18)
         self.assertTrue(
             all(field["status"] == "found" for field in fields if field["value"])
         )
 
         rules = {flag["rule"] for flag in payload["flags"]}
+        # The insured matches the RC owner and the driver matches the licence
+        # holder (initials against the full name); the owner holds the licence,
+        # so there is no driver-not-owner note either.
+        self.assertNotIn("insured_owner_mismatch", rules)
+        self.assertNotIn("driver_licence_mismatch", rules)
         self.assertNotIn("name_mismatch", rules)
+        self.assertEqual(payload["notes"], [])
         self.assertNotIn("registration_mismatch", rules)
         self.assertIn("dl_expired_at_loss", rules)
         self.assertNotIn("policy_not_active", rules)

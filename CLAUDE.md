@@ -122,6 +122,72 @@ Runtime:
   every request to them gets a 401. The console asks for the token once and
   keeps it in localStorage.
 
+## Domain and presentation rules
+
+- **Timestamps.** Every stored timestamp is timezone-aware UTC
+  (`db.utc_now_iso()`, `+00:00`). Browsers render it in local time. Legacy
+  naive rows are read as UTC (`db.as_utc_iso`). Session, inbound and dedup
+  times are epoch seconds.
+- **Owner vs driver.** In Indian motor insurance the driver need not be the
+  owner.
+  - The insured on the claim form is matched to the RC owner
+    (`insured_owner_mismatch`, HIGH).
+  - The claim form's driver is matched to the licence holder
+    (`driver_licence_mismatch`, HIGH).
+  - RC owner vs licence holder alone is only an INFO note
+    (`payload.notes`, `driver_not_owner`), never a flag.
+  - No claim form → undetermined "Driver identity".
+- **Who sees what.** Each undetermined entry has an `audience`.
+  - `customer_actionable` entries carry a `request`: missing or unread
+    documents, an illegible plate, an illegible document field. WhatsApp
+    shows only these, as "To complete your claim" requests.
+  - Everything else is `internal`: forensics, AI check, EXIF, ELA, model
+    confidence, providers. It is shown only in the console.
+  - The WhatsApp review line never gives the reason.
+- **Provider provenance.** A fallback that still produced a result is not
+  uncertainty. It appears on the stage in the pipeline trace (`timings[].via`,
+  e.g. "via gemini (groq rate-limited)"), not under undetermined. Only a
+  failure that left something unknown is undetermined.
+
+## Known behaviour
+
+### Sightengine AI-generation check: live calibration, 19 Oct 2026
+
+How it was measured:
+- Four images scored with the live Sightengine `genai` model through the
+  pipeline's own `forensics.check_ai_generated`.
+- Thresholds unchanged: **suspicious ≥ 0.85, inconclusive 0.50–0.85,
+  clean < 0.50**.
+- Each image scored twice; the repeat came from the vision cache.
+
+| image | file | score | verdict | first call | repeat |
+|---|---|---|---|---|---|
+| real photo, taken on own phone | phone.jpeg, 1076×1128, no EXIF | **0.990** | **suspicious** | 2.68s | 0.01s, cache hit, same result |
+| image downloaded from Google | google.jpeg, 1600×1200 | 0.001 | clean | 2.31s | 0.01s, cache hit, same result |
+| YouTube screenshot | youtube.jpeg, 1548×695 (same file as `test data/Photos/CAR A PIC1.jpeg`) | 0.001 | clean | 2.52s | 0.00s, cache hit, same result |
+| AI-generated damaged car | ai.jpeg, 1376×768 | 0.990 | suspicious | 2.91s | 0.00s, cache hit, same result |
+
+What this shows, for Q&A:
+- **A genuine phone photo scored as high as a generated image.** The photo
+  shows heavy phone-side AI enhancement: smoothed textures and
+  over-sharpened edges, typical of AI zoom or super-resolution. The detector
+  flags AI *processing*, not only AI *fabrication*.
+- **A downloaded image and a screenshot scored clean**, although neither is
+  an original capture. The check says nothing about provenance or reuse.
+- **So the check is one signal, never a verdict.** A "suspicious" score adds
+  a HIGH review flag and "photo authenticity requires verification". It
+  never rejects a claim; an assessor decides. Thresholds were deliberately
+  not tuned to make these four images pass or fail.
+- **Caching:** each repeat came from the content-hash cache in about 0.01s,
+  with no second API call and an identical result.
+
+### Groq free tier
+
+Groq's free tier allows about 7,000 input tokens per minute. One image call
+is about 2,200 tokens, so roughly three image calls a minute. Beyond that the
+call returns 429 and the chain moves straight to Gemini (no retry). The
+claim still completes, with the result produced by the fallback.
+
 ## Known limitations
 
 - The Sightengine AI-generation check sees the re-encoded photo, not the

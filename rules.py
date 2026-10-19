@@ -48,7 +48,21 @@ SURVEY_REASON = (
     "losses below Rs 50,000."
 )
 
-NAME_FIELDS = ("insured_name_claim_form", "owner_name_rc", "holder_name_dl")
+# In Indian motor insurance the driver need not be the owner. The insured is
+# matched to the RC owner and the driver to the licence holder; owner versus
+# licence holder on its own is information, never a flag.
+NAME_CHECKS = (
+    (
+        "insured_owner_mismatch", "insured_name_claim_form", "owner_name_rc",
+        "Insured name on the claim form ('{a}') does not match the registered "
+        "owner on the RC ('{b}').",
+    ),
+    (
+        "driver_licence_mismatch", "driver_name_claim_form", "holder_name_dl",
+        "Driver named on the claim form ('{a}') does not match the driving "
+        "licence holder ('{b}').",
+    ),
+)
 HONORIFICS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR"}
 DATE_FIELDS = (
     "dl_expiry_date",
@@ -137,9 +151,9 @@ def infer_document_types(fields):
     if found & {"holder_name_dl", "dl_number", "dl_expiry_date"}:
         inferred.add("driving_licence")
     if found & {
-        "insured_name_claim_form", "registration_number_claim_form",
-        "accident_date", "accident_time", "accident_location",
-        "accident_description",
+        "insured_name_claim_form", "driver_name_claim_form",
+        "registration_number_claim_form", "accident_date", "accident_time",
+        "accident_location", "accident_description",
     }:
         inferred.add("claim_form")
     if found & {"policy_number", "policy_start_date", "policy_end_date"}:
@@ -297,21 +311,16 @@ def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None
     flags = []
     damage = damage or []
 
-    # 1. name_mismatch
-    names = {n: get_field(fields, n) for n in NAME_FIELDS}
-    present_names = [(name, value) for name, value in names.items() if value]
-    for index, (a, a_value) in enumerate(present_names):
-        for b, b_value in present_names[index + 1:]:
-            if not _names_match(a_value, b_value):
-                flags.append({
-                    "rule": "name_mismatch",
-                    "severity": "HIGH",
-                    "message": (
-                        f"Name on {a} ('{a_value}') does not match "
-                        f"{b} ('{b_value}')."
-                    ),
-                    "evidence": [a, b],
-                })
+    # 1. insured vs RC owner, and claim-form driver vs licence holder
+    for rule, field_a, field_b, template in NAME_CHECKS:
+        a_value, b_value = get_field(fields, field_a), get_field(fields, field_b)
+        if a_value and b_value and not _names_match(a_value, b_value):
+            flags.append({
+                "rule": rule,
+                "severity": "HIGH",
+                "message": template.format(a=a_value, b=b_value),
+                "evidence": [field_a, field_b],
+            })
 
     date_values = {name: get_field(fields, name) for name in DATE_FIELDS}
     parsed_dates = {}
@@ -507,6 +516,24 @@ def reported_confidence(item):
     if value != value:
         return None
     return max(0.0, min(1.0, value))
+
+
+def identity_notes(fields):
+    """Information about who drove, never a flag: the licence holder may
+    legitimately differ from the registered owner."""
+    owner = get_field(fields, "owner_name_rc")
+    holder = get_field(fields, "holder_name_dl")
+    if owner and holder and not _names_match(owner, holder):
+        return [{
+            "rule": "driver_not_owner",
+            "severity": "INFO",
+            "message": (
+                f"The driver is not the registered owner: the licence holder is "
+                f"'{holder}', the RC owner is '{owner}'. A driver need not be the owner."
+            ),
+            "evidence": ["holder_name_dl", "owner_name_rc"],
+        }]
+    return []
 
 
 def _damage_confidence(item):

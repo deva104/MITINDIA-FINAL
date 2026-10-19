@@ -115,6 +115,7 @@ class AiDetectionTests(unittest.TestCase):
             "item": "AI-generation check",
             "reason": "Sightengine credentials are not configured",
             "impact": "photo authenticity not independently checked",
+            "audience": "internal",
         }, undetermined)
 
     def test_suspicious_signal_flags_and_requires_review(self):
@@ -160,6 +161,7 @@ class AiDetectionTests(unittest.TestCase):
             "item": "Photo authenticity",
             "reason": "AI-generation score inconclusive (0.62)",
             "impact": "authenticity not confirmed",
+            "audience": "internal",
         }, undetermined)
 
     def test_duplicate_and_non_vehicle_stop_before_sightengine(self):
@@ -388,11 +390,11 @@ class AiDetectionTests(unittest.TestCase):
             "undetermined": [],
         })
 
-        self.assertIn(
-            "Flagged for manual review: photo authenticity requires verification.",
-            reply,
-        )
+        # The customer is told an assessor will check the claim, never which
+        # forensic check raised it.
+        self.assertIn("Flagged for manual review. An assessor will check your claim.", reply)
         lowered = reply.lower()
+        self.assertNotIn("authenticity", lowered)
         self.assertNotIn("ai generation", lowered)
         self.assertNotIn("ai-generation", lowered)
         self.assertNotIn("fraud", lowered)

@@ -91,7 +91,7 @@ EXTRACT_PROMPT = """You are reading Indian motor insurance claim documents (clai
 Registration Certificate, Driving Licence, policy schedule).
 Extract these fields. Return JSON: {"fields":[{"name","value","source_doc","confidence","status"}]}
 Field names to extract, exactly these keys:
-  insured_name_claim_form, owner_name_rc, holder_name_dl,
+  insured_name_claim_form, driver_name_claim_form, owner_name_rc, holder_name_dl,
   registration_number_claim_form, registration_number_rc,
   chassis_number, engine_number, vehicle_make_model,
   dl_number, dl_expiry_date, policy_number,
@@ -204,9 +204,9 @@ DOCUMENT_FIELDS = {
     ),
     "driving_licence": ("holder_name_dl", "dl_number", "dl_expiry_date"),
     "claim_form": (
-        "insured_name_claim_form", "registration_number_claim_form",
-        "accident_date", "accident_time", "accident_location",
-        "accident_description",
+        "insured_name_claim_form", "driver_name_claim_form",
+        "registration_number_claim_form", "accident_date", "accident_time",
+        "accident_location", "accident_description",
     ),
     "policy": ("policy_number", "policy_start_date", "policy_end_date"),
 }

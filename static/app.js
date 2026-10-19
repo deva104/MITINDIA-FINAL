@@ -11,6 +11,7 @@
   
   const LABELS = {
     insured_name_claim_form: 'Insured name (claim form)',
+    driver_name_claim_form: 'Driver name (claim form)',
     owner_name_rc: 'Owner name (RC)',
     holder_name_dl: 'Holder name (licence)',
     registration_number_claim_form: 'Registration no. (claim form)',
@@ -28,6 +29,9 @@
     accident_location: 'Accident location',
     accident_description: 'Accident description',
     name_mismatch: 'Name mismatch across documents',
+    insured_owner_mismatch: 'Insured is not the registered owner',
+    driver_licence_mismatch: 'Driver does not match the licence holder',
+    driver_not_owner: 'Driver is not the registered owner',
     registration_mismatch: 'Registration number mismatch',
     dl_expired_at_loss: 'Licence expired at time of loss',
     policy_not_active: 'Policy not active on accident date',
@@ -674,7 +678,8 @@
       if (t && t.stage) {
         map[t.stage] = {
           seconds: Number(t.seconds) || 0,
-          cached: t.cached === true
+          cached: t.cached === true,
+          via: typeof t.via === 'string' ? t.via : ''
         };
       }
     });
@@ -693,8 +698,9 @@
       const pct = Math.max(2, (sec / max) * 100);
       const slim = pct < 12 ? ' slim' : '';
       const cached = timing.cached === true;
+      const via = timing.via && timing.via !== 'cached' ? ` — ${esc(timing.via)}` : '';
       return `<div class="bar-row ${cached ? 'is-cached' : ''}">
-        <span class="bar-name">${s.label}${cached ? ' — cached' : ''}</span>
+        <span class="bar-name">${s.label}${cached ? ' — cached' : via}</span>
         <div class="bar-track"><div class="bar-fill${slim}" style="width:${pct}%"></div></div>
         <span class="bar-time">${sec.toFixed(2)}s</span></div>`;
     }).join('');
@@ -783,6 +789,14 @@
     return '';
   }
 
+  /* Information about the claim that is never a flag (e.g. the driver is
+     not the registered owner, which is normal). */
+  function notesHtml(p) {
+    return list(p.notes).filter(n => n && typeof n === 'object').map(n => `<div class="row">
+        <div class="row-top"><span class="row-title">${esc(human(n.rule))}</span><span class="pill pill-mute">info</span></div>
+        <p class="row-text">${esc(n.message || '')}</p></div>`).join('');
+  }
+
   function renderFlags(p) {
     const flags = Array.isArray(p.flags) ? p.flags : [];
     const notice = flagsNotice(p);
@@ -800,10 +814,10 @@
             : 'No cross-document checks — no document fields were read.';
         }
       }
-      $('flags').innerHTML = `<p class="empty">${esc(text)}</p>`;
+      $('flags').innerHTML = `<p class="empty">${esc(text)}</p>` + notesHtml(p);
       return;
     }
-    $('flags').innerHTML = (notice ? `<p class="empty">${esc(notice)}</p>` : '') + flags.map(f => {
+    $('flags').innerHTML = (notice ? `<p class="empty">${esc(notice)}</p>` : '') + notesHtml(p) + flags.map(f => {
       const ev = Array.isArray(f.evidence) ? f.evidence : [];
       const chips = ev.length
         ? `<div class="chips">${ev.map(e => `<span class="chip">${esc(human(e))}</span>`).join('')}</div>`

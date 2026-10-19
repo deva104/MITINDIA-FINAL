@@ -133,11 +133,33 @@ Runtime:
   - The live pipeline never waits for a key. `seed_demo.py` calls
     `vision.wait_for_keys(True)`: when every key of every provider is
     limited it sleeps until the soonest one returns (at most 60 s a step).
-- Admin endpoints (`/api/demo/reset`, `/api/claims/{id}/override`,
-  `/api/whatsapp/subscribe`, `/api/whatsapp/status`) require the
-  `X-Admin-Token` header to equal `ADMIN_TOKEN`. When `ADMIN_TOKEN` is unset,
-  every request to them gets a 401. The console asks for the token once and
-  keeps it in localStorage.
+- **Access.** Claim data is personal data: names, licence and chassis
+  numbers, phone numbers, document photos.
+  - These require the `X-Admin-Token` header to equal `ADMIN_TOKEN` (401
+    otherwise, and always when `ADMIN_TOKEN` is unset): `/api/claims`,
+    `/api/claims/{id}`, `/api/analyze`, `/api/storage`, `/api/demo/reset`,
+    `/api/claims/{id}/override`, `/api/whatsapp/subscribe`,
+    `/api/whatsapp/status`.
+  - `/media/{id}` needs a signature, not the header, because `<img>` cannot
+    send one. Claim responses carry `?exp=…&sig=…` (HMAC from `ADMIN_TOKEN`,
+    valid 6–7 h, `main.sign_media_urls`); anything else gets a 403. The cache
+    header is `private`.
+  - Open by design: `/api/health` (configuration and labels only) and
+    `/webhook`.
+  - The console asks for the token once at load, again after a 401, and
+    keeps it in localStorage. A dismissed prompt is not repeated by the
+    3-second poll; the feed shows an "Enter admin token" button instead.
+- **Webhook signature.** With `WHATSAPP_APP_SECRET` set (Meta app settings,
+  App secret), `POST /webhook` must carry a valid `X-Hub-Signature-256`
+  (HMAC-SHA256 of the raw body) or it gets a 403. Unset: a WARNING per
+  request and the request is accepted. `/api/health` reports
+  `webhook_signature: enforced | not_configured`.
+- **No phone numbers in logs.** Log a sender with `whatsapp.who()` (last four
+  digits), a message with `whatsapp.message_ref()` (a wamid embeds the
+  number), and any provider response body through `whatsapp.log_safe()`.
+- **Warm-up.** `imagehash.phash` imports `scipy.fftpack` on first use, about
+  4 s on Render's CPU. `forensics.warm_up` runs it in a thread at startup
+  and logs `[forensics] warm-up: phash ready in …s`.
 
 ## Domain and presentation rules
 
@@ -154,6 +176,21 @@ Runtime:
   - RC owner vs licence holder alone is only an INFO note
     (`payload.notes`, `driver_not_owner`), never a flag.
   - No claim form → undetermined "Driver identity".
+  - Names are compared by `rules.name_match`. Word order does not matter
+    ("S Karthik" = "Karthik S"), an initial stands for a word, S/O W/O D/O
+    C/O and what follows are dropped, honorifics are ignored, and MD/MOHD
+    and PVT/LTD are aliases. A subset ("Rajesh Kumar" in "Rajesh Kumar
+    Singh") is `partial`: an INFO note (`*_partial_match`), never a flag.
+    Only a `mismatch` is HIGH. Initials alone never match.
+- **Number plates.** A plate is compared with the RC only on the claimed
+  vehicle (the first claimable group). Photos of another vehicle, such as
+  the other party's, are reported once by `vehicle_mismatch`.
+- **Survey.** An estimate whose upper bound exceeds Rs 50,000 needs a survey.
+  The reason cites the IRDAI Master Circular on Protection of Policyholders'
+  Interests, 2024 (`rules.SURVEY_REASON`); the console shows that text.
+- **Approval message.** "approved — estimated repair cost ₹a–₹b. The final
+  amount is confirmed against the repair invoice." With no confirmed
+  estimate the range is left out.
 - **Who sees what.** Each undetermined entry has an `audience`.
   - `customer_actionable` entries carry a `request`: missing or unread
     documents, an illegible plate, an illegible document field. WhatsApp

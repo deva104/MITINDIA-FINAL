@@ -4,6 +4,7 @@ except ImportError:
     from tests import bootstrap  # noqa: F401
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -89,19 +90,59 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
 
     def test_media_route_serves_stored_bytes(self):
+        from unittest.mock import patch
+
         from fastapi.testclient import TestClient
 
         media_id = db.media_put(b"route-bytes", "image/jpeg", "photo", "CLM-ROUTE")
-        with TestClient(main.app) as client:
-            response = client.get(f"/media/{media_id}")
+        with patch.dict(os.environ, {"ADMIN_TOKEN": "media-test-token"}),                 TestClient(main.app) as client:
+            signed = main.sign_media_urls({"url": f"/media/{media_id}"})["url"]
+            response = client.get(signed)
+            unsigned = client.get(f"/media/{media_id}")
+            tampered = client.get(signed[:-1] + ("0" if signed[-1] != "0" else "1"))
+            expired = client.get(main.sign_media_urls(
+                {"url": f"/media/{media_id}"}, now=time.time() - 8 * 3600)["url"])
             health = client.get("/api/health")
-            storage = client.get("/api/storage")
+            storage = client.get("/api/storage", headers={"X-Admin-Token": "media-test-token"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content, b"route-bytes")
         self.assertEqual(response.headers["content-type"], "image/jpeg")
-        self.assertIn("immutable", response.headers["cache-control"])
+        self.assertTrue(response.headers["cache-control"].startswith("private, max-age="))
+        for refused in (unsigned, tampered, expired):
+            self.assertEqual(refused.status_code, 403)
+            self.assertNotIn(b"route-bytes", refused.content)
         self.assertEqual(health.json()["db"], db.database_backend())
         self.assertGreaterEqual(storage.json()["media_bytes"], len(b"route-bytes"))
+
+
+
+class WarmUpTests(unittest.TestCase):
+    def test_startup_warms_phash_so_the_first_claim_does_not_pay_for_scipy(self):
+        import subprocess
+        import sys
+
+        root = Path(__file__).resolve().parents[1]
+        code = "\n".join([
+            'import sys, tempfile, os',
+            "sys.path.insert(0, 'tests')",
+            'import bootstrap, db',
+            "db.DB_PATH = os.path.join(tempfile.mkdtemp(), 'warm.db')",
+            'import main',
+            'from fastapi.testclient import TestClient',
+            "print('before', 'scipy.fftpack' in sys.modules)",
+            'with TestClient(main.app):',
+            "    main.WARM_UP['thread'].join(60)",
+            "print('after', 'scipy.fftpack' in sys.modules)",
+        ])
+        env = {key: value for key, value in os.environ.items()
+               if key not in ("CLAIMPILOT_USE_TEST_DB", "DATABASE_URL")}
+        result = subprocess.run(
+            [sys.executable, "-c", code], cwd=root, env=env,
+            capture_output=True, text=True, timeout=180,
+        )
+        self.assertIn("before False", result.stdout, result.stderr[-800:])
+        self.assertIn("after True", result.stdout, result.stderr[-800:])
+        self.assertIn("[forensics] warm-up: phash ready in", result.stdout)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import threading
 import time
 import traceback
@@ -89,6 +90,7 @@ try:
         fit_jpeg,
         prepare_uploaded_image,
         run_deep_forensics,
+        warm_up,
     )
 except ImportError:
     def build_photo_url_map(photo_paths):
@@ -108,6 +110,9 @@ except ImportError:
 
     def run_deep_forensics(photo_paths, conn=None, fields=None):
         return []
+
+    def warm_up():
+        return None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
@@ -174,12 +179,61 @@ def require_admin(x_admin_token: Optional[str] = Header(default=None)):
 
 ADMIN_ONLY = [Depends(require_admin)]
 
+# Claim responses go to assessors only. The photos and document pages in them
+# are loaded by <img>, which cannot send the admin header, so every /media URL
+# in a response carries an expiring signature derived from ADMIN_TOKEN.
+MEDIA_URL = re.compile(r"/media/([0-9a-f]{64})(?![0-9a-f?])")
+MEDIA_URL_HOURS = 6
+
+
+def media_signature(media_id, expires):
+    token = os.getenv("ADMIN_TOKEN", "").strip()
+    if not token:
+        return None
+    key = hashlib.sha256(b"claimpilot-media-url:" + token.encode("utf-8")).digest()
+    message = f"{media_id}:{int(expires)}".encode("utf-8")
+    return hmac.new(key, message, hashlib.sha256).hexdigest()[:32]
+
+
+def sign_media_urls(value, now=None):
+    """Return value with every /media/<id> string signed. Expiry is rounded
+    to the hour, so an image keeps one URL (and its cache entry) for an hour."""
+    now = time.time() if now is None else now
+    expires = (int(now) // 3600 + MEDIA_URL_HOURS + 1) * 3600
+
+    def sign(match):
+        signature = media_signature(match.group(1), expires)
+        if signature is None:
+            return match.group(0)
+        return f"{match.group(0)}?exp={expires}&sig={signature}"
+
+    def walk(node):
+        if isinstance(node, str):
+            return MEDIA_URL.sub(sign, node) if "/media/" in node else node
+        if isinstance(node, list):
+            return [walk(item) for item in node]
+        if isinstance(node, dict):
+            return {key: walk(item) for key, item in node.items()}
+        return node
+
+    return walk(value)
+
+
+WARM_UP = {"thread": None}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # In the background: the server answers at once, the first claim does not
+    # pay for scipy's import.
+    WARM_UP["thread"] = threading.Thread(target=warm_up, name="warm-up", daemon=True)
+    WARM_UP["thread"].start()
     if not os.getenv("ADMIN_TOKEN", "").strip():
         print("[auth] ADMIN_TOKEN is not set: admin endpoints refuse every request", flush=True)
+    if not os.getenv("WHATSAPP_APP_SECRET", "").strip():
+        print("[auth] WARNING: WHATSAPP_APP_SECRET is not set: webhook signatures are "
+              "not checked", flush=True)
     log_provider_chain()
     yield
 
@@ -223,18 +277,29 @@ def health():
         # Configuration only: provider names, models and whether keys are set.
         "vision": provider_status(),
         "ai_detection": ai_detection_status(),
+        # Whether inbound WhatsApp webhooks must carry Meta's signature.
+        "webhook_signature": (
+            "enforced" if os.getenv("WHATSAPP_APP_SECRET", "").strip() else "not_configured"
+        ),
     }
 
 
-@app.get("/api/storage")
+@app.get("/api/storage", dependencies=ADMIN_ONLY)
 def storage():
     return storage_stats()
 
 
 @app.get("/media/{media_id}")
-def media_file(media_id: str):
+def media_file(media_id: str, exp: Optional[int] = None, sig: Optional[str] = None):
     if len(media_id) != 64 or any(character not in "0123456789abcdef" for character in media_id):
         raise HTTPException(status_code=404, detail="media not found")
+    now = time.time()
+    expected = media_signature(media_id, exp) if exp is not None else None
+    if (
+        not expected or not sig or exp < now
+        or not hmac.compare_digest(sig.encode("utf-8"), expected.encode("utf-8"))
+    ):
+        raise HTTPException(status_code=403, detail="media link is invalid or has expired")
     found = media_get(media_id)
     if not found:
         raise HTTPException(status_code=404, detail="media not found")
@@ -242,7 +307,8 @@ def media_file(media_id: str):
     return Response(
         content=data,
         media_type=mime,
-        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        # Personal documents: never stored by a shared cache.
+        headers={"Cache-Control": f"private, max-age={max(0, int(exp - now))}"},
     )
 
 
@@ -408,17 +474,17 @@ def build_claim_response(payload):
     return response
 
 
-@app.get("/api/claims")
+@app.get("/api/claims", dependencies=ADMIN_ONLY)
 def claims():
-    return list_claims()
+    return sign_media_urls(list_claims())
 
 
-@app.get("/api/claims/{claim_id}")
+@app.get("/api/claims/{claim_id}", dependencies=ADMIN_ONLY)
 def claim_detail(claim_id: str):
     payload = get_claim(claim_id)
     if payload is None:
         raise HTTPException(status_code=404, detail="claim not found")
-    return build_claim_response(payload)
+    return sign_media_urls(build_claim_response(payload))
 
 
 def _rupees(value):
@@ -456,11 +522,15 @@ async def _notify_whatsapp_decision(
         current = await asyncio.to_thread(build_claim_response, payload)
         estimate = current.get("effective_estimate") or {}
         if decision == "approved":
+            # The estimate is a range from the rate card, not a settled amount.
+            cost = (
+                f" — estimated repair cost ₹{_rupees(estimate.get('total_low'))}–"
+                f"₹{_rupees(estimate.get('total_high'))}"
+                if (estimate.get("total_high") or 0) > 0 else ""
+            )
             message = (
-                f"*Claim {claim_id} approved* — "
-                f"Rs {_rupees(estimate.get('total_low'))} – "
-                f"Rs {_rupees(estimate.get('total_high'))}. "
-                "An assessor has reviewed your claim."
+                f"*Claim {claim_id} approved*{cost}. "
+                "The final amount is confirmed against the repair invoice."
             )
         elif decision == "rejected":
             message = f"*Claim {claim_id} not approved* — {reason.rstrip('.')}."
@@ -562,7 +632,7 @@ async def override_claim(claim_id: str, request: OverrideRequest):
         await _notify_whatsapp_decision(
             claim_id, payload, actor, after["value"], reason
         )
-    return await asyncio.to_thread(build_claim_response, payload)
+    return sign_media_urls(await asyncio.to_thread(build_claim_response, payload))
 
 
 @app.post("/api/demo/reset", dependencies=ADMIN_ONLY)
@@ -1298,7 +1368,7 @@ def _release_temp_uploads(paths):
             pass
 
 
-@app.post("/api/analyze")
+@app.post("/api/analyze", dependencies=ADMIN_ONLY)
 async def analyze(
     documents: List[UploadFile] = File(default=[]),
     photos: List[UploadFile] = File(default=[]),
@@ -1318,7 +1388,7 @@ async def analyze(
         await asyncio.to_thread(_store_upload, claim_id, filename, kind, dest, content)
         bucket.append(dest)
 
-    return await analyse_claim(claim_id, doc_paths, photo_paths)
+    return sign_media_urls(await analyse_claim(claim_id, doc_paths, photo_paths))
 
 
 def _store_upload(claim_id, filename, kind, dest, content):
@@ -1570,7 +1640,7 @@ async def handle_wa_message(message):
                     wa_id,
                     "Send a photo of the damaged vehicle to start a claim. "
                     "You can also attach the claim form, RC or driving licence. "
-                    "Send any message when you are done and I will analyse it.",
+                    "Reply DONE when you are done.",
                 )
         elif message_type in wa.UNSUPPORTED_REPLIES:
             await send_text(wa_id, wa.UNSUPPORTED_REPLIES[message_type])
@@ -1604,10 +1674,36 @@ def webhook_verify(request: Request):
     return PlainTextResponse("Forbidden", status_code=403)
 
 
+def webhook_signature_ok(raw_body, header):
+    """Meta signs every webhook POST with the app secret:
+    X-Hub-Signature-256: sha256=<hex HMAC-SHA256 of the raw body>.
+    None when WHATSAPP_APP_SECRET is not configured."""
+    secret = os.getenv("WHATSAPP_APP_SECRET", "").strip()
+    if not secret:
+        return None
+    expected = "sha256=" + hmac.new(
+        secret.encode("utf-8"), raw_body, hashlib.sha256
+    ).hexdigest()
+    supplied = (header or "").strip().lower()
+    return bool(supplied) and hmac.compare_digest(
+        supplied.encode("utf-8"), expected.encode("utf-8")
+    )
+
+
 @app.post("/webhook")
 async def webhook_receive(request: Request, background: BackgroundTasks):
+    raw = await request.body()
+    signed = webhook_signature_ok(raw, request.headers.get("X-Hub-Signature-256"))
+    if signed is None:
+        # Kept open until the secret is added, so production keeps working.
+        print("[whatsapp] WARNING: WHATSAPP_APP_SECRET is not set; "
+              "accepting an unsigned webhook", flush=True)
+    elif not signed:
+        print("[whatsapp] rejected a webhook: X-Hub-Signature-256 missing or wrong",
+              flush=True)
+        return PlainTextResponse("Forbidden", status_code=403)
     try:
-        body = await request.json()
+        body = json.loads(raw)
     except Exception:
         return {"ok": True}
 
@@ -1621,7 +1717,8 @@ async def webhook_receive(request: Request, background: BackgroundTasks):
             if not isinstance(message, dict):
                 continue
             if not await asyncio.to_thread(remember_message, message.get("id")):
-                print(f"[whatsapp] skipping already-processed {message.get('id')}", flush=True)
+                print(f"[whatsapp] skipping already-processed "
+                      f"{wa.message_ref(message.get('id'))}", flush=True)
                 continue
             background.add_task(handle_wa_message, message)
     except Exception:

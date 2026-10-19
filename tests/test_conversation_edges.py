@@ -4,6 +4,7 @@ except ImportError:
     from tests import bootstrap  # noqa: F401
 import asyncio
 import io
+import json
 import os
 import tempfile
 import time
@@ -30,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FRESH_INSTRUCTIONS = (
     "Send a photo of the damaged vehicle to start a claim. "
     "You can also attach the claim form, RC or driving licence. "
-    "Send any message when you are done and I will analyse it."
+    "Reply DONE when you are done."
 )
 
 
@@ -199,6 +200,45 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
             whatsapp.ANALYSIS_BUSY_REPLY,
             [call.args[1] for call in sent.await_args_list],
         )
+
+    async def test_failed_analysis_keeps_the_media_and_asks_for_done(self):
+        seed_session("user", photos=1, updated=time.time())
+        sent = AsyncMock()
+
+        async def broken(*args, **kwargs):
+            raise RuntimeError("pipeline crashed")
+
+        with patch.object(whatsapp, "classify_session_intake", ready_intake), \
+                patch.object(main, "analyse_claim", broken), \
+                patch.object(whatsapp, "send_text", sent):
+            await whatsapp.process_session("user")
+
+        self.assertEqual(
+            sent.await_args_list[-1].args[1],
+            "Something went wrong processing your claim. Reply DONE to try again.",
+        )
+        self.assertEqual(len(db.list_session_media("user")), 1)
+
+    async def test_failure_after_the_claim_was_saved_asks_for_nothing(self):
+        seed_session("user", photos=1, updated=time.time())
+        sent = AsyncMock()
+        saved = []
+
+        async def analyse_and_save(claim_id, *args, **kwargs):
+            db.save_claim(claim_id, analysed_payload(claim_id))
+            saved.append(claim_id)
+            return analysed_payload(claim_id)
+
+        with patch.object(whatsapp, "classify_session_intake", ready_intake), \
+                patch.object(main, "analyse_claim", analyse_and_save), \
+                patch.object(whatsapp, "format_reply", side_effect=RuntimeError("format")), \
+                patch.object(whatsapp, "send_text", sent):
+            await whatsapp.process_session("user")
+
+        last = sent.await_args_list[-1].args[1]
+        self.assertIn(f"Your claim {saved[0]} was saved", last)
+        self.assertIn("you do not need to resend anything", last)
+        self.assertNotIn("DONE", last)
 
     async def test_photo_during_analysis_starts_a_new_claim(self):
         (old,), _ = seed_session("user", photos=[jpeg_bytes(color=(200, 1, 1))],
@@ -521,6 +561,11 @@ class HostileInputTests(unittest.IsolatedAsyncioTestCase):
         }
 
         class Request:
+            headers = {}
+
+            async def body(self):
+                return json.dumps(body).encode("utf-8")
+
             async def json(self):
                 return body
 
@@ -535,7 +580,8 @@ class HostileInputTests(unittest.IsolatedAsyncioTestCase):
         second = Background()
         payload = jpeg_bytes(color=(1, 2, 3))
         with patch.object(main, "download_media", AsyncMock(return_value=payload)), \
-                patch.object(main, "send_text", AsyncMock()):
+                patch.object(main, "send_text", AsyncMock()), \
+                patch.dict(os.environ, {"WHATSAPP_APP_SECRET": ""}):
             await main.webhook_receive(Request(), first)
             self.assertEqual(len(first.tasks), 1)
             await first.tasks[0][0](*first.tasks[0][1])

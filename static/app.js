@@ -141,8 +141,9 @@
     }
   }
 
-  /* Overrides and demo reset need the admin token. It is asked for once and
-     kept in localStorage; if storage is blocked it lives for this page only. */
+  /* Claims, uploads, overrides and demo reset need the admin token. It is
+     asked for once and kept in localStorage (for this page only if storage is
+     blocked), and asked for again when the server answers 401. */
   const ADMIN_TOKEN_KEY = 'claimpilot.adminToken';
   let adminToken = (function () {
     try {
@@ -162,19 +163,74 @@
     }
   }
 
-  async function adminFetch(url, options) {
-    for (let attempt = 0; attempt < 2; attempt++) {
+  /* The token is asked for in the feed panel, not with prompt(): embedded
+     browsers refuse prompt(), and the poll must never wipe what is typed. */
+  let tokenWaiters = [];
+
+  function showTokenForm(note) {
+    $('claimCount').textContent = '–';
+    if ($('tokenForm')) {
+      $('tokenNote').textContent = note;
+      return;
+    }
+    $('feed').innerHTML = `<form class="feed-empty token-form" id="tokenForm">
+        <span id="tokenNote">${esc(note)}</span>
+        <input id="tokenInput" type="password" autocomplete="current-password"
+               placeholder="Admin token" aria-label="Admin token">
+        <button type="submit" class="btn btn-primary btn-sm">Unlock</button>
+      </form>`;
+    $('tokenForm').onsubmit = event => {
+      event.preventDefault();
+      const value = String($('tokenInput').value || '').trim();
+      if (!value) return;
+      rememberAdminToken(value);
+      const waiters = tokenWaiters;
+      tokenWaiters = [];
+      waiters.forEach(resolve => resolve());
+      pollClaims().then(claims => {
+        if (claims.length && !activeId) openClaim(claims[0].claim_id);
+      });
+    };
+    $('tokenInput').focus();
+  }
+
+  const TOKEN_ASK = 'Claims are shown to assessors only. Enter the admin token.';
+  const TOKEN_REJECTED = 'That token was not accepted. Enter the admin token.';
+
+  function requestToken(note) {
+    showTokenForm(note);
+    return new Promise(resolve => tokenWaiters.push(resolve));
+  }
+
+  function isTokenError(e) {
+    return /^Admin token/.test(String((e && e.message) || ''));
+  }
+
+  /* interactive = true waits for the operator to enter the token; polling
+     passes false and only shows the form. */
+  /* True from a 401 until a request succeeds, so the poll keeps saying why. */
+  let tokenRejected = false;
+
+  async function adminFetch(url, options, interactive = true) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       if (!adminToken) {
-        const entered = String(prompt('Admin token (needed for assessor actions):') || '').trim();
-        if (!entered) throw new Error('Admin token required');
-        rememberAdminToken(entered);
+        if (!interactive) {
+          throw new Error(tokenRejected ? 'Admin token rejected' : 'Admin token required');
+        }
+        await requestToken(tokenRejected ? TOKEN_REJECTED : TOKEN_ASK);
       }
+      const sent = adminToken;
       const headers = Object.assign({}, (options && options.headers) || {}, {
         'X-Admin-Token': adminToken
       });
       const r = await fetch(url, Object.assign({}, options || {}, { headers }));
-      if (r.status !== 401) return r;
-      rememberAdminToken('');
+      if (r.status !== 401) {
+        tokenRejected = false;
+        return r;
+      }
+      tokenRejected = true;
+      /* A token entered meanwhile by another request is kept. */
+      if (adminToken === sent) rememberAdminToken('');
     }
     throw new Error('Admin token rejected');
   }
@@ -262,12 +318,17 @@
   /* ---------- feed ---------- */
   async function pollClaims() {
     try {
-      const r = await fetch('api/claims');
+      /* Never waits for the token: the form stays up until it is entered. */
+      const r = await adminFetch('api/claims', null, false);
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const claims = normalise(await r.json());
       renderFeed(claims);          /* sorts newest-first in place */
       return claims;
     } catch (e) {
+      if (isTokenError(e)) {
+        showTokenForm(/rejected/.test(e.message) ? TOKEN_REJECTED : TOKEN_ASK);
+        return [];
+      }
       $('feed').innerHTML =
         '<div class="feed-empty">Cannot reach the claim service. Check the server is running.</div>';
       return [];
@@ -334,11 +395,12 @@
   
   async function openClaim(id) {
     try {
-      const r = await fetch('api/claims/' + encodeURIComponent(id));
+      const r = await adminFetch('api/claims/' + encodeURIComponent(id));
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const data = await r.json();
       render(normalise([data])[0] || data);
     } catch (e) {
+      if (isTokenError(e)) return;
       alert('Could not load claim ' + id);
     }
   }
@@ -398,7 +460,7 @@
       title = 'Rejected \u2014 image is not a vehicle';
       sub = p.vehicle_description || 'The uploaded image does not show a motor vehicle.';
     } else if (p.estimate && p.estimate.requires_survey) {
-      sub = 'Estimate exceeds the automated settlement threshold.';
+      sub = p.estimate.survey_reason || 'Estimate exceeds the automated settlement threshold.';
     }
     if (!escalated && decision === 'auto_assess') {
       title = 'Auto-assessed';
@@ -1128,7 +1190,7 @@
     staged.photos.forEach(f => fd.append('photos', f, f.name));
     startWorking();
     try {
-      const r = await fetch('api/analyze', { method: 'POST', body: fd });
+      const r = await adminFetch('api/analyze', { method: 'POST', body: fd });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const p = await r.json();
       clearInterval(stageTimer);
@@ -1137,7 +1199,9 @@
     } catch (e) {
       clearInterval(stageTimer);
       show('viewUpload');
-      $('uploadNote').textContent = 'Analysis failed: ' + e.message + '. Check the server and try again.';
+      $('uploadNote').textContent = isTokenError(e)
+        ? 'Analysis needs a valid admin token. Enter it in the claim feed panel.'
+        : 'Analysis failed: ' + e.message + '. Check the server and try again.';
     }
   }
   
@@ -1202,7 +1266,7 @@
   /* Open on the newest claim if one exists. Only the first poll auto-opens —
      the interval below must never steal focus from a claim being read. */
   (async () => {
-    const claims = await pollClaims();
+    const claims = await pollClaims();   /* shows the token form when there is none */
     if (claims.length) openClaim(claims[0].claim_id);
-    setInterval(pollClaims, 3000);
+    setInterval(() => pollClaims(), 3000);
   })();

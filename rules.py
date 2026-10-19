@@ -44,8 +44,8 @@ RATE_CARD = {
 
 SURVEY_THRESHOLD = 50000
 SURVEY_REASON = (
-    "IRDAI 2024 regulations permit waiver of mandatory survey only for "
-    "losses below Rs 50,000."
+    "IRDAI Master Circular on Protection of Policyholders' Interests, 2024: "
+    "motor losses below Rs 50,000 need not be surveyed by a registered surveyor."
 )
 
 # In Indian motor insurance the driver need not be the owner. The insured is
@@ -63,7 +63,20 @@ NAME_CHECKS = (
         "licence holder ('{b}').",
     ),
 )
-HONORIFICS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR"}
+HONORIFICS = {"MR", "MRS", "MS", "MISS", "SHRI", "SRI", "SHREE", "SMT", "KUMARI", "DR"}
+# Spellings of one name part, as they appear across Indian documents.
+NAME_ALIASES = {
+    "MD": "MOHAMMED", "MOHD": "MOHAMMED", "MOHAMMAD": "MOHAMMED", "MOHAMED": "MOHAMMED",
+    "MUHAMMAD": "MOHAMMED", "MUHAMMED": "MOHAMMED",
+    "PVT": "PRIVATE", "PRIVATE": "PRIVATE", "LTD": "LIMITED", "LIMITED": "LIMITED",
+}
+# "Ramesh S/O Krishnan": the relation and the father's or husband's name that
+# follows are not part of the person's name.
+RELATION_SUFFIX = re.compile(
+    r"\b(?:[SWDC]\s*/\s*O|[SWDC]\s*\.\s*O\s*\.?|SON\s+OF|WIFE\s+OF|DAUGHTER\s+OF|CARE\s+OF)\b.*$",
+    re.IGNORECASE,
+)
+FIRM_PREFIX = re.compile(r"\bM\s*/\s*S\b\.?", re.IGNORECASE)
 DATE_FIELDS = (
     "dl_expiry_date",
     "accident_date",
@@ -212,37 +225,55 @@ def get_field(fields, name):
     return None
 
 
-def _norm_name(v):
-    text = re.sub(r"[^A-Z0-9\s]", " ", str(v or "").upper())
-    tokens = [token for token in text.split() if token not in HONORIFICS]
-    return " ".join(tokens)
+def _name_tokens(value):
+    text = RELATION_SUFFIX.sub(" ", str(value or ""))
+    text = FIRM_PREFIX.sub(" ", text)
+    text = re.sub(r"[^A-Z0-9\s]", " ", text.upper())
+    return [NAME_ALIASES.get(token, token) for token in text.split() if token not in HONORIFICS]
 
 
 def _token_compatible(a, b):
-    return a == b or (
-        (len(a) == 1 and b.startswith(a))
-        or (len(b) == 1 and a.startswith(b))
-    )
+    """Same word, or an initial standing for the other word."""
+    return a == b or (len(a) == 1 and b.startswith(a)) or (len(b) == 1 and a.startswith(b))
+
+
+def name_match(a, b):
+    """"match", "partial" or "mismatch" for two renderings of a name.
+
+    Order does not matter ("S Karthik" is "Karthik S"), an initial stands for
+    a word ("K R Priya" is "Priya Krishnan Ramesh"), relation suffixes and
+    honorifics are ignored, and MD/MOHD, PVT/LTD are spellings of one word.
+    "partial" means every part of one name is in the other, which has more
+    ("Rajesh Kumar" in "Rajesh Kumar Singh"). Initials alone never match.
+    """
+    left, right = _name_tokens(a), _name_tokens(b)
+    if not left or not right:
+        return "mismatch"
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    remaining = list(longer)
+    pending, words_equal = [], 0
+    # Whole words first, so an initial cannot take a word another word needs.
+    for token in shorter:
+        if len(token) > 1 and token in remaining:
+            remaining.remove(token)
+            words_equal += 1
+        else:
+            pending.append(token)
+    for token in pending:
+        index = next(
+            (i for i, other in enumerate(remaining) if _token_compatible(token, other)), None
+        )
+        if index is None:
+            return "mismatch"
+        remaining.pop(index)
+    if not words_equal:
+        return "mismatch"
+    return "match" if not remaining else "partial"
 
 
 def _names_match(a, b):
-    left = _norm_name(a).split()
-    right = _norm_name(b).split()
-    if not left or not right or left[-1] != right[-1]:
-        return False
-
-    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
-    available = list(longer[:-1])
-    for token in shorter[:-1]:
-        match = next(
-            (index for index, candidate in enumerate(available)
-             if _token_compatible(token, candidate)),
-            None,
-        )
-        if match is None:
-            return False
-        available.pop(match)
-    return True
+    """The same person for the purpose of a flag: a match or a partial match."""
+    return name_match(a, b) != "mismatch"
 
 
 def _norm_reg(v):
@@ -306,6 +337,23 @@ def _part_group(part):
     return None
 
 
+def _claimed_photo_names(vehicles):
+    """Lower-case photo names of the vehicle the claim is for: the first
+    claimable group, as stage 3 prices it. None when no vehicle is claimable,
+    so every legible plate is still checked."""
+    claimed = next(
+        (vehicle for vehicle in vehicles or []
+         if isinstance(vehicle, dict) and vehicle.get("status") == "claimable"),
+        None,
+    )
+    if claimed is None:
+        return None
+    return {
+        str(name).replace("\\", "/").rsplit("/", 1)[-1].lower()
+        for name in claimed.get("photos") or []
+    }
+
+
 def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None,
               vehicles=None, claimable_count: int = 0, forensics=None):
     flags = []
@@ -314,7 +362,8 @@ def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None
     # 1. insured vs RC owner, and claim-form driver vs licence holder
     for rule, field_a, field_b, template in NAME_CHECKS:
         a_value, b_value = get_field(fields, field_a), get_field(fields, field_b)
-        if a_value and b_value and not _names_match(a_value, b_value):
+        # A partial match is an INFO note (identity_notes), never a flag.
+        if a_value and b_value and name_match(a_value, b_value) == "mismatch":
             flags.append({
                 "rule": rule,
                 "severity": "HIGH",
@@ -352,11 +401,17 @@ def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None
             "evidence": ["registration_number_claim_form", "registration_number_rc"],
         })
 
-    # A legible plate in the submitted vehicle photo must belong to the RC.
+    # A legible plate on the claimed vehicle must belong to the RC. Photos of
+    # another vehicle (the other party in a collision) are evidence, not a
+    # mismatch; vehicle_mismatch already reports that they are there.
     if reg_rc:
         normalised_rc = _norm_reg(reg_rc)
+        claimed = _claimed_photo_names(vehicles)
         for photo in photos or []:
             if not isinstance(photo, dict) or not photo.get("number_plate"):
+                continue
+            name = str(photo.get("source_photo") or "").replace("\\", "/").rsplit("/", 1)[-1]
+            if claimed is not None and name.lower() not in claimed:
                 continue
             number_plate = str(photo["number_plate"])
             if _norm_reg(number_plate) != normalised_rc:
@@ -518,13 +573,36 @@ def reported_confidence(item):
     return max(0.0, min(1.0, value))
 
 
+PARTIAL_NAME_NOTES = {
+    "insured_owner_mismatch": ("insured_owner_partial_match", "Insured name on the claim form",
+                               "registered owner on the RC"),
+    "driver_licence_mismatch": ("driver_licence_partial_match", "Driver named on the claim form",
+                                "driving licence holder"),
+}
+
+
 def identity_notes(fields):
-    """Information about who drove, never a flag: the licence holder may
-    legitimately differ from the registered owner."""
+    """Information about names, never a flag: the licence holder may
+    legitimately differ from the registered owner, and a name written with
+    parts left out is noted for the assessor."""
+    notes = []
+    for rule, field_a, field_b, _ in NAME_CHECKS:
+        a_value, b_value = get_field(fields, field_a), get_field(fields, field_b)
+        if a_value and b_value and name_match(a_value, b_value) == "partial":
+            note_rule, a_label, b_label = PARTIAL_NAME_NOTES[rule]
+            notes.append({
+                "rule": note_rule,
+                "severity": "INFO",
+                "message": (
+                    f"{a_label} ('{a_value}') matches the {b_label} ('{b_value}') in part: "
+                    "one has name parts the other leaves out."
+                ),
+                "evidence": [field_a, field_b],
+            })
     owner = get_field(fields, "owner_name_rc")
     holder = get_field(fields, "holder_name_dl")
-    if owner and holder and not _names_match(owner, holder):
-        return [{
+    if owner and holder and name_match(owner, holder) == "mismatch":
+        notes.append({
             "rule": "driver_not_owner",
             "severity": "INFO",
             "message": (
@@ -532,8 +610,8 @@ def identity_notes(fields):
                 f"'{holder}', the RC owner is '{owner}'. A driver need not be the owner."
             ),
             "evidence": ["holder_name_dl", "owner_name_rc"],
-        }]
-    return []
+        })
+    return notes
 
 
 def _damage_confidence(item):

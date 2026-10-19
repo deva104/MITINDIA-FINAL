@@ -213,8 +213,8 @@ class OverrideTests(unittest.TestCase):
             )
 
         message = (
-            "*Claim CLM-WHATSAPP approved* — Rs 4,000 – Rs 8,000. "
-            "An assessor has reviewed your claim."
+            "*Claim CLM-WHATSAPP approved* — estimated repair cost ₹4,000–₹8,000. "
+            "The final amount is confirmed against the repair invoice."
         )
         mocked_send.assert_awaited_once_with(wa_id, message)
         self.assertEqual(response["final_decision"]["value"], "approved")

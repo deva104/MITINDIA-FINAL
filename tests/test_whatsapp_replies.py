@@ -177,7 +177,8 @@ class WhatsAppReplyTests(unittest.TestCase):
                 "*No visible damage found*",
                 "",
                 "We examined 2 photos and could not identify damage on either vehicle.",
-                "Send clearer photos showing the damaged area, or reply HELP to speak to an assessor.",
+                "Send clearer photos showing the damaged area to start a new claim. "
+                "An assessor will also review this one.",
             ]),
         )
 

@@ -2,6 +2,7 @@ import hashlib
 import io
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -501,6 +502,21 @@ def _claim_coordinates(value):
     if -90 <= lat <= 90 and -180 <= lon <= 180:
         return lat, lon
     return None
+
+
+def warm_up():
+    """imagehash.phash imports scipy.fftpack on its first call. On Render's
+    free CPU that took about 4 s of the first claim after every restart, so
+    it is done once at startup instead. Returns the seconds it took."""
+    started = time.perf_counter()
+    try:
+        imagehash.phash(Image.new("RGB", (32, 32)))
+    except Exception as error:
+        print(f"[forensics] warm-up failed: {type(error).__name__}", flush=True)
+        return None
+    elapsed = time.perf_counter() - started
+    print(f"[forensics] warm-up: phash ready in {elapsed:.2f}s", flush=True)
+    return elapsed
 
 
 def check_duplicate(image, path, conn, claim_id=None):

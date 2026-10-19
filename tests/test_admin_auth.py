@@ -36,6 +36,11 @@ class AdminAuthTests(unittest.TestCase):
             ("post", "/api/claims/CLM-NONE/override", OVERRIDE),
             ("post", "/api/whatsapp/subscribe", None),
             ("get", "/api/whatsapp/status", None),
+            # Claim data and media references: personal documents.
+            ("get", "/api/claims", None),
+            ("get", "/api/claims/CLM-NONE", None),
+            ("post", "/api/analyze", None),
+            ("get", "/api/storage", None),
         ]
 
     def request(self, method, path, body, headers):
@@ -63,15 +68,48 @@ class AdminAuthTests(unittest.TestCase):
                 "/api/claims/CLM-NONE/override", json=OVERRIDE, headers=headers
             )
             status = self.client.get("/api/whatsapp/status", headers=headers)
+            listed = self.client.get("/api/claims", headers=headers)
+            detail = self.client.get("/api/claims/CLM-NONE", headers=headers)
+            storage = self.client.get("/api/storage", headers=headers)
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json(), [])
+        self.assertEqual(detail.status_code, 404)
+        self.assertEqual(storage.status_code, 200)
         self.assertEqual(reset.status_code, 200)
         self.assertEqual(reset.json(), {"cleared": True})
         self.assertEqual(override.status_code, 404)
         self.assertEqual(status.status_code, 200)
 
     def test_public_endpoints_need_no_token(self):
-        with patch.dict(os.environ, {"ADMIN_TOKEN": TOKEN}):
+        empty = {"entry": [{"changes": [{"value": {}}]}]}
+        with patch.dict(os.environ, {"ADMIN_TOKEN": TOKEN, "WHATSAPP_APP_SECRET": ""}):
             self.assertEqual(self.client.get("/api/health").status_code, 200)
-            self.assertEqual(self.client.get("/api/claims").status_code, 200)
+            # The webhook answers Meta without the admin token.
+            self.assertEqual(self.client.post("/webhook", json=empty).status_code, 200)
+
+    def test_claim_responses_carry_signed_media_urls(self):
+        media = "/media/" + "a" * 64
+        with patch.dict(os.environ, {"ADMIN_TOKEN": TOKEN}):
+            signed = main.sign_media_urls(
+                {"photos": [{"url": media}], "note": f"see {media}", "n": 3}, now=1_000_000)
+            again = main.sign_media_urls(signed, now=1_000_000)
+        url = signed["photos"][0]["url"]
+        self.assertRegex(url, r"^/media/a{64}\?exp=\d+&sig=[0-9a-f]{32}$")
+        self.assertIn(url, signed["note"])
+        self.assertEqual(signed["n"], 3)
+        self.assertEqual(again, signed)  # never signed twice
+        with patch.dict(os.environ, {"ADMIN_TOKEN": ""}):
+            self.assertEqual(main.sign_media_urls({"url": media})["url"], media)
+
+    def test_console_asks_in_page_and_polls_without_waiting(self):
+        source = Path(main.STATIC_DIR, "app.js").read_text(encoding="utf-8")
+        self.assertIn("adminFetch('api/claims', null, false)", source)
+        self.assertIn("adminFetch('api/claims/' + encodeURIComponent(id))", source)
+        self.assertIn("adminFetch('api/analyze'", source)
+        self.assertIn('id="tokenForm"', source)
+        self.assertNotIn("fetch('api/claims')", source)
+        # Embedded browsers refuse prompt(): the token is asked for in the page.
+        self.assertNotIn("prompt(", source.replace("not with prompt()", "").replace("refuse prompt()", ""))
 
     def test_console_sends_the_token_and_never_hardcodes_it(self):
         source = Path(main.STATIC_DIR, "app.js").read_text(encoding="utf-8")

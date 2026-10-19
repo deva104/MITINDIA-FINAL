@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import json
 import os
+import re
 import time
 import traceback
 import uuid
@@ -58,7 +60,7 @@ CHOICE_CLEARED_REPLY = (
     "The previous vehicle choice has been cleared. This photo starts a new claim. "
     "Reply DONE when you are done."
 )
-ANALYSING_REPLY = "Analysing your claim. This takes a few seconds."
+ANALYSING_REPLY = "Analysing your claim. This usually takes under a minute."
 ACCEPTED_MEDIA = (
     "Send a photo of the damaged vehicle, or a photo or PDF of your claim documents."
 )
@@ -86,6 +88,28 @@ IMAGE_LIMIT_REPLY = "Maximum 8 images per claim — keeping the first 8."
 
 def _auth_headers():
     return {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+
+
+# Phone numbers never reach the logs. A wamid message id is base64 that embeds
+# the sender's number, so it is hashed too.
+_LONG_NUMBER = re.compile(r"\+?\d[\d\s\-]{8,}\d")
+_WAMID = re.compile(r"wamid\.[A-Za-z0-9+/=_\-]+")
+
+
+def log_safe(text):
+    """Text for a log line: message ids and long digit runs removed."""
+    return _LONG_NUMBER.sub("[number]", _WAMID.sub("wamid.[id]", str(text)))
+
+
+def who(wa_id):
+    """A sender in a log line: the last four digits, as on the console badge."""
+    digits = "".join(character for character in str(wa_id or "") if character.isdigit())
+    return f"...{digits[-4:]}" if digits else "unknown sender"
+
+
+def message_ref(message_id):
+    """A stable short reference for a message id, for matching log lines."""
+    return "msg-" + hashlib.sha256(str(message_id or "").encode("utf-8")).hexdigest()[:10]
 
 
 def _safe_url(url):
@@ -451,11 +475,12 @@ async def download_media(media_obj):
                     print("[whatsapp] download_media: no url and no id", flush=True)
                     return None
                 lookup = f"{BASE}/{media_id}"
-                print(f"[whatsapp] GET {lookup}", flush=True)
+                print(f"[whatsapp] GET {log_safe(lookup)}", flush=True)
                 meta = await client.get(lookup, headers=_auth_headers())
                 print(f"[whatsapp] media lookup status {meta.status_code}", flush=True)
                 if meta.status_code != 200:
-                    print(f"[whatsapp] media lookup failed: {meta.text[:300]}", flush=True)
+                    print(f"[whatsapp] media lookup failed: {log_safe(meta.text[:300])}",
+                          flush=True)
                     return None
                 try:
                     url = (meta.json() or {}).get("url")
@@ -465,11 +490,12 @@ async def download_media(media_obj):
                     print("[whatsapp] media lookup returned no url", flush=True)
                     return None
 
-            print(f"[whatsapp] GET {_safe_url(url)} (media bytes)", flush=True)
+            print(f"[whatsapp] GET {log_safe(_safe_url(url))} (media bytes)", flush=True)
             resp = await client.get(url, headers=_auth_headers())
             print(f"[whatsapp] media download status {resp.status_code}", flush=True)
             if resp.status_code != 200:
-                print(f"[whatsapp] media download failed: {resp.text[:300]}", flush=True)
+                print(f"[whatsapp] media download failed: {log_safe(resp.text[:300])}",
+                      flush=True)
                 return None
             return resp.content
     except Exception:
@@ -491,7 +517,10 @@ async def send_text(to, body):
             resp = await client.post(
                 url, headers={**_auth_headers(), "Content-Type": "application/json"}, json=payload
             )
-        print(f"[whatsapp] send_text -> {resp.status_code}: {resp.text[:300]}", flush=True)
+        # Meta's response echoes the recipient's number; only an error body is
+        # logged, and then without numbers.
+        detail = "" if resp.is_success else f": {log_safe(resp.text[:300])}"
+        print(f"[whatsapp] send_text to {who(to)} -> {resp.status_code}{detail}", flush=True)
         return resp.is_success
     except Exception:
         print("[whatsapp] send_text failed:", flush=True)
@@ -504,7 +533,8 @@ async def subscribe_app():
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             resp = await client.post(url, headers=_auth_headers())
-        print(f"[whatsapp] subscribe_app -> {resp.status_code}: {resp.text[:300]}", flush=True)
+        print(f"[whatsapp] subscribe_app -> {resp.status_code}: {log_safe(resp.text[:300])}",
+              flush=True)
         try:
             return resp.json()
         except Exception:
@@ -864,8 +894,8 @@ def format_reply(payload):
                     f"on {target}."
                 ),
                 (
-                    "Send clearer photos showing the damaged area, or reply HELP "
-                    "to speak to an assessor."
+                    "Send clearer photos showing the damaged area to start a new "
+                    "claim. An assessor will also review this one."
                 ),
             ])
 
@@ -1050,7 +1080,7 @@ def _materialise_media(wa_id, rows):
         loaded = db.media_get(row["media_id"])
         if not loaded:
             missing += 1
-            print(f"[whatsapp] session media missing for {wa_id}", flush=True)
+            print(f"[whatsapp] session media missing for {who(wa_id)}", flush=True)
             continue
         data, mime = loaded
         if row["kind"] == "document_page":
@@ -1218,12 +1248,23 @@ async def process_session(wa_id, skip_missing=False):
     except Exception:
         print("[whatsapp] process_session failed:", flush=True)
         traceback.print_exc()
-        if consumed is not None and claim_id and await asyncio.to_thread(db.get_claim, claim_id) is None:
+        saved = bool(claim_id) and await asyncio.to_thread(db.get_claim, claim_id) is not None
+        if consumed is not None and claim_id and not saved:
             # Nothing was saved: keep the media so DONE retries it, and drop the
             # half-written file rows so the retry is not matched as a duplicate.
             await asyncio.to_thread(db.delete_files_for_claim, claim_id)
             consumed = None
-        await send_text(wa_id, "Something went wrong processing your claim. Please try again.")
+        if saved:
+            # The claim exists; a retry would only meet the duplicate gate.
+            await send_text(
+                wa_id,
+                f"Your claim {claim_id} was saved, but sending the result failed. "
+                "An assessor will review it; you do not need to resend anything.",
+            )
+        else:
+            await send_text(
+                wa_id, "Something went wrong processing your claim. Reply DONE to try again."
+            )
     finally:
         _release_materialised(temp_paths)
         if consumed:

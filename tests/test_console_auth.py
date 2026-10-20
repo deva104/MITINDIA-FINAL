@@ -315,7 +315,7 @@ class RequestInfoJourneyTests(journey.JourneyBase):
 class ComparisonTests(unittest.TestCase):
     FIELDS = [
         {"name": "insured_name_claim_form", "value": "R. K. Sharma", "status": "found"},
-        {"name": "owner_name_rc", "value": "SURENDRA UTTAM ARAKH", "status": "found"},
+        {"name": "owner_name_rc", "value": "PRAKASH MOHAN DIXIT", "status": "found"},
         {"name": "registration_number_rc", "value": "MH12AB1234", "status": "found"},
         {"name": "registration_number_claim_form", "value": "MH12AB1234", "status": "found"},
     ]
@@ -325,7 +325,7 @@ class ComparisonTests(unittest.TestCase):
                     if flag["rule"] == "insured_owner_mismatch")
         self.assertEqual(flag["comparison"], {
             "rows": [{"source": "Claim form name", "value": "R. K. Sharma"},
-                     {"source": "RC owner", "value": "SURENDRA UTTAM ARAKH"}],
+                     {"source": "RC owner", "value": "PRAKASH MOHAN DIXIT"}],
             "verdict": "MISMATCH"})
 
     def test_passed_checks_are_match_rows(self):

@@ -1,4 +1,7 @@
+import os
 import re
+
+import vehicle_terms
 from datetime import date
 
 # Seeded from published market service rates.
@@ -51,6 +54,10 @@ SURVEY_REASON = (
 # In Indian motor insurance the driver need not be the owner. The insured is
 # matched to the RC owner and the driver to the licence holder; owner versus
 # licence holder on its own is information, never a flag.
+# Fields a check uses only when read: missing or unreadable, they are skipped
+# without a decision reason or a "could not determine" entry.
+SILENT_FIELDS = {"registration_valid_until", "licence_expiry_nt", "licence_expiry_tr"}
+
 NAME_CHECKS = (
     (
         "insured_owner_mismatch", "insured_name_claim_form", "owner_name_rc",
@@ -69,7 +76,20 @@ NAME_ALIASES = {
     "MD": "MOHAMMED", "MOHD": "MOHAMMED", "MOHAMMAD": "MOHAMMED", "MOHAMED": "MOHAMMED",
     "MUHAMMAD": "MOHAMMED", "MUHAMMED": "MOHAMMED",
     "PVT": "PRIVATE", "PRIVATE": "PRIVATE", "LTD": "LIMITED", "LIMITED": "LIMITED",
+    "DEPTT": "DEPARTMENT", "DEPT": "DEPARTMENT", "DEPARTMENT": "DEPARTMENT",
+    "GOVT": "GOVERNMENT", "CO": "COMPANY",
 }
+# Words that make a name an organisation's (a department, an office, a
+# company), not a person's: no initials, no reordering into a person's name.
+ORGANISATION_WORDS = {
+    "DEPARTMENT", "DIRECTOR", "DIRECTORATE", "COMMISSIONER", "COMMISSION", "OFFICER",
+    "OFFICE", "GOVERNMENT", "MINISTRY", "SECRETARY", "SECRETARIAT", "COLLECTOR",
+    "CORPORATION", "COMPANY", "LIMITED", "PRIVATE", "LLP", "BANK", "TRUST", "SOCIETY",
+    "UNIVERSITY", "COLLEGE", "SCHOOL", "HOSPITAL", "MUNICIPAL", "COUNCIL", "BOARD",
+    "AUTHORITY", "POLICE", "DISTRICT", "INDUSTRIES", "ENTERPRISES", "TRADERS", "AGENCIES",
+    "SERVICES", "SOLUTIONS", "TECHNOLOGIES", "ASSOCIATION", "FOUNDATION", "INSTITUTE",
+}
+ORGANISATION_FILLERS = {"THE", "OF", "AND", "FOR"}
 # "Ramesh S/O Krishnan": the relation and the father's or husband's name that
 # follows are not part of the person's name.
 RELATION_SUFFIX = re.compile(
@@ -244,6 +264,29 @@ def _token_compatible(a, b):
     return a == b or (len(a) == 1 and b.startswith(a)) or (len(b) == 1 and a.startswith(b))
 
 
+def is_organisation(tokens):
+    return bool(set(tokens) & ORGANISATION_WORDS)
+
+
+def _organisation_match(left, right):
+    """Organisation names: the same words in any order ("The Deputy
+    Commissioner, Transport Department" = "THE DEPUTY COMMISSIONER , TRANSPORT
+    DEPTT"), with THE/OF/AND/FOR ignored. Never initials."""
+    left = [token for token in left if token not in ORGANISATION_FILLERS]
+    right = [token for token in right if token not in ORGANISATION_FILLERS]
+    if not left or not right:
+        return "mismatch"
+    if sorted(left) == sorted(right):
+        return "match"
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    remaining = list(longer)
+    for token in shorter:
+        if token not in remaining:
+            return "mismatch"
+        remaining.remove(token)
+    return "partial"
+
+
 def name_match(a, b):
     """"match", "partial" or "mismatch" for two renderings of a name.
 
@@ -256,6 +299,11 @@ def name_match(a, b):
     left, right = _name_tokens(a), _name_tokens(b)
     if not left or not right:
         return "mismatch"
+    if is_organisation(left) or is_organisation(right):
+        return _organisation_match(left, right)
+    # A leading "The" is not part of a person's name either.
+    left = left[1:] if left[0] == "THE" and len(left) > 1 else left
+    right = right[1:] if right[0] == "THE" and len(right) > 1 else right
     shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
     remaining = list(longer)
     pending, words_equal = [], 0
@@ -361,58 +409,24 @@ def _claimed_photo_names(vehicles):
     }
 
 
-# Colour words as cameras and documents use them, grouped so lighting and
-# naming ("grey" vs "silver") do not count as a different colour.
-COLOUR_GROUPS = {
-    "silver": "silver", "grey": "silver", "gray": "silver",
-    "white": "white", "pearl": "white", "black": "black",
-    "red": "red", "maroon": "red", "wine": "red",
-    "blue": "blue", "navy": "blue", "brown": "brown", "beige": "brown", "gold": "brown",
-    "bronze": "brown", "green": "green", "orange": "orange", "yellow": "yellow",
-}
-BODY_GROUPS = {
-    "hatchback": "hatchback", "hatch": "hatchback", "sedan": "sedan", "saloon": "sedan",
-    "suv": "suv", "crossover": "suv", "muv": "muv", "mpv": "muv", "van": "muv",
-    "pickup": "pickup", "truck": "truck",
-}
-KNOWN_MAKES = {
-    "maruti", "suzuki", "hyundai", "tata", "mahindra", "honda", "toyota", "kia", "mg",
-    "skoda", "volkswagen", "renault", "nissan", "ford", "jeep", "bmw", "mercedes",
-    "audi", "citroen", "byd",
-    # Rare in India, but a model names them (a non-Subaru was labelled "Subaru").
-    "subaru", "lexus", "volvo", "jaguar", "rover", "porsche", "fiat", "chevrolet",
-    "mitsubishi", "isuzu", "datsun", "peugeot", "mazda", "tesla", "opel", "dodge",
-}
-
-
-def _words(text):
-    return re.findall(r"[a-z0-9]+", str(text or "").lower())
-
-
-def _group(text, groups):
-    for word in _words(text):
-        if word in groups:
-            return groups[word]
-    return None
+def _registered_vehicle(registry):
+    return f"{registry.get('make') or ''} {registry.get('model') or ''}".strip()
 
 
 def appearance_mismatch(registry, seen):
     """("HIGH"|"MEDIUM", message) when the photographed vehicle differs from
     the registered one, else None. Make AND body type differing is HIGH; make
     alone, body type alone or colour alone is MEDIUM (models misread makes,
-    and light changes colours). Anything the photos do not show is not compared."""
+    and light changes colours). Every value goes through vehicle_terms: a
+    value it does not know, on either side, is not compared; a near colour
+    (silver/grey, blue/green) is not a difference."""
     seen = seen or {}
     seen_text = str(seen.get("make_model") or "")
-    seen_words = set(_words(seen_text))
-    registered = set(_words(f"{registry.get('make')} {registry.get('model')}"))
-    seen_makes = seen_words & KNOWN_MAKES
-    make_differs = bool(seen_makes) and not (seen_makes & registered)
-    body_seen = _group(seen.get("body_type"), BODY_GROUPS)
-    body_registered = _group(registry.get("body_type"), BODY_GROUPS)
-    body_differs = bool(body_seen and body_registered and body_seen != body_registered)
-    colour_seen = _group(seen.get("colour"), COLOUR_GROUPS)
-    colour_registered = _group(registry.get("colour"), COLOUR_GROUPS)
-    colour_differs = bool(colour_seen and colour_registered and colour_seen != colour_registered)
+    make_differs = vehicle_terms.make_relation(seen_text, _registered_vehicle(registry)) == "different"
+    body_differs = vehicle_terms.body_relation(seen.get("body_type"),
+                                               registry.get("body_type")) == "different"
+    colour_differs = vehicle_terms.colour_relation(seen.get("colour"),
+                                                   registry.get("colour")) == "different"
     if not (make_differs or body_differs or colour_differs):
         return None
     shown = " ".join(str(part) for part in (seen.get("colour"), seen_text or seen.get("body_type"))
@@ -430,6 +444,56 @@ def appearance_mismatch(registry, seen):
         return "MEDIUM", (f"Vehicle body type could not be confirmed from photos: they suggest a "
                           f"{seen.get('body_type')}; this plate is registered to a {on_record}.")
     return "MEDIUM", f"Photos show a {shown}; this plate is registered to a {on_record}."
+
+
+def _tail5(value):
+    """The last five characters of a chassis or engine number, or None when
+    fewer than five are legible or one of them was unreadable ("?"). VINs
+    never use I, O or Q, so those are read as 1, 0, 0."""
+    text = re.sub(r"[^A-Z0-9?]", "", str(value or "").upper())
+    if len(text) < 5 or "?" in text[-5:]:
+        return None
+    return text[-5:].translate(str.maketrans("OIQ", "010"))
+
+
+def rc_identity_flags(fields, registry):
+    """The RC's printed make, model, chassis and engine against the registry.
+    A value missing or unknown on either side is skipped without a word."""
+    flags = []
+    rc_vehicle = get_field(fields, "vehicle_make_model")
+    on_record = _registered_vehicle(registry)
+    if rc_vehicle and on_record:
+        rows = [{"source": "RC make and model", "value": rc_vehicle},
+                {"source": "Registered vehicle (VAHAN)", "value": on_record}]
+        if vehicle_terms.make_relation(rc_vehicle, on_record) == "different":
+            flags.append({
+                "rule": "registry_rc_make_mismatch", "severity": "HIGH",
+                "message": f"The RC names a {rc_vehicle}; this plate is registered to a {on_record}.",
+                "evidence": ["vehicle_make_model", "registry.make"],
+                "comparison": {"rows": rows, "verdict": "MISMATCH"},
+            })
+        elif vehicle_terms.model_relation(rc_vehicle, registry.get("model")) == "different":
+            flags.append({
+                "rule": "registry_rc_model_mismatch", "severity": "MEDIUM", "review": True,
+                "message": f"The RC names a {rc_vehicle}; this plate is registered to a {on_record}.",
+                "evidence": ["vehicle_make_model", "registry.model"],
+                "comparison": {"rows": rows, "verdict": "MISMATCH"},
+            })
+    for field, column, label in (("chassis_number", "chassis_last5", "Chassis"),
+                                 ("engine_number", "engine_last5", "Engine")):
+        printed, registered = _tail5(get_field(fields, field)), _tail5(registry.get(column))
+        if printed and registered and printed != registered:
+            flags.append({
+                "rule": f"registry_{label.lower()}_mismatch", "severity": "MEDIUM", "review": True,
+                "message": (f"{label} number on the RC ends {printed}; the registry has "
+                            f"{registered}. Check the RC image before deciding."),
+                "evidence": [field, f"registry.{column}"],
+                "comparison": {"rows": [
+                    {"source": f"RC {label.lower()} number (last 5)", "value": printed},
+                    {"source": f"Registered {label.lower()} number (last 5)", "value": registered},
+                ], "verdict": "MISMATCH"},
+            })
+    return flags
 
 
 def registry_flags(fields, registry, seen=None, accident_date=None):
@@ -451,6 +515,7 @@ def registry_flags(fields, registry, seen=None, accident_date=None):
             "message": f"The RC owner ('{owner_rc}') is not the registered owner of {plate}.",
             "evidence": ["owner_name_rc", "registry.owner_name"],
         })
+    flags.extend(rc_identity_flags(fields, registry))
     mismatch = appearance_mismatch(registry, seen)
     if mismatch:
         severity, message = mismatch
@@ -506,32 +571,86 @@ def registry_notes(fields, registry):
 
 
 def vehicle_matches_registry(registry, seen):
-    """How well a photographed vehicle matches the record: make +2, body and
-    colour +1 each (-1 when they differ); a different make is -10."""
+    """How well a photographed vehicle matches the record: make +2 (-10 when
+    it differs), model +1, body and colour +1 each (-1 when they differ; a
+    near colour counts 0). Values vehicle_terms does not know count 0."""
     if not registry or not seen:
         return 0
-    seen_words = set(_words(seen.get("make_model")))
-    registered = set(_words(f"{registry.get('make')} {registry.get('model')}"))
-    seen_makes = seen_words & KNOWN_MAKES
     score = 0
-    if seen_makes:
-        score += 2 if seen_makes & registered else -10
-    elif seen_words & registered:
+    make = vehicle_terms.make_relation(seen.get("make_model"), _registered_vehicle(registry))
+    if make == "different":
+        score -= 10
+    elif make == "same":
         score += 2
-    body = (_group(seen.get("body_type"), BODY_GROUPS), _group(registry.get("body_type"), BODY_GROUPS))
-    if all(body):
-        score += 1 if body[0] == body[1] else -1
-    colour = (_group(seen.get("colour"), COLOUR_GROUPS), _group(registry.get("colour"), COLOUR_GROUPS))
-    if all(colour):
-        score += 1 if colour[0] == colour[1] else -1
+    if vehicle_terms.model_relation(seen.get("make_model"), registry.get("model")) == "same":
+        score += 1
+    body = vehicle_terms.body_relation(seen.get("body_type"), registry.get("body_type"))
+    score += {"same": 1, "different": -1}.get(body, 0)
+    colour = vehicle_terms.colour_relation(seen.get("colour"), registry.get("colour"))
+    score += {"same": 1, "different": -1}.get(colour, 0)
     return score
+
+
+TRANSPORT_WORDS = ("transport", "commercial", "goods", "taxi", "contract carriage", "bus")
+
+
+def _is_transport(registry):
+    """A transport (commercial) vehicle, when the registry says so. Every
+    vehicle in the mock registry is a private car (non-transport)."""
+    vehicle_class = str((registry or {}).get("vehicle_class") or "").lower()
+    return bool(vehicle_class) and "non" not in vehicle_class and any(
+        word in vehicle_class for word in TRANSPORT_WORDS)
+
+
+def licence_validity(fields, registry=None):
+    """(date, field) the driving licence must be valid until for this vehicle.
+
+    Indian smart-card licences can print Non-Transport (NT) and Transport (TR)
+    validity separately. A private (non-transport) vehicle needs NT validity;
+    a transport vehicle needs TR. Two dates whose labels could not be read:
+    the later one, for a non-transport vehicle. One date: that date."""
+    nt = parse_date(get_field(fields, "licence_expiry_nt"))[0]
+    tr = parse_date(get_field(fields, "licence_expiry_tr"))[0]
+    printed = parse_date(get_field(fields, "dl_expiry_date"))[0]
+    if _is_transport(registry):
+        if tr:
+            return tr, "licence_expiry_tr"
+        return (printed, "dl_expiry_date") if printed else (None, None)
+    if nt:
+        return nt, "licence_expiry_nt"
+    if tr and printed and printed != tr:
+        return max(tr, printed), "dl_expiry_date" if printed > tr else "licence_expiry_tr"
+    if printed:
+        return printed, "dl_expiry_date"
+    return None, None
+
+
+def _ist_today():
+    from datetime import datetime, timedelta, timezone
+    return datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+
+
+def late_intimation_days():
+    try:
+        return max(0, int(os.getenv("LATE_INTIMATION_DAYS", "30")))
+    except ValueError:
+        return 30
+
+
+# Policy wordings ask for immediate notice of an accident, but IRDAI circular
+# IRDA/HLTH/MISC/CIR/216/09/2011 says a genuine claim must not be rejected for
+# a delay in intimation alone. Late intimation therefore only sends the claim
+# to an assessor (review), never to a rejection.
+LATE_INTIMATION_CIRCULAR = "IRDA/HLTH/MISC/CIR/216/09/2011"
 
 
 def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None,
               vehicles=None, claimable_count: int = 0, forensics=None, registry=None,
-              seen=None):
+              seen=None, submitted_on=None):
     """registry: the plate's registration record (mock VAHAN), when known.
-    seen: {"colour", "make_model", "body_type"} of the claimed vehicle in the photos."""
+    seen: {"colour", "make_model", "body_type"} of the claimed vehicle in the photos.
+    submitted_on: the date the claim was submitted (India time), for the
+    accident-date checks; None skips them."""
     flags = []
     damage = damage or []
 
@@ -602,19 +721,69 @@ def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None
                     "evidence": [source, number_plate, reg_rc],
                 })
 
-    # 3. dl_expired_at_loss
-    dl_exp = parsed_dates["dl_expiry_date"]
+    # 3. dl_expired_at_loss: the validity that applies to this vehicle
+    #    (Non-Transport for a private car), not any date printed.
+    dl_exp, dl_field = licence_validity(fields, registry)
     acc_date = parsed_dates["accident_date"]
     if dl_exp and acc_date and dl_exp < acc_date:
+        kind = {"licence_expiry_nt": " (non-transport validity)",
+                "licence_expiry_tr": " (transport validity)"}.get(dl_field, "")
         flags.append({
             "rule": "dl_expired_at_loss",
             "severity": "HIGH",
             "message": (
-                f"Driving licence expired on {dl_exp.isoformat()}, before the "
+                f"Driving licence{kind} expired on {dl_exp.isoformat()}, before the "
                 f"accident date {acc_date.isoformat()}."
             ),
-            "evidence": ["dl_expiry_date", "accident_date"],
+            "evidence": [dl_field, "accident_date"],
         })
+
+    # 3b. The RC's registration validity ("Regn. Validity", 15 years for a
+    #     private vehicle) on the accident date. Not read: not checked.
+    reg_until = parse_date(get_field(fields, "registration_valid_until"))[0]
+    if reg_until and acc_date and acc_date > reg_until:
+        flags.append({
+            "rule": "registration_expired_at_loss",
+            "severity": "HIGH",
+            "message": (
+                f"Registration had expired before the accident: the RC is valid until "
+                f"{reg_until.isoformat()}, the accident was on {acc_date.isoformat()}."
+            ),
+            "evidence": ["accident_date", "registration_valid_until"],
+        })
+
+    # 3c. The accident date against the day the claim was submitted.
+    if acc_date and submitted_on:
+        if acc_date > submitted_on:
+            flags.append({
+                "rule": "accident_after_submission",
+                "severity": "HIGH",
+                "message": (
+                    f"The accident date {acc_date.isoformat()} is after the claim was "
+                    f"submitted ({submitted_on.isoformat()})."
+                ),
+                "evidence": ["accident_date", "submitted_on"],
+                "comparison": {"rows": [
+                    {"source": "Accident date", "value": acc_date.isoformat()},
+                    {"source": "Claim submitted", "value": submitted_on.isoformat()},
+                ], "verdict": "AFTER SUBMISSION"},
+            })
+        else:
+            days = (submitted_on - acc_date).days
+            if days > late_intimation_days():
+                # MEDIUM and review only: never a rejection by itself.
+                flags.append({
+                    "rule": "late_intimation",
+                    "severity": "MEDIUM",
+                    "review": True,
+                    "message": (f"Reported {days} days after the accident — ask the customer "
+                                "for the reason."),
+                    "evidence": ["accident_date", "submitted_on"],
+                    "comparison": {"rows": [
+                        {"source": "Accident date", "value": acc_date.isoformat()},
+                        {"source": "Claim submitted", "value": submitted_on.isoformat()},
+                    ], "verdict": f"REPORTED {days} DAYS LATER"},
+                })
 
     # 4. policy_not_active. The registry is the source of truth for the
     #    policy when there is one; the documents only without it.
@@ -803,6 +972,9 @@ SOURCE_LABELS = {
     "registration_number_claim_form": "Claim form registration",
     "registration_number_rc": "RC registration",
     "dl_expiry_date": "Licence valid until",
+    "licence_expiry_nt": "Licence valid until (non-transport)",
+    "licence_expiry_tr": "Licence valid until (transport)",
+    "registration_valid_until": "RC registration valid until",
     "accident_date": "Accident date",
     "policy_start_date": "Policy start (documents)",
     "policy_end_date": "Policy end (documents)",
@@ -813,6 +985,7 @@ SOURCE_LABELS = {
 # The verdict a flag's rule stands for; anything else is MISMATCH.
 RULE_VERDICTS = {
     "dl_expired_at_loss": "EXPIRED",
+    "registration_expired_at_loss": "EXPIRED",
     "policy_not_active": "OUTSIDE POLICY",
     "policy_third_party_only": "NOT COVERED",
     "date_undetermined": "UNREADABLE",
@@ -951,11 +1124,15 @@ def passed_checks(fields, registry=None, flags=(), notes=(), photos=()):
             add("vehicle_identity_match", "Plate in the photos matches the RC", rows=[
                 {"source": "Plate in photos", "value": ", ".join(plates)},
                 {"source": "RC registration", "value": str(reg_rc)}])
-    dl_expiry = parse_date(get_field(fields, "dl_expiry_date"))[0]
+    dl_expiry, dl_field = licence_validity(fields, registry)
     accident = parse_date(get_field(fields, "accident_date"))[0]
     if dl_expiry and accident and dl_expiry >= accident:
         add("dl_valid_at_loss", "Licence valid on the accident date",
-            ["dl_expiry_date", "accident_date"], verdict="VALID")
+            [dl_field, "accident_date"], verdict="VALID")
+    reg_until = parse_date(get_field(fields, "registration_valid_until"))[0]
+    if reg_until and accident and accident <= reg_until:
+        add("registration_valid_at_loss", "Registration valid on the accident date",
+            ["accident_date", "registration_valid_until"], verdict="VALID")
     if accident and "policy_not_active" not in raised:
         if registry.get("policy_start") and registry.get("policy_end"):
             start = parse_date(registry["policy_start"])[0]
@@ -1011,8 +1188,11 @@ def assess_confidence(payload):
     if payload.get("status") == "error":
         reasons.append("Automated assessment unavailable: escalated to an assessor")
     for flag in payload.get("flags") or []:
-        if isinstance(flag, dict) and str(flag.get("severity")).upper() == "HIGH":
-            reasons.append(flag.get("message") or f"High-severity flag: {flag.get('rule')}")
+        # HIGH, and any flag marked review (late intimation, an RC number that
+        # differs from the registry): an assessor decides. Never a rejection.
+        if isinstance(flag, dict) and (str(flag.get("severity")).upper() == "HIGH"
+                                       or flag.get("review") is True):
+            reasons.append(flag.get("message") or f"Flag: {flag.get('rule')}")
 
     estimate = payload.get("estimate") or {}
     if estimate.get("requires_survey") is True:
@@ -1033,7 +1213,8 @@ def assess_confidence(payload):
             reasons.append(f"Low-confidence damage finding: {part}")
 
     for field in payload.get("fields") or []:
-        if isinstance(field, dict) and field.get("status") == "unreadable":
+        if (isinstance(field, dict) and field.get("status") == "unreadable"
+                and field.get("name") not in SILENT_FIELDS):
             reasons.append(f"Unreadable field: {field.get('name')}")
 
     reasons.extend(extraction_reasons(payload.get("extraction")))

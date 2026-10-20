@@ -141,6 +141,7 @@ token; see its docstring.
 | `SESSION_SECRET` | Signs console session cookies. Unset: derived from `ADMIN_TOKEN`. |
 | `ADMIN_TOKEN` | For scripts (seed_demo): accepted by every claim, upload, override, reset and admin endpoint in place of a session. Also the key for signed media links. |
 | `ELA_ENABLED` | `true` turns error-level analysis back on. Default `false`. |
+| `LATE_INTIMATION_DAYS` | Days between accident and claim after which the claim is flagged MEDIUM for review (never rejected). Default `30`. |
 | `GROQ_API_KEY`, `GROQ_API_KEY_<suffix>` | Groq keys; the bare name is used first, then suffixes alphabetically. |
 | `GEMINI_API_KEY`, `GEMINI_API_KEY_<suffix>` | Gemini keys, pooled the same way. |
 | `OPENROUTER_API_KEY`, `OPENROUTER_API_KEY_<suffix>` | OpenRouter keys, pooled the same way. |

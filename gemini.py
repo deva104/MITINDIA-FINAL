@@ -93,11 +93,15 @@ Extract these fields. Return JSON: {"fields":[{"name","value","source_doc","conf
 Field names to extract, exactly these keys:
   insured_name_claim_form, driver_name_claim_form, owner_name_rc, holder_name_dl,
   registration_number_claim_form, registration_number_rc,
-  chassis_number, engine_number, vehicle_make_model,
-  dl_number, dl_expiry_date, policy_number,
+  chassis_number, engine_number, vehicle_make_model, registration_valid_until,
+  dl_number, dl_expiry_date, licence_expiry_nt, licence_expiry_tr, policy_number,
   policy_start_date, policy_end_date,
   accident_date, accident_time, accident_location, accident_description
 Dates in ISO format YYYY-MM-DD. source_doc = the filename it came from.
+Driving licence: Non-Transport (NT) and Transport (TR) validity can be printed separately;
+licence_expiry_nt and licence_expiry_tr are those dates, dl_expiry_date is the NT date (the
+later date when two are printed and you cannot tell which is which).
+RC: registration_valid_until is the "Regn. Validity" date, not fitness or tax validity.
 confidence = 0.0 to 1.0.
 If a field's label appears on the document but the value is blank, illegible or cut off,
 return status 'unreadable'. If the field does not appear on this document type at all,
@@ -207,9 +211,10 @@ def classify_image(path):
 DOCUMENT_FIELDS = {
     "rc": (
         "owner_name_rc", "registration_number_rc", "chassis_number",
-        "engine_number", "vehicle_make_model",
+        "engine_number", "vehicle_make_model", "registration_valid_until",
     ),
-    "driving_licence": ("holder_name_dl", "dl_number", "dl_expiry_date"),
+    "driving_licence": ("holder_name_dl", "dl_number", "dl_expiry_date",
+                        "licence_expiry_nt", "licence_expiry_tr"),
     "claim_form": (
         "insured_name_claim_form", "driver_name_claim_form",
         "registration_number_claim_form", "accident_date", "accident_time",
@@ -232,7 +237,20 @@ confidence = 0.0 to 1.0.
 If a field's label appears on the document but the value is blank, illegible or cut off,
 return status 'unreadable'. If the field does not appear on this document at all,
 return 'not_present'. Only use 'found' when you read an actual value.
-CRITICAL: never guess or infer a value; return value null and confidence 0 instead."""
+CRITICAL: never guess or infer a value; return value null and confidence 0 instead.{notes}"""
+
+LICENCE_NOTE = """Indian smart-card driving licences can print Non-Transport (NT) and Transport
+(TR or T) validity separately. licence_expiry_nt = the Non-Transport validity end date;
+licence_expiry_tr = the Transport validity end date; use not_present for one that is not
+printed. dl_expiry_date = the Non-Transport validity end date, or the only validity date
+when just one is printed. If two validity dates are printed and you cannot tell which is
+which, put the LATER one in dl_expiry_date and return licence_expiry_nt and
+licence_expiry_tr as not_present."""
+RC_NOTE = """registration_valid_until = the date the registration itself is valid until, printed
+as "Regn. Validity", "Registration Valid Upto" or "Valid Upto" (15 years for a private
+vehicle). Not the fitness, tax or insurance validity. vehicle_make_model = the maker's
+name and model name as printed."""
+DOCUMENT_NOTES = {"driving_licence": LICENCE_NOTE, "rc": RC_NOTE}
 
 
 def _document(spec):
@@ -324,6 +342,8 @@ def _extract_document(document):
         SINGLE_DOCUMENT_PROMPT.format(
             title=DOCUMENT_TITLES[document["doc_type"]],
             keys=", ".join(DOCUMENT_FIELDS[document["doc_type"]]),
+            notes=("\n" + DOCUMENT_NOTES[document["doc_type"]])
+            if document["doc_type"] in DOCUMENT_NOTES else "",
         )
         if document["doc_type"]
         else EXTRACT_PROMPT
@@ -389,6 +409,22 @@ def _merge_chunks(chunks):
             elif current.get("status") == "not_present" and field.get("status") == "unreadable":
                 best[name] = field
     return [best[name] for name in order]
+
+
+def reconcile_licence_dates(fields):
+    """dl_expiry_date stays the Non-Transport date (older code and claims read
+    it): when NT validity was read, dl_expiry_date carries it."""
+    nt = next((field for field in fields if field.get("name") == "licence_expiry_nt"
+               and field.get("status") == "found"), None)
+    if nt is None:
+        return fields
+    for field in fields:
+        if field.get("name") == "dl_expiry_date":
+            field.update(value=nt.get("value"), status="found",
+                         confidence=nt.get("confidence"), source_doc=nt.get("source_doc"))
+            return fields
+    fields.append(dict(nt, name="dl_expiry_date"))
+    return fields
 
 
 def _merge_fields(fields):
@@ -466,7 +502,7 @@ def extract_fields(documents):
                 "doc_type": document["doc_type"],
                 "error": _cause(error),
             })
-    result["fields"] = _merge_fields(fields)
+    result["fields"] = reconcile_licence_dates(_merge_fields(fields))
     if not result["failed"]:
         result["status"] = "ok"
     else:

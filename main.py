@@ -58,6 +58,7 @@ from gemini import (
 )
 from rules import (
     DOCUMENT_LABELS,
+    SILENT_FIELDS,
     add_comparisons,
     assess_confidence,
     build_estimate,
@@ -1068,7 +1069,7 @@ def format_vehicle_label(parts):
 def build_undetermined(payload):
     entries = []
     for field in payload.get("fields") or []:
-        if not isinstance(field, dict):
+        if not isinstance(field, dict) or field.get("name") in SILENT_FIELDS:
             continue
         status = field.get("status")
         field_info = RULE_FIELD_IMPACTS.get(field.get("name"))
@@ -1365,6 +1366,23 @@ def build_vehicle_groups(photos, damage, excluded, photo_urls=None):
         })
 
     return vehicles
+
+
+def submitted_date(created_at):
+    """The day a claim was submitted, in India time (an accident date is the
+    customer's local date): created_at when given, else now."""
+    from datetime import timedelta, timezone
+
+    india = timezone(timedelta(hours=5, minutes=30))
+    if created_at:
+        try:
+            moment = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            return moment.astimezone(india).date()
+        except ValueError:
+            pass
+    return datetime.now(india).date()
 
 
 def seen_vehicle(vehicle, photos):
@@ -1756,7 +1774,8 @@ def _analyse_claim_sync(
                                          vehicles=vehicles,
                                          claimable_count=rules_claimable,
                                          forensics=deep, registry=case["registry"],
-                                         seen=seen_vehicle(primary_vehicle, photos))
+                                         seen=seen_vehicle(primary_vehicle, photos),
+                                         submitted_on=submitted_date(None))
         stage_done("stage3_rules", mark)
 
         return finish(make_payload("analysed", None, fields=fields, damage=damage,
@@ -2410,6 +2429,8 @@ def reassess_claim(claim_id, documents, classifications=(), labels=()):
             claimable_count=1 if selected is not None else (payload.get("claimable_count") or 0),
             forensics=payload.get("forensics") or [], registry=record,
             seen=seen_vehicle(primary, photos),
+            # The claim's own submission date, not the day documents were added.
+            submitted_on=submitted_date(payload.get("created_at")),
         )
     notes = [note for note in payload.get("notes") or [] if note.get("rule") == "other_vehicle_in_photos"]
     payload["notes"] = identity_notes(fields) + registry_notes(fields, record) + notes

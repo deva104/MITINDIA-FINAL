@@ -6,6 +6,7 @@ out of the public repo: data/private_registry_rows.json (gitignored) or the
 REGISTRY_PRIVATE_ROWS env var (a JSON list). load() puts them all in the
 vehicle_registry table at startup, on either backend.
 """
+import hashlib
 import json
 import os
 import re
@@ -86,13 +87,27 @@ def records():
     return list(by_plate.values())
 
 
+_LOADED = {"fingerprint": None}
+
+
+def _fingerprint(rows):
+    return hashlib.sha256(json.dumps(sorted(rows, key=lambda row: row["plate"]),
+                                     sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
 def load(force=False):
-    """Fill the vehicle_registry table. Skipped when it already holds the
-    same number of rows, so repeated startups cost one count query."""
+    """Sync the vehicle_registry table with the spreadsheet and the private
+    rows. The first load in a process (startup) always rewrites it, in one
+    transaction (registry_replace: one DELETE, one INSERT), so a redeploy with
+    a new or edited REGISTRY_PRIVATE_ROWS takes effect: a count check missed a
+    row edited in place. Later loads in the same process are skipped while
+    the rows are unchanged. A row removed from the sources is removed too."""
     rows = records()
-    if not force and rows and db.registry_count() == len(rows):
+    fingerprint = _fingerprint(rows)
+    if not force and fingerprint == _LOADED["fingerprint"]:
         return len(rows)
     db.registry_replace(rows)
+    _LOADED["fingerprint"] = fingerprint
     print(f"[registry] loaded {len(rows)} vehicles", flush=True)
     return len(rows)
 
@@ -110,7 +125,7 @@ def lookup(plate):
     try:
         record = db.registry_get(plate)
         if record is None and db.registry_count() == 0:
-            load()
+            load(force=True)
             record = db.registry_get(plate)
     except Exception as error:
         # An unavailable registry is "not checked", never a failed claim.

@@ -5,3 +5,7 @@ __pycache__/
 uploads/
 static_output/
 data/private_registry_rows.json
+# Real people's documents and registry rows: never committed (the repo is public).
+data/private_*
+data/registry_5_sets*
+scripts/local/

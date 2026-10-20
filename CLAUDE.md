@@ -284,7 +284,43 @@ Runtime:
 - **Registry data.** `data/mock_vahan_registry.xlsx` (100 fictitious rows,
   `scripts/generate_registry.py`). Rows from real test documents are never
   committed (the repo is public): `data/private_registry_rows.json`
-  (gitignored) or `REGISTRY_PRIVATE_ROWS`.
+  (gitignored) or `REGISTRY_PRIVATE_ROWS` (which wins over the file). A
+  private row replaces a public row with the same plate. `data/private_*`,
+  `data/registry_5_sets*` and `scripts/local/` are gitignored; real names,
+  plates, chassis, engine and DL numbers never go in a tracked file, test or
+  commit message. Tests pin `REGISTRY_PRIVATE_ROWS=[]` (bootstrap) and use
+  synthetic plates. `chassis_last5`/`engine_last5` are strings.
+  - `registry.load()` at startup rewrites `vehicle_registry` from the sources
+    in one transaction (`db.registry_replace`), so a redeploy with a new or
+    edited `REGISTRY_PRIVATE_ROWS` takes effect; later loads in the same
+    process are skipped while the rows' fingerprint is unchanged.
+- **One vehicle normaliser** (`vehicle_terms.py`): make (corporate words
+  stripped, "M&M", a model implying its make), model (spacing and case
+  ignored, a catalogue of model names), colour family (teal/turquoise/aqua
+  are blue; silver~grey and blue~green are near matches, never a flag) and
+  body class (saloon = sedan, hard top/crossover/MUV/MPV = SUV; "RIGID
+  (PASSENGER CAR)" is unknown). Every make/model/colour/body comparison goes
+  through it; a value it does not know is skipped silently.
+- **RC against the registry** (`rules.rc_identity_flags`): the RC's make (HIGH
+  when different) and model (MEDIUM, review); chassis and engine number by
+  their last 5 (MEDIUM, review; I/O/Q read as 1/0/0; an unreadable "?" in
+  the last 5 or a blank registry value skips the check).
+- **Dates.** The licence must be valid on the accident date for this vehicle:
+  Non-Transport validity (`licence_expiry_nt`) for a private vehicle,
+  Transport (`licence_expiry_tr`) only when the registry says transport;
+  `dl_expiry_date` carries NT (`gemini.reconcile_licence_dates`); two
+  unlabelled dates: the later one. The RC's `registration_valid_until`
+  before the accident is HIGH (`registration_expired_at_loss`). An accident
+  dated after submission is HIGH; more than `LATE_INTIMATION_DAYS` (30)
+  between accident and submission (India date) is MEDIUM `late_intimation`,
+  which only sends the claim to review (IRDAI IRDA/HLTH/MISC/CIR/216/09/2011:
+  no rejection for delay alone). A flag with `review: true` is a decision
+  reason like a HIGH. `rules.SILENT_FIELDS` (the new optional dates) never
+  produce a "could not determine" entry or a decision reason.
+- **Organisation owners** (`rules.name_match`): a name with an organisation
+  word (department, director, commissioner, limited, …) is matched as an
+  organisation: same words in any order, THE/OF/AND/FOR ignored,
+  Deptt/Dept = Department, no initials.
 - **Registry cross-checks** (`rules.registry_flags`): plate vs RC, owner vs
   RC owner (name matcher), the photographed vehicle vs the registration
   (make AND body type differ: HIGH; make only, body only or colour only:
@@ -305,8 +341,10 @@ Runtime:
   and agreed come back as `checks` (MATCH, VALID, COVERED;
   `rules.passed_checks`). Cards are tinted faint red (HIGH, MEDIUM,
   suspicious), green (match, clean) or grey (information).
-- **Assessors and timeline.** Six mock assessors (`assessors.py`), assigned
-  by registry city, round robin, phone `ASSESSOR_CONTACT`. `claim_events`
+- **Assessors and timeline.** Mock assessors (`assessors.py`) in the
+  registry's cities, assigned by city, else by region (`assessors.REGIONS`),
+  else anyone, round robin, phone `ASSESSOR_CONTACT`; from the built-in list
+  when the database cannot be read, so a claim always gets one. `claim_events`
   holds the timeline (submitted, assessor_assigned, survey_scheduled,
   documents_added, more_info_requested, approved, rejected,
   assessment_updated).

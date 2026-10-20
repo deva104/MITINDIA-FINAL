@@ -34,6 +34,10 @@ def configure():
     for name in set(file_env) | set(os.environ):
         if name.upper().startswith(PROVIDER_PREFIXES):
             os.environ[name] = ""
+    # Real people's registry rows (data/private_registry_rows.json, gitignored)
+    # never reach a test: the public 100 rows only. A test that needs private
+    # rows sets synthetic ones.
+    os.environ["REGISTRY_PRIVATE_ROWS"] = "[]"
     production_hosts = set()
     file_database_url = (file_env.get("DATABASE_URL") or "").strip()
     if file_database_url:

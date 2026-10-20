@@ -1277,7 +1277,7 @@ async def process_session(wa_id, skip_missing=False):
         from main import analyse_claim  # deferred: main imports this module at startup
 
         # The guided flow confirmed a registry record before collecting.
-        guided = get_session(wa_id).get("stage") == "collect"
+        guided = get_session(wa_id).get("stage") in ("collect", "ready")
         record = get_session(wa_id).get("registry") if guided else None
         forced = []
         if record and not registry.mobile_matches(record, wa_id):
@@ -1330,6 +1330,10 @@ async def process_session(wa_id, skip_missing=False):
                 analysing=False, analysis_cutoff=None, stage="open_claim",
                 claim_id=payload.get("claim_id", claim_id), step=None,
                 pending_choice=choice, pending_prompt=reply if needs_choice else None,
+                claim_shas=sorted({row["sha256"] for row in rows}),
+                # NO after EXIT, or a greeting, returns here, not to the summary.
+                last_prompt=(f"Your claim *{payload.get('claim_id', claim_id)}* is open. "
+                             f"{OPEN_CLAIM_LINE}"),
                 updated=time.time(),
             )
             keep_session = True
@@ -1352,7 +1356,8 @@ async def process_session(wa_id, skip_missing=False):
                 updated=time.time(),
             )
             keep_session = True
-        await send_text(wa_id, reply)
+        # A guided result waits for documents: it carries the footer.
+        await send_text(wa_id, with_footer(reply) if guided else reply)
     except Exception:
         print("[whatsapp] process_session failed:", flush=True)
         traceback.print_exc()
@@ -1411,31 +1416,52 @@ async def process_session(wa_id, skip_missing=False):
 #   "ask_plate"           waiting for the registration number
 #   "confirm_vehicle"     registry record shown, waiting for YES / NO
 #   "collect"             steps 1-4: photos, RC, licence, claim form
+#   "ready"               everything filled or skipped: waiting for SUBMIT
 #   "open_claim"          result sent; documents now attach to claim_id
 #   "track"               waiting for a tracking ID or ALL
 #   "confirm_attach"      a document arrived for a claim in more_info status
-# MENU, END and HELP work at any point.
+# exit_pending: EXIT was sent and is waiting for YES / NO.
+# last_prompt: the last message that waited for input, for NO and greetings.
+# MENU, END, HELP and EXIT work at any point.
 
+FOOTER = "_Reply EXIT to cancel · MENU for the main menu_"
 WELCOME = "*Welcome to InsureIT*\nReply *1* to file a new claim\nReply *2* to track a claim"
 HELP_TEXT = "\n".join([
     "*Commands*",
-    "*MENU* — start again",
+    "*MENU* — the main menu",
+    "*EXIT* — cancel what you are doing",
     "*END* — close this session",
     "*HELP* — this list",
     "*DONE* — finish sending damage photos",
     "*SKIP* — skip steps 2 to 4 (RC, licence, claim form)",
+    "*SUBMIT* — file the claim when everything is sent",
 ])
 PLATE_PROMPT = "Send your vehicle registration number, for example *MH12AB1234*."
 TRACK_PROMPT = ("Send your tracking ID (e.g. CLM-72F34AC2), or reply *ALL* to see "
                 "claims on this number.")
 CONFIRM_PROMPT = "Reply *YES* to continue or *NO* to enter a different number."
 TIMEOUT_TEXT = "Your session timed out after 30 minutes of inactivity."
+SCREENSHOT_REPLY = "That looks like a screenshot — please send the original photo."
+ANALYSING_EXIT_REPLY = "Your claim is being analysed and will finish — you will get the result here."
+MID_CLAIM_TRACK = ("You are filing a claim right now. Finish it, or reply *EXIT* and then "
+                   "*2* to track a claim.")
+KEPT_FOR_CLAIM = "Got it — what you sent will be added to your claim."
+GUIDED_BUSY_MEDIA = ("Your claim is still being analysed — please send this again after you "
+                     "get the result.")
+NOT_A_TRACKING_ID = "That is not a tracking ID."
 STEP_SLOTS = {1: "photo", 2: "rc", 3: "driving_licence", 4: "claim_form"}
 SLOT_STEPS = {slot: step for step, slot in STEP_SLOTS.items()}
 SLOT_LABELS = {
     "photo": "damage photo", "rc": "registration certificate",
     "driving_licence": "driving licence", "claim_form": "claim form",
     "policy": "policy document",
+}
+# What each step asks for, in "That does not look like a ..." replies.
+EXPECTED = {
+    1: ("damage photo", "a photo of the damage to your vehicle"),
+    2: ("registration certificate", "a photo of the RC"),
+    3: ("driving licence", "a photo of the driving licence"),
+    4: ("claim form", "the claim form as a photo or PDF"),
 }
 STEP_PROMPTS = {
     1: ("*Step 1 of 4 — damage photos*\nSend photos of the damage from a few angles. "
@@ -1444,17 +1470,25 @@ STEP_PROMPTS = {
     3: "*Step 3 of 4 — driving licence*\nSend a photo of the driver's licence, or reply *SKIP*.",
     4: "*Step 4 of 4 — claim form*\nSend the claim form as a photo or PDF, or reply *SKIP*.",
 }
+GREETINGS = {
+    "hi", "hii", "hiii", "hello", "helo", "hey", "heyy", "hlo", "hai", "namaste",
+    "namaskar", "good morning", "good afternoon", "good evening",
+}
 COMMANDS = {
     "menu": {"menu", "main menu", "start", "restart", "home"},
-    "end": {"end", "exit", "quit", "close", "bye"},
+    "exit": {"exit", "cancel", "quit", "stop"},
+    "end": {"end", "close", "bye"},
     "help": {"help", "?", "commands"},
-    "yes": {"yes", "y", "yeah", "yep", "ok", "okay", "haan", "ha", "confirm"},
-    "no": {"no", "n", "nope", "nahi"},
+    "yes": {"yes", "y", "yeah", "yep", "ok", "okay", "haan", "ha", "haa", "ji", "sure",
+            "confirm", "👍", "✅"},
+    "no": {"no", "n", "nope", "nah", "nahi", "nahin", "👎", "❌"},
     "done": {"done", "finished", "finish", "next", "complete", "ho gaya", "hogaya", "हो गया"},
     "skip": {"skip"},
+    "submit": {"submit", "submit claim", "send claim"},
     "1": {"1", "one", "new claim", "file a claim", "file claim", "claim"},
     "2": {"2", "two", "track", "track a claim", "track claim", "status"},
     "all": {"all"},
+    "greeting": GREETINGS,
 }
 EVENT_LABELS = {
     "submitted": "Claim submitted", "assessor_assigned": "Assessor assigned",
@@ -1462,6 +1496,15 @@ EVENT_LABELS = {
     "more_info_requested": "More information requested", "approved": "Approved",
     "rejected": "Not approved", "assessment_updated": "Assessment updated",
 }
+POSITIVE_TYPES = {"vehicle_photo": "photo", "rc": "rc", "driving_licence": "driving_licence",
+                  "claim_form": "claim_form", "policy": "policy"}
+SLOT_CONFIDENCE = 0.6
+BEFORE_SUBMISSION = {"ask_plate", "confirm_vehicle", "collect", "ready"}
+AFTER_SUBMISSION = {"open_claim", "confirm_attach"}
+
+
+def with_footer(text):
+    return f"{text}\n\n{FOOTER}"
 
 
 def command_of(text):
@@ -1480,7 +1523,7 @@ def set_conversation(wa_id, **fields):
 
 
 def clear_conversation(wa_id):
-    """END or MENU: the session's state and its pending media go."""
+    """END, EXIT or MENU: the session's state and its pending media go."""
     rows = db.list_session_media(wa_id)
     if rows:
         db.delete_session_media(wa_id, [row["id"] for row in rows])
@@ -1488,20 +1531,62 @@ def clear_conversation(wa_id):
     DEFERRED_MEDIA.pop(wa_id, None)
 
 
+async def ask(wa_id, text):
+    """A message that waits for input: remembered, and sent with the footer."""
+    set_conversation(wa_id, last_prompt=text)
+    await send_text(wa_id, with_footer(text))
+
+
+def stage_prompt(wa_id, session):
+    """The prompt for a stage, for a session with no last_prompt (one
+    created before last_prompt existed)."""
+    stage = session.get("stage")
+    if stage == "collect":
+        return STEP_PROMPTS.get(session.get("step") or 1, STEP_PROMPTS[1])
+    if stage == "ready":
+        return ready_summary(wa_id)
+    if stage == "ask_plate":
+        return PLATE_PROMPT
+    if stage == "track":
+        return TRACK_PROMPT
+    if stage == "open_claim" and session.get("claim_id"):
+        return f"Your claim *{session['claim_id']}* is open. {OPEN_CLAIM_LINE}"
+    if stage == "confirm_attach" and session.get("attach_claim_id"):
+        return f"Add this to *{session['attach_claim_id']}*? Reply *YES* or *NO*."
+    return WELCOME
+
+
+async def restate(wa_id, prefix=None):
+    """The prompt the customer is on, again (after NO, a greeting or noise)."""
+    session = get_session(wa_id)
+    prompt = session.get("last_prompt") or stage_prompt(wa_id, session)
+    await ask(wa_id, f"{prefix}\n\n{prompt}" if prefix else prompt)
+    set_conversation(wa_id, last_prompt=prompt)
+
+
 def slot_counts(wa_id):
-    """Pending items per slot. Photos sent before a claim was started count
-    as damage photos; a PDF counts once, however many pages."""
+    """Pending items per slot; a multi-page document counts once per slot."""
     session = get_session(wa_id)
     counts = {slot: 0 for slot in SLOT_LABELS}
     seen = set()
     for row in _pending_rows(session, db.list_session_media(wa_id)):
-        slot = row.get("slot") or ("photo" if row["kind"] == "photo" else "claim_form")
+        slot = row.get("slot")
+        if slot not in counts:
+            continue
         key = (slot, row["sha256"])
         if key in seen:
             continue
         seen.add(key)
-        counts[slot] = counts.get(slot, 0) + 1
+        counts[slot] += 1
     return counts
+
+
+def media_totals(wa_id):
+    """(photos, documents) pending, for the EXIT question."""
+    rows = _pending_rows(get_session(wa_id), db.list_session_media(wa_id))
+    photos = sum(1 for row in rows if row["kind"] == "photo" and row.get("slot") == "photo")
+    documents = len({row["sha256"] for row in rows if row.get("slot") not in (None, "photo")})
+    return photos, documents
 
 
 def next_step(session, counts, after):
@@ -1514,45 +1599,56 @@ def next_step(session, counts, after):
     return None
 
 
-def classify_slot(data, is_pdf, step):
-    """Which slot an arriving image (or a PDF's first page) belongs in."""
+def classify_pages(images, is_pdf):
+    """One slot per image: photo, rc, driving_licence, claim_form or policy
+    only when classification names it with confidence >= 0.6; "screenshot"
+    for a screen capture; None for anything else. A PDF page is never a
+    damage photo."""
     import tempfile
 
-    handle, path = tempfile.mkstemp(suffix=".jpg")
-    try:
-        with os.fdopen(handle, "wb") as out:
-            out.write(data)
-        result = classify_image(path) or {}
-    except Exception as error:
-        print(f"[whatsapp] slot classification failed: {type(error).__name__}", flush=True)
-        result = {}
-    finally:
+    slots = []
+    for data in images:
+        handle, path = tempfile.mkstemp(suffix=".jpg")
         try:
-            os.remove(path)
-        except OSError:
-            pass
-    route = route_classification({
-        "doc_type": result.get("doc_type"), "confidence": reported_confidence(result),
-    })
-    if route in SLOT_LABELS and route != "photo":
-        return route
-    if route == "vehicle_photo" and not is_pdf:
-        return "photo"
-    # Not clearly a vehicle and not a known document: the step being filled.
-    if step and step > 1:
-        return STEP_SLOTS[step]
-    return "claim_form" if is_pdf else "photo"
+            with os.fdopen(handle, "wb") as out:
+                out.write(data)
+            result = classify_image(path) or {}
+        except Exception as error:
+            print(f"[whatsapp] slot classification failed: {type(error).__name__}", flush=True)
+            result = {}
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        doc_type = str(result.get("doc_type") or "")
+        confidence = reported_confidence(result)
+        if confidence is None or confidence < SLOT_CONFIDENCE:
+            slots.append(None)
+        elif doc_type == "screenshot":
+            slots.append("screenshot")
+        elif doc_type in POSITIVE_TYPES and not (is_pdf and doc_type == "vehicle_photo"):
+            slots.append(POSITIVE_TYPES[doc_type])
+        else:
+            slots.append(None)
+    return slots
 
 
 async def show_welcome(wa_id, prefix=None):
-    set_conversation(wa_id, stage="menu")
-    await send_text(wa_id, f"{prefix}\n\n{WELCOME}" if prefix else WELCOME)
+    set_conversation(wa_id, stage="menu", exit_pending=False)
+    await ask(wa_id, f"{prefix}\n\n{WELCOME}" if prefix else WELCOME)
+    set_conversation(wa_id, last_prompt=WELCOME)
 
 
 async def begin_claim(wa_id):
+    if get_session(wa_id).get("stage") not in (None, "menu", "track"):
+        clear_conversation(wa_id)
+    # Photos or documents sent at START (before choosing 1) are kept for
+    # this claim; start_collecting counts them.
     set_conversation(wa_id, stage="ask_plate", step=None, skipped=[], plate=None,
-                     registry=None, claim_id=None)
-    await send_text(wa_id, PLATE_PROMPT)
+                     registry=None, claim_id=None, exit_pending=False, track_misses=0,
+                     attach_claim_id=None, claim_shas=[])
+    await ask(wa_id, PLATE_PROMPT)
 
 
 def vehicle_summary(plate, record, wa_id):
@@ -1580,12 +1676,14 @@ def vehicle_summary(plate, record, wa_id):
 async def on_plate(wa_id, text):
     plate = registry.normalise_plate(text)
     if not registry.valid_plate(plate):
-        await send_text(wa_id, "That is not a valid registration number. " + PLATE_PROMPT)
+        await ask(wa_id, "That is not a valid registration number. " + PLATE_PROMPT)
+        set_conversation(wa_id, last_prompt=PLATE_PROMPT)
         return
     record = registry.lookup(plate)
     if not record:
-        await send_text(wa_id, f"We could not find *{plate}* in the registry. "
-                               "Check the number and send it again.")
+        await ask(wa_id, f"We could not find *{plate}* in the registry. "
+                         "Check the number and send it again.")
+        set_conversation(wa_id, last_prompt=PLATE_PROMPT)
         return
     state = registry.policy_state(record, registry.today())
     insurer = record.get("insurer") or "your insurer"
@@ -1608,94 +1706,168 @@ async def on_plate(wa_id, text):
         await send_text(wa_id, f"{ending}\n\nReply *MENU* to start again.")
         return
     set_conversation(wa_id, stage="confirm_vehicle", plate=plate, registry=record)
-    await send_text(wa_id, vehicle_summary(plate, record, wa_id))
+    await ask(wa_id, vehicle_summary(plate, record, wa_id))
 
 
 async def start_collecting(wa_id):
     set_conversation(wa_id, stage="collect", step=1, skipped=[])
     held = slot_counts(wa_id).get("photo", 0)
     if held:
-        await send_text(wa_id, STEP_PROMPTS[1] + f"\nYou have already sent {held} photo"
-                        f"{'' if held == 1 else 's'}; send more or reply *DONE*.")
+        await ask(wa_id, STEP_PROMPTS[1] + f"\nYou have already sent {held} photo"
+                  f"{'' if held == 1 else 's'}; send more or reply *DONE*.")
         return
-    await send_text(wa_id, STEP_PROMPTS[1])
+    await ask(wa_id, STEP_PROMPTS[1])
 
 
-async def advance(wa_id, step, start_analysis, prefix=None):
-    """Prompt the next step, or analyse when every step is filled or skipped."""
+def ready_summary(wa_id):
+    session = get_session(wa_id)
+    counts = slot_counts(wa_id)
+    skipped = set(session.get("skipped") or [])
+    parts = [f"✓ Damage photos ({counts.get('photo', 0)})"]
+    for slot, label in (("rc", "RC"), ("driving_licence", "Licence"), ("claim_form", "Claim form")):
+        if counts.get(slot):
+            parts.append(f"✓ {label}")
+        elif slot in skipped:
+            parts.append(f"– {label} (skipped)")
+        else:
+            parts.append(f"✗ {label}")
+    return ("*Ready to submit*\n" + " · ".join(parts)
+            + "\nReply *SUBMIT* to file the claim, or send anything missing.")
+
+
+async def advance(wa_id, step, prefix=None):
+    """Prompt the next step; with every step filled or skipped, the summary.
+    Nothing is analysed until the customer replies SUBMIT."""
     if step is None:
-        if prefix:
-            await send_text(wa_id, prefix)
-        await start_analysis(wa_id, skip_missing=True)
+        set_conversation(wa_id, stage="ready", step=None)
+        summary = ready_summary(wa_id)
+        await ask(wa_id, f"{prefix}\n\n{summary}" if prefix else summary)
+        set_conversation(wa_id, last_prompt=summary)
         return
-    set_conversation(wa_id, step=step)
-    await send_text(wa_id, f"{prefix}\n\n{STEP_PROMPTS[step]}" if prefix else STEP_PROMPTS[step])
+    set_conversation(wa_id, stage="collect", step=step)
+    await ask(wa_id, f"{prefix}\n\n{STEP_PROMPTS[step]}" if prefix else STEP_PROMPTS[step])
+    set_conversation(wa_id, last_prompt=STEP_PROMPTS[step])
 
 
-async def on_collect_text(wa_id, command, start_analysis):
+async def on_collect_text(wa_id, command):
     session = get_session(wa_id)
     step = session.get("step") or 1
     counts = slot_counts(wa_id)
+    if command == "2":
+        await restate(wa_id, MID_CLAIM_TRACK)
+        return
+    if command == "submit":
+        if not counts.get("photo"):
+            await restate(wa_id, "Send at least one photo of the damage first, then reply *DONE*.")
+            return
+        # Early SUBMIT shows what is still missing; it still needs a SUBMIT.
+        await advance(wa_id, None)
+        return
     if step == 1:
         if command == "skip":
-            await send_text(wa_id, "Damage photos cannot be skipped. Send at least one photo "
-                                   "of the damage, then reply *DONE*.")
+            await restate(wa_id, "Damage photos cannot be skipped. Send at least one photo "
+                                 "of the damage, then reply *DONE*.")
             return
         if command != "done":
-            await send_text(wa_id, STEP_PROMPTS[1])
+            await restate(wa_id)
             return
         if not counts.get("photo"):
-            await send_text(wa_id, "Send at least one photo of the damage first, then reply *DONE*.")
+            await restate(wa_id, "Send at least one photo of the damage first, then reply *DONE*.")
             return
-        await advance(wa_id, next_step(session, counts, 1), start_analysis)
+        await advance(wa_id, next_step(session, counts, 1))
         return
     slot = STEP_SLOTS[step]
     if command == "skip":
         if strict_docs_enabled():
-            await send_text(wa_id, f"The {SLOT_LABELS[slot]} is required for this claim. "
-                                   "Please send it.")
+            await restate(wa_id, f"The {SLOT_LABELS[slot]} is required for this claim. "
+                                 "Please send it.")
             return
         skipped = list(session.get("skipped") or []) + [slot]
         session = set_conversation(wa_id, skipped=skipped)
-        await advance(wa_id, next_step(session, counts, step), start_analysis)
+        await advance(wa_id, next_step(session, counts, step))
         return
     if command == "done" and counts.get(slot):
-        await advance(wa_id, next_step(session, counts, step), start_analysis)
+        await advance(wa_id, next_step(session, counts, step))
         return
-    await send_text(wa_id, STEP_PROMPTS[step])
+    await restate(wa_id)
 
 
-async def guided_media_received(wa_id, slot, start_analysis):
-    """Say which slot an item filled, and move on when its step is done."""
+def _labels(slots):
+    names = [SLOT_LABELS.get(slot, "document") for slot in slots]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+async def guided_media_received(wa_id, slots, is_pdf=False):
+    """Say which slot(s) an item filled, and move on when its step is done."""
     if is_analysing(wa_id):
         return
+    slots = [slot for slot in dict.fromkeys(slots or []) if slot]
     session = get_session(wa_id)
+    stage = session.get("stage")
     step = session.get("step") or 1
+    if slots:
+        # Something sent for a skipped slot is no longer skipped.
+        skipped = [slot for slot in session.get("skipped") or [] if slot not in slots]
+        session = set_conversation(wa_id, skipped=skipped)
     counts = slot_counts(wa_id)
-    if slot == "photo":
+    if stage == "ready":
+        await advance(wa_id, None, prefix=f"{_labels(slots).capitalize()} received.")
+        return
+    if slots == ["photo"]:
         count = counts.get("photo", 0)
         if step == 1:
-            await send_text(wa_id, f"Photo received ({count} total). Reply DONE when you are done.")
+            await ask(wa_id, f"Photo received ({count} total). Reply DONE when you are done.")
         else:
-            await send_text(wa_id, f"That looks like a damage photo — added to step 1 "
-                                   f"({count} photo{'' if count == 1 else 's'}). Still on step "
-                                   f"{step}: send the {SLOT_LABELS[STEP_SLOTS[step]]} or reply *SKIP*.")
+            await ask(wa_id, f"That looks like a damage photo — added to step 1 "
+                             f"({count} photo{'' if count == 1 else 's'}). Still on step "
+                             f"{step}: send the {SLOT_LABELS[STEP_SLOTS[step]]} or reply *SKIP*.")
+        set_conversation(wa_id, last_prompt=STEP_PROMPTS[step])
         return
-    label = SLOT_LABELS.get(slot, "document")
-    target = SLOT_STEPS.get(slot)
-    if target is None:
-        await send_text(wa_id, f"{label.capitalize()} received; it will be added to the claim.")
-        return
-    if target == step:
-        received = f"{label[:1].upper() + label[1:]} received (step {step} of 4)."
-        await advance(wa_id, next_step(session, counts, step), start_analysis, prefix=received)
-        return
-    text = f"That looks like your {label} — added to step {target}."
-    if step == 1:
-        text += " Send more damage photos, or reply *DONE*."
+    if is_pdf and len(slots) > 1:
+        filled = f"That PDF filled: {_labels(slots)}."
+    elif len(slots) == 1 and SLOT_STEPS.get(slots[0]) not in (None, step):
+        filled = f"That looks like your {_labels(slots)} — added to step {SLOT_STEPS[slots[0]]}."
     else:
-        text += f" Still on step {step}: send the {SLOT_LABELS[STEP_SLOTS[step]]} or reply *SKIP*."
-    await send_text(wa_id, text)
+        filled = f"{_labels(slots).capitalize()} received."
+    if step == 1:
+        await ask(wa_id, f"{filled} Send more damage photos, or reply *DONE*.")
+        set_conversation(wa_id, last_prompt=STEP_PROMPTS[1])
+        return
+    if STEP_SLOTS[step] in slots:
+        await advance(wa_id, next_step(session, counts, step), prefix=filled)
+        return
+    await ask(wa_id, f"{filled} Still on step {step}: send the "
+                     f"{SLOT_LABELS[STEP_SLOTS[step]]} or reply *SKIP*.")
+    set_conversation(wa_id, last_prompt=STEP_PROMPTS[step])
+
+
+async def media_kept(wa_id):
+    """Media sent before step 1 (at START, the plate or the vehicle check) is
+    kept for the claim. Then the prompt the customer is on."""
+    if get_session(wa_id).get("stage") in (None, "menu", "track"):
+        await show_welcome(wa_id, KEPT_FOR_CLAIM)
+        return
+    await restate(wa_id, KEPT_FOR_CLAIM)
+
+
+async def media_rejected(wa_id, kind):
+    """A screenshot, or an image that is not what the claim needs."""
+    session = get_session(wa_id)
+    if kind == "screenshot":
+        await restate(wa_id, SCREENSHOT_REPLY)
+        return
+    stage = session.get("stage")
+    step = session.get("step") or 1
+    if stage in ("open_claim", "confirm_attach"):
+        await restate(wa_id, "That does not look like a document for this claim. Send the RC, "
+                             "the driving licence or the claim form.")
+        return
+    if stage != "collect":
+        await restate(wa_id, "That does not look like a damage photo or a claim document.")
+        return
+    noun, wanted = EXPECTED.get(step, EXPECTED[1])
+    skip = "" if step == 1 else ", or reply *SKIP*"
+    await restate(wa_id, f"That does not look like a {noun}. Please send {wanted}{skip}.")
 
 
 def _ist(value):
@@ -1759,12 +1931,23 @@ def own_claim(wa_id, claim_id):
     return build_claim_response(payload)
 
 
+def tracking_id_of(text):
+    """"clm 72f3 4ac2", "CLM72F34AC2", "72f34ac2" -> "CLM-72F34AC2"; else None."""
+    compact = re.sub(r"[\s*_.\-]", "", str(text or "")).upper()
+    match = re.fullmatch(r"(?:CLM)?([0-9A-F]{8})", compact)
+    if match:
+        return "CLM-" + match.group(1)
+    match = re.fullmatch(r"CLM([0-9A-Z]{4,12})", compact)
+    return ("CLM-" + match.group(1)) if match else None
+
+
 async def on_track(wa_id, text, command):
     if command == "all":
         claims = db.claims_for_number(wa_id)[:5]
         if not claims:
-            await send_text(wa_id, "There are no claims for this WhatsApp number yet. "
-                                   "Reply *1* to file one, or *MENU*.")
+            await ask(wa_id, "There are no claims for this WhatsApp number yet. "
+                             "Reply *1* to file one, or *MENU*.")
+            set_conversation(wa_id, last_prompt=TRACK_PROMPT)
             return
         lines = ["*Claims on this number*"]
         for summary in claims:
@@ -1773,17 +1956,31 @@ async def on_track(wa_id, text, command):
                 plate = response.get("plate") or ""
                 lines.append(f"• *{response['claim_id']}* {plate} — {status_label(response)}")
         lines.append("\nSend a tracking ID for details.")
-        await send_text(wa_id, "\n".join(lines))
+        await ask(wa_id, "\n".join(lines))
+        set_conversation(wa_id, last_prompt=TRACK_PROMPT)
         return
-    tracking = re.sub(r"[\s*]", "", str(text or "")).upper()
-    if re.fullmatch(r"[0-9A-F]{8}", tracking):
-        tracking = "CLM-" + tracking
+    tracking = tracking_id_of(text)
     response = await asyncio.to_thread(own_claim, wa_id, tracking) if tracking else None
-    if not response:
-        await send_text(wa_id, f"We could not find *{tracking or text}* for this number. "
-                               "Check the tracking ID, or reply *ALL*.")
+    if response:
+        set_conversation(wa_id, track_misses=0)
+        await ask(wa_id, tracking_text(response))
+        set_conversation(wa_id, last_prompt=TRACK_PROMPT)
         return
-    await send_text(wa_id, tracking_text(response))
+    if command == "2" or not (tracking or re.search(r"\d", str(text or ""))):
+        # "status", "haan", a sentence: the options, not "could not find".
+        await ask(wa_id, TRACK_PROMPT if command == "2" else f"{NOT_A_TRACKING_ID} {TRACK_PROMPT}")
+        set_conversation(wa_id, last_prompt=TRACK_PROMPT)
+        return
+    misses = int(get_session(wa_id).get("track_misses") or 0) + 1
+    set_conversation(wa_id, track_misses=misses)
+    if misses % 2 == 0:
+        # Not "could not find" twice in a row: show the options again.
+        await ask(wa_id, TRACK_PROMPT)
+        return
+    shown = (tracking or str(text or "").strip())[:20]
+    await ask(wa_id, f"We could not find *{shown}* for this number. Check the tracking ID, "
+                     "or reply *ALL*.")
+    set_conversation(wa_id, last_prompt=TRACK_PROMPT)
 
 
 async def end_session(wa_id):
@@ -1796,6 +1993,47 @@ async def end_session(wa_id):
                                "decision is made.")
     else:
         await send_text(wa_id, "Session closed. Send any message to start again.")
+
+
+async def request_exit(wa_id):
+    """EXIT: confirm first; what it says depends on where the customer is."""
+    session = get_session(wa_id)
+    stage = session.get("stage")
+    claim_id = session.get("claim_id") or session.get("attach_claim_id")
+    if stage in AFTER_SUBMISSION and claim_id:
+        set_conversation(wa_id, exit_pending=True)
+        await send_text(wa_id, f"Your claim *{claim_id}* stays submitted — reply *2* "
+                               "any time to track it. End this session? *YES* / *NO*")
+        return
+    photos, documents = media_totals(wa_id)
+    if stage in BEFORE_SUBMISSION or photos or documents:
+        set_conversation(wa_id, exit_pending=True)
+        if not (photos or documents):
+            await send_text(wa_id, "Exit this claim? Reply *YES* to exit or *NO* to continue.")
+            return
+        await send_text(wa_id, f"Exit this claim? The {photos} photo{'' if photos == 1 else 's'} "
+                               f"and {documents} document{'' if documents == 1 else 's'} you sent "
+                               "will be discarded. Reply *YES* to exit or *NO* to continue.")
+        return
+    # Nothing in progress: nothing to lose.
+    clear_conversation(wa_id)
+    await send_text(wa_id, "Session closed. Send any message to start again.")
+
+
+async def on_exit_answer(wa_id, command):
+    session = get_session(wa_id)
+    if command == "yes":
+        if session.get("stage") in AFTER_SUBMISSION:
+            await end_session(wa_id)
+            return
+        clear_conversation(wa_id)
+        await show_welcome(wa_id, "Claim cancelled; nothing was submitted.")
+        return
+    if command == "no":
+        set_conversation(wa_id, exit_pending=False)
+        await restate(wa_id)
+        return
+    await send_text(wa_id, "Reply *YES* to exit or *NO* to continue.")
 
 
 def more_info_claim(wa_id):
@@ -1815,32 +2053,74 @@ def more_info_claim(wa_id):
     return None
 
 
+async def unsupported_reply(wa_id, message_type):
+    """A video, voice note, sticker, location or contact: say so, then the
+    prompt the customer is on (or START)."""
+    text = UNSUPPORTED_REPLIES[message_type].split(". ")[0] + "."
+    if is_analysing(wa_id):
+        await send_text(wa_id, f"{text} {ANALYSIS_BUSY_REPLY}")
+        return
+    if get_session(wa_id).get("stage") in (None, "menu"):
+        await show_welcome(wa_id, text)
+        return
+    await restate(wa_id, text)
+
+
 async def handle_conversation_text(wa_id, text, start_analysis, attach):
     """Every text in the guided flow. start_analysis is process_session;
     attach(wa_id, claim_id) adds pending documents to a claim."""
     command = command_of(text)
     session = get_session(wa_id)
     stage = session.get("stage")
+    if session.get("exit_pending") and command not in ("menu", "end", "help"):
+        await on_exit_answer(wa_id, command)
+        return
+    pending = any(media_totals(wa_id))
+    if command in ("menu", "end") and pending and stage not in AFTER_SUBMISSION and (
+            command == "end" or stage in BEFORE_SUBMISSION):
+        # Nothing the customer sent is discarded without a YES.
+        await request_exit(wa_id)
+        return
     if command == "menu":
-        clear_conversation(wa_id)
+        if stage not in (None, "menu", "track"):
+            clear_conversation(wa_id)
         await show_welcome(wa_id)
         return
     if command == "end":
         await end_session(wa_id)
         return
-    if command == "help":
-        await send_text(wa_id, HELP_TEXT)
+    if command == "exit":
+        await request_exit(wa_id)
         return
+    if command == "help":
+        await send_text(wa_id, with_footer(HELP_TEXT))
+        return
+    tracking = tracking_id_of(text) if command is None else None
     if stage in (None, "menu"):
         if command == "1":
             await begin_claim(wa_id)
-        elif command == "2":
-            set_conversation(wa_id, stage="track")
-            await send_text(wa_id, TRACK_PROMPT)
+        elif command == "2" or tracking:
+            # A tracking ID sent at the menu is answered at once.
+            set_conversation(wa_id, stage="track", track_misses=0)
+            if tracking:
+                await on_track(wa_id, text, command)
+            else:
+                await ask(wa_id, TRACK_PROMPT)
         else:
             await show_welcome(wa_id)
         return
+    if (tracking and stage in BEFORE_SUBMISSION
+            and not registry.valid_plate(registry.normalise_plate(text))):
+        await restate(wa_id, MID_CLAIM_TRACK)
+        return
+    if command == "greeting":
+        # Never a plate or a tracking ID: the step the customer is on, again.
+        await restate(wa_id)
+        return
     if stage == "ask_plate":
+        if command == "2":
+            await restate(wa_id, MID_CLAIM_TRACK)
+            return
         await on_plate(wa_id, text)
         return
     if stage == "confirm_vehicle":
@@ -1848,14 +2128,27 @@ async def handle_conversation_text(wa_id, text, start_analysis, attach):
             await start_collecting(wa_id)
         elif command == "no":
             set_conversation(wa_id, stage="ask_plate", plate=None, registry=None)
-            await send_text(wa_id, PLATE_PROMPT)
+            await ask(wa_id, PLATE_PROMPT)
+        elif command == "2":
+            await restate(wa_id, MID_CLAIM_TRACK)
         else:
-            await send_text(wa_id, CONFIRM_PROMPT)
+            await restate(wa_id)
         return
     if stage == "collect":
-        await on_collect_text(wa_id, command, start_analysis)
+        await on_collect_text(wa_id, command)
+        return
+    if stage == "ready":
+        if command == "submit":
+            await start_analysis(wa_id, skip_missing=True)
+        elif command == "2":
+            await restate(wa_id, MID_CLAIM_TRACK)
+        else:
+            await restate(wa_id)
         return
     if stage == "track":
+        if command == "1":
+            await begin_claim(wa_id)
+            return
         await on_track(wa_id, text, command)
         return
     if stage == "confirm_attach":
@@ -1867,11 +2160,24 @@ async def handle_conversation_text(wa_id, text, start_analysis, attach):
             clear_conversation(wa_id)
             await show_welcome(wa_id, "Not added.")
         else:
-            await send_text(wa_id, f"Add this to *{claim_id}*? Reply *YES* or *NO*.")
+            await restate(wa_id)
         return
     if stage == "open_claim":
+        if command == "1":
+            await begin_claim(wa_id)
+            return
+        if command == "2":
+            set_conversation(wa_id, stage="track", track_misses=0)
+            await ask(wa_id, TRACK_PROMPT)
+            return
         claim_id = session.get("claim_id")
-        await send_text(wa_id, f"Your claim *{claim_id}* is open. {OPEN_CLAIM_LINE}")
+        open_line = f"Your claim *{claim_id}* is open. {OPEN_CLAIM_LINE}"
+        response = await asyncio.to_thread(own_claim, wa_id, tracking) if tracking else None
+        if response:
+            await ask(wa_id, f"{tracking_text(response)}\n\n{open_line}")
+            set_conversation(wa_id, last_prompt=open_line)
+            return
+        await ask(wa_id, open_line)
         return
     await show_welcome(wa_id)
 
@@ -1910,4 +2216,4 @@ def attach_reply(claim_id, before, after, labels):
     if after.get("next_step"):
         lines.append(f"Next: {after['next_step']}")
     lines += ["", "Send more documents here, reply *END* to close this session or *MENU* for more."]
-    return "\n".join(lines)
+    return with_footer("\n".join(lines))

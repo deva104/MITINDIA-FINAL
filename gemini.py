@@ -106,7 +106,7 @@ CRITICAL: if a field is not visible in any document, return it with
 value null and confidence 0. Never guess or infer a value."""
 
 DAMAGE_PROMPT = """You are a motor insurance damage assessor. For each visible damaged part
-return JSON: {"is_vehicle":true,"vehicle_description":"<one short sentence>","photos":[{"source_photo","is_vehicle","vehicle_group","make_model","colour","body_type","description"}],"damage":[{"part","damage_type","severity","confidence","reasoning","source_photo"}]}
+return JSON: {"is_vehicle":true,"vehicle_description":"<one short sentence>","photos":[{"source_photo","is_vehicle","vehicle_group","make_model","make_confidence","colour","body_type","description"}],"damage":[{"part","damage_type","severity","confidence","reasoning","source_photo"}]}
 Return ONE top-level JSON object in this shape, never an array or one object per vehicle.
 Put every vehicle group in the same photos array and every damage item in the same damage array.
 is_vehicle: false if the image does not show a motor vehicle (car, van, SUV, truck, two-wheeler). If false return empty damage.
@@ -114,6 +114,8 @@ For EVERY photo provided, identify the vehicle separately: make and model if leg
 body colour as a simple word (white, black, silver, red, blue, grey), and body type (hatchback,
 sedan, SUV, van, truck, two-wheeler). Use null where you cannot tell. Report one entry per photo
 even if a photo shows no damage.
+make_confidence = 0 to 1: how sure you are of the make and model. Below 0.8 unless a badge,
+logo or model lettering is clearly legible; never guess a make from the shape alone.
 Group the photos by vehicle. Photos of the SAME physical vehicle share a vehicle_group number,
 starting at 0. A different vehicle gets the next number. Judge by colour, body type, model,
 number plate and visible damage together — the same car photographed from two angles is ONE
@@ -135,11 +137,15 @@ Only report damage you can actually see. Do not infer hidden damage."""
 
 CLASSIFY_PROMPT = """Classify this one uploaded image for an Indian motor insurance claim.
 Return JSON exactly as:
-{"doc_type":"vehicle_photo|rc|driving_licence|claim_form|policy|other_document|other","confidence":0.0,"number_plate":null}
+{"doc_type":"vehicle_photo|rc|driving_licence|claim_form|policy|screenshot|other_document|other","confidence":0.0,"number_plate":null}
 Use vehicle_photo for an exterior or interior motor-vehicle photograph, including damage photos.
 Use rc only for a Registration Certificate, driving_licence only for a driving licence,
 claim_form only for a motor claim form, and policy only for an insurance policy document.
-Use other_document for another readable document and other for everything else.
+Use screenshot for any screen capture or photo of a screen: a phone status bar, chat
+bubbles, app or browser chrome, or a phone or monitor screen photographed. A screenshot
+of a vehicle or a document is still screenshot.
+Use other_document for another readable document and other for everything else
+(a person, a scene, a blank or dark image).
 confidence MUST be a number between 0 and 1.
 number_plate: read it only from a vehicle_photo when it is clearly legible. Otherwise null.
 Never guess a number plate."""
@@ -150,6 +156,7 @@ CLASSIFICATION_TYPES = {
     "driving_licence",
     "claim_form",
     "policy",
+    "screenshot",
     "other_document",
     "other",
 }
@@ -676,6 +683,7 @@ def _normalise_photos(items, photo_paths):
                 else None
             ),
             "make_model": _clean_text(item.get("make_model")),
+            "make_confidence": parse_confidence(item.get("make_confidence")),
             "colour": _clean_word(item.get("colour")),
             "body_type": _clean_word(item.get("body_type")),
             "description": _clean_text(item.get("description")) or "",

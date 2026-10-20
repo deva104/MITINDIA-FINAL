@@ -379,6 +379,9 @@ KNOWN_MAKES = {
     "maruti", "suzuki", "hyundai", "tata", "mahindra", "honda", "toyota", "kia", "mg",
     "skoda", "volkswagen", "renault", "nissan", "ford", "jeep", "bmw", "mercedes",
     "audi", "citroen", "byd",
+    # Rare in India, but a model names them (a non-Subaru was labelled "Subaru").
+    "subaru", "lexus", "volvo", "jaguar", "rover", "porsche", "fiat", "chevrolet",
+    "mitsubishi", "isuzu", "datsun", "peugeot", "mazda", "tesla", "opel", "dodge",
 }
 
 
@@ -395,9 +398,9 @@ def _group(text, groups):
 
 def appearance_mismatch(registry, seen):
     """("HIGH"|"MEDIUM", message) when the photographed vehicle differs from
-    the registered one, else None. Make or body type differing is HIGH;
-    colour alone is MEDIUM, because lighting changes how a colour photographs.
-    Anything the photos do not show is not compared."""
+    the registered one, else None. Make AND body type differing is HIGH; make
+    alone, body type alone or colour alone is MEDIUM (models misread makes,
+    and light changes colours). Anything the photos do not show is not compared."""
     seen = seen or {}
     seen_text = str(seen.get("make_model") or "")
     seen_words = set(_words(seen_text))
@@ -416,8 +419,17 @@ def appearance_mismatch(registry, seen):
                      if part)
     on_record = " ".join(str(part) for part in (registry.get("colour"), registry.get("make"),
                                                 registry.get("model")) if part)
-    message = f"Photos show a {shown}; this plate is registered to a {on_record}."
-    return ("HIGH" if make_differs or body_differs else "MEDIUM"), message
+    if make_differs and body_differs:
+        return "HIGH", f"Photos show a {shown}; this plate is registered to a {on_record}."
+    # A model misreads makes (a non-Subaru was labelled "Subaru"): a make or a
+    # body type alone is not proof, and colour depends on the light.
+    if make_differs:
+        return "MEDIUM", (f"Vehicle make could not be confirmed from photos: they suggest a "
+                          f"{seen_text}; this plate is registered to a {on_record}.")
+    if body_differs:
+        return "MEDIUM", (f"Vehicle body type could not be confirmed from photos: they suggest a "
+                          f"{seen.get('body_type')}; this plate is registered to a {on_record}.")
+    return "MEDIUM", f"Photos show a {shown}; this plate is registered to a {on_record}."
 
 
 def registry_flags(fields, registry, seen=None, accident_date=None):

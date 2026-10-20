@@ -109,7 +109,9 @@ class LiveSequenceTests(unittest.IsolatedAsyncioTestCase):
         self.calls.append(("groq", label))
         images = [part[1] for part in parts if part[0] == "image"]
         if label == "classify_image":
-            return {"doc_type": kind_of(images[0]), "confidence": 0.97, "number_plate": None}
+            kind = kind_of(images[0])
+            return {"doc_type": "claim_form" if kind == "page" else kind,
+                    "confidence": 0.97, "number_plate": None}
         if label.startswith("extract_fields("):
             if label.endswith("p.4)"):
                 raise StatusError("429 Rate limit reached. Please try again in 0.01s.", 429)
@@ -192,16 +194,19 @@ class LiveSequenceTests(unittest.IsolatedAsyncioTestCase):
             await self.deliver(*album)
             await self.deliver(self.message("document", "pdf"))
             self.assertEqual(self.sent, [
-                "Photo received (1 total). Reply DONE when you are done.",
-                "That looks like your registration certificate — added to step 2. "
-                "Send more damage photos, or reply *DONE*.",
-                "That looks like your driving licence — added to step 3. "
-                "Send more damage photos, or reply *DONE*.",
-                "That looks like your claim form — added to step 4. "
-                "Send more damage photos, or reply *DONE*.",
+                whatsapp.with_footer("Photo received (1 total). Reply DONE when you are done."),
+                whatsapp.with_footer("That looks like your registration certificate — added to "
+                                     "step 2. Send more damage photos, or reply *DONE*."),
+                whatsapp.with_footer("That looks like your driving licence — added to step 3. "
+                                     "Send more damage photos, or reply *DONE*."),
+                whatsapp.with_footer("That looks like your claim form — added to step 4. "
+                                     "Send more damage photos, or reply *DONE*."),
             ])
+            await self.deliver(self.message("text", body="Done"))
+            self.assertIn("*Ready to submit*", self.sent[4])
+            del self.sent[4]  # the summary; analysis waits for SUBMIT
 
-            done = asyncio.create_task(main.handle_wa_message(self.message("text", body="Done")))
+            done = asyncio.create_task(main.handle_wa_message(self.message("text", body="SUBMIT")))
             for _ in range(2400):  # up to 120 s on a remote database
                 if self.analysis_paused.is_set():
                     break
@@ -215,7 +220,8 @@ class LiveSequenceTests(unittest.IsolatedAsyncioTestCase):
                                self.message("image", "dl"), self.message("unsupported"))
             self.assertEqual(self.sent[5:], [
                 "Your claim is still being analysed — you will get the result here.",
-                "Your previous claim is still being analysed — these photos will start a new claim.",
+                # Guided: nothing is kept during an analysis, and the customer is told once.
+                whatsapp.GUIDED_BUSY_MEDIA,
             ])
 
             self.release.set()
@@ -224,7 +230,7 @@ class LiveSequenceTests(unittest.IsolatedAsyncioTestCase):
         claims = db.list_claims()
         self.assertEqual(len(claims), 1)
         payload = db.get_claim(claims[0]["claim_id"])
-        self.assertEqual(self.sent[7:], [whatsapp.format_reply(payload)])
+        self.assertEqual(self.sent[7:], [whatsapp.with_footer(whatsapp.format_reply(payload))])
         self.assertEqual(len(self.sent), 8)  # nothing else, no greeting, ever
         self.assertNotIn("start a claim", " ".join(self.sent[:7]))
 
@@ -246,9 +252,9 @@ class LiveSequenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("please send a clear photo of page 4 of your claim form", asks)
         self.assertIn("page 4 of your claim form", self.sent[7])
 
-        # The three photos re-sent during the analysis wait for the next claim.
-        pending = [row for row in db.list_session_media(WA_ID) if row["kind"] == "photo"]
-        self.assertEqual(len(pending), 3)
+        # Guided: the photos re-sent during the analysis were refused, not kept
+        # (a new claim starts from the menu); the customer was told to resend.
+        self.assertEqual(db.list_session_media(WA_ID), [])
         self.assertNotIn(WA_ID, whatsapp.ANALYSING_IDS)
         self.assertEqual(whatsapp.DEFERRED_MEDIA, {})
 
@@ -258,7 +264,7 @@ class LiveSequenceTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "send_text", self.send), \
                 patch.object(whatsapp, "send_text", self.send):
             await self.deliver(self.message("unsupported"))
-        self.assertEqual(self.sent, [whatsapp.WELCOME])
+        self.assertEqual(self.sent, [whatsapp.with_footer(whatsapp.WELCOME)])
 
     async def test_an_unsupported_event_before_its_photos_is_silent(self):
         async def download(media_obj):
@@ -274,7 +280,7 @@ class LiveSequenceTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
             await self.deliver(self.message("image", "car"))
             await stray
-        self.assertEqual(self.sent, ["Photo received (1 total). Reply DONE when you are done."])
+        self.assertEqual(self.sent, [whatsapp.with_footer("Photo received (1 total). Reply DONE when you are done.")])
 
     async def test_a_later_unhandled_event_with_media_pending_gets_no_greeting(self):
         async def download(media_obj):
@@ -288,7 +294,7 @@ class LiveSequenceTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "send_text", self.send), \
                 patch.object(whatsapp, "send_text", self.send), stub_slots():
             await self.deliver(self.message("image", "car"), later)
-        self.assertEqual(self.sent, ["Photo received (1 total). Reply DONE when you are done.",
+        self.assertEqual(self.sent, [whatsapp.with_footer("Photo received (1 total). Reply DONE when you are done."),
                                      whatsapp.UNHANDLED_WITH_MEDIA_REPLY])
 
     async def test_a_reaction_is_never_answered(self):

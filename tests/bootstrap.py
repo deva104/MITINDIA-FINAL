@@ -20,9 +20,20 @@ def _hostname(url):
     return (urlparse(str(url or "").strip()).hostname or "").lower()
 
 
+PROVIDER_PREFIXES = ("GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY",
+                     "SIGHTENGINE_API_USER", "SIGHTENGINE_API_SECRET")
+
+
 def configure():
     env_path = Path(__file__).resolve().parents[1] / ".env"
     file_env = dotenv_values(env_path) if env_path.exists() else {}
+    # No test may reach a real provider. Every provider key, pooled ones
+    # included, is set empty before the app loads .env (which never
+    # overrides a variable that is already set), so an unstubbed call fails
+    # here with "not set". Tests that need keys get fakes (provider_keys).
+    for name in set(file_env) | set(os.environ):
+        if name.upper().startswith(PROVIDER_PREFIXES):
+            os.environ[name] = ""
     production_hosts = set()
     file_database_url = (file_env.get("DATABASE_URL") or "").strip()
     if file_database_url:

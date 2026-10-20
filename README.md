@@ -192,10 +192,12 @@ with a provider timeout and a provider error, and checks every reply.
 
 ## Known limitations
 
-- **A screenshot or re-photograph of an earlier claim's photo is not caught.**
-  The duplicate gate compares perceptual hashes. A screen photo of a
-  previously claimed image changes the hash beyond the threshold; a test
-  pins this.
+- **A re-photograph of an earlier claim's photo is not caught by the
+  duplicate gate.** The gate compares perceptual hashes, and a screen photo
+  of a previously claimed image changes the hash beyond the threshold; a
+  test pins this. On WhatsApp an image the classifier recognises as a
+  screenshot or a photo of a screen is refused at intake, but that depends
+  on the vision model recognising it.
 - **No reverse image search.** A photo downloaded from the internet passes the
   duplicate gate unless it was submitted to InsureIT before. In calibration
   the AI-generation check also scored an image downloaded from Google as

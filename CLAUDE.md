@@ -102,9 +102,11 @@ Storage:
   `whatsapp.DEFERRED_MEDIA` and added back as soon as the analysis releases
   its rows, so it is the next claim too.
 - **During an analysis**, a text (DONE included) gets exactly one "Your claim
-  is still being analysed — you will get the result here." New media gets one
-  "Your previous claim is still being analysed — these photos will start a
-  new claim." per analysis, however many items arrive. The start-a-claim
+  is still being analysed — you will get the result here." In the guided
+  flow, new media gets one "Your claim is still being analysed — please send
+  this again after you get the result." per analysis, however many items
+  arrive, and is not kept (a new claim starts from the menu). Outside it
+  (no stage) the older rule holds: "these photos will start a new claim". The start-a-claim
   greeting is never sent to a number with session media or a running
   analysis.
 - **Stray events.** Every inbound message's type is logged (with
@@ -205,22 +207,47 @@ Runtime:
 ## WhatsApp conversation (guided flow)
 
 - **START** (no active session): "Welcome to InsureIT", *1* file a claim, *2*
-  track a claim. MENU, END and HELP work at any point (case and punctuation
-  ignored); during an analysis a text gets the one busy line.
+  track a claim. MENU, END, EXIT and HELP work at any point (case and
+  punctuation ignored; exit/cancel/quit/stop are EXIT; haan/ha/nahi, y/nope
+  are YES/NO). During an analysis a text gets the one busy line, EXIT gets
+  "will finish", and media gets one "send this again after the result".
+- **Every message that waits for input** ends with the footer "_Reply EXIT to
+  cancel · MENU for the main menu_" and is remembered as `last_prompt`
+  (`whatsapp.ask`). A greeting, NO after EXIT, or noise restates it
+  (`restate`; a session without one falls back to `stage_prompt`). A
+  greeting is never a plate or a tracking ID.
+- **EXIT confirms first.** Before submission it counts what will be discarded;
+  after it says the claim stays submitted. MENU and END with media pending
+  ask the same question: nothing the customer sent is discarded without YES.
+  Sending media after EXIT means carrying on.
 - **File a claim:**
   - The plate is normalised and validated (standard and BH series), then
     looked up in the mock VAHAN registry (`registry.lookup`, where the VAHAN
     API call goes in production). Expired or third-party-only policies end
     the claim path.
   - Steps 1–4: damage photos (DONE; cannot be skipped), RC, licence, claim
-    form (SKIP allowed). Every item is classified into its own slot
-    (`wa_session_media.slot`) whatever the step.
+    form (SKIP allowed). Every image, and every page of a PDF, is classified
+    (`whatsapp.classify_pages`) into its own slot (`wa_session_media.slot`)
+    whatever the step, **only** on a positive classification at confidence
+    >= 0.6. A screenshot is refused ("please send the original photo"); a
+    person, a scene, a blank image or anything below 0.6 gets "That does not
+    look like a <expected item>" and fills nothing. One PDF can fill several
+    slots ("That PDF filled: …"). A resend says "You already sent that …".
+  - Media sent before step 1 (at START, the plate or the vehicle check) is
+    kept for the claim and counted at step 1.
+  - After step 4 (or SUBMIT early) a **Ready to submit** summary is shown;
+    analysis starts only on SUBMIT.
   - The result adds tracking ID, assessor and next step. The claim then
     stays **open** (`stage = open_claim`): documents sent in the session
     attach to it (`main.reassess_claim`: extraction and rules again, damage
     assessment reused, a `documents_added` event).
+  - A document already on the claim (by sha256, `claim_shas` in the session)
+    is not attached again.
   - A document for a claim in `more_info` asks "Add this to CLM-…?" first.
-- **Track:** a tracking ID or ALL, only this number's claims.
+- **Track:** a tracking ID (any case, spaces allowed) or ALL, only this
+  number's claims; a tracking ID at the menu or on an open claim is answered
+  at once. A word that is not an ID gets the options again, never "could not
+  find"; an ID-like miss says so once, then the options.
 - **END** clears the session and repeats the tracking ID. 30 minutes idle:
   the next message says the session timed out, then START.
 - **Registry data.** `data/mock_vahan_registry.xlsx` (100 fictitious rows,
@@ -228,8 +255,12 @@ Runtime:
   committed (the repo is public): `data/private_registry_rows.json`
   (gitignored) or `REGISTRY_PRIVATE_ROWS`.
 - **Registry cross-checks** (`rules.registry_flags`): plate vs RC, owner vs
-  RC owner (name matcher), make/body vs the photos HIGH and colour alone
-  MEDIUM, policy on the accident date from the registry. With two vehicles
+  RC owner (name matcher), the photographed vehicle vs the registration
+  (make AND body type differ: HIGH; make only, body only or colour only:
+  MEDIUM, "could not be confirmed from photos", since models misread makes),
+  policy on the accident date from the registry. A make is shown to anyone
+  only at `make_confidence` >= 0.8 (`main.MAKE_CONFIDENCE`); below that the
+  label is colour and body type ("White Sedan"). With two vehicles
   in the photos, the one matching the registration is chosen
   (`selected_vehicle_group`); the customer is asked only when none clearly
   matches.

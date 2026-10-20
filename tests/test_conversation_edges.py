@@ -287,7 +287,8 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
         whatsapp.get_session("user").update(stage="open_claim", claim_id="CLM-EDGE")
         sent = AsyncMock()
         with patch.object(main, "download_media", AsyncMock(return_value=jpeg_bytes())), \
-                patch.object(main, "send_text", sent), stub_slots():
+                patch.object(main, "send_text", sent), patch.object(whatsapp, "send_text", sent), \
+                stub_slots():
             await main.handle_wa_message({
                 "from": "user",
                 "id": "fresh-photo",
@@ -295,9 +296,11 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
                 "image": {"id": "media"},
             })
 
-        sent.assert_awaited_once_with(
-            "user", "*CLM-EDGE* has already been assessed, so new damage photos cannot be "
-                    "added to it. Reply *MENU* to file a new claim.")
+        # No last_prompt on this session: the open-claim prompt comes from its stage.
+        sent.assert_awaited_once_with("user", whatsapp.with_footer(
+            "*CLM-EDGE* has already been assessed, so new damage photos cannot be added to it. "
+            "Reply *1* to file a new claim.\n\nYour claim *CLM-EDGE* is open. "
+            + whatsapp.OPEN_CLAIM_LINE))
         session = whatsapp.SESSIONS["user"]
         self.assertIsNotNone(session["pending_choice"])
         self.assertEqual(len(session["photos"]), 0)
@@ -321,8 +324,9 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
         process.assert_not_awaited()
         sent.assert_awaited_once_with(
             "user",
-            "Your session timed out after 30 minutes of inactivity. The photos and "
-            "documents you sent were removed.\n\n" + whatsapp.WELCOME,
+            whatsapp.with_footer("Your session timed out after 30 minutes of inactivity. "
+                                 "The photos and documents you sent were removed.\n\n"
+                                 + whatsapp.WELCOME),
         )
         self.assertEqual(whatsapp.SESSIONS["user"].get("stage"), "menu")
         self.assertEqual(db.list_session_media("user"), [])
@@ -350,7 +354,8 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
         for call in sent.await_args_list:
             self.assertNotIn("duplicate", call.args[1].lower())
         self.assertIn("Photo received (1 total)", sent.await_args_list[0].args[1])
-        self.assertEqual(sent.await_args_list[1].args[1], "You already sent that damage photo.")
+        self.assertEqual(sent.await_args_list[1].args[1], whatsapp.with_footer(
+            "You already sent that damage photo.\n\n" + whatsapp.STEP_PROMPTS[1]))
 
         stored = db.media_get(session["photos"][0])
         self.assertIsNotNone(stored)
@@ -384,6 +389,15 @@ class ConversationEdgeTests(unittest.IsolatedAsyncioTestCase):
                     "id": f"text-{text}",
                     "type": "text",
                     "text": {"body": text},
+                })
+            # Analysis waits for SUBMIT; the phrase only reaches the summary.
+            process.assert_not_awaited()
+            self.assertEqual(whatsapp.get_session("user").get("stage"), "ready")
+            with patch.object(main, "process_session", process), \
+                    patch.object(whatsapp, "send_text", sent):
+                await main.handle_wa_message({
+                    "from": "user", "id": f"submit-{text}", "type": "text",
+                    "text": {"body": "SUBMIT"},
                 })
             process.assert_awaited_with("user", skip_missing=True)
             process.reset_mock()
@@ -541,7 +555,7 @@ class HostileInputTests(unittest.IsolatedAsyncioTestCase):
             ("location", {"location": {"latitude": 19.0, "longitude": 72.8}}),
             ("contacts", {"contacts": [{"name": {"formatted_name": "A"}}]}),
         ]
-        with patch.object(main, "send_text", sent):
+        with patch.object(main, "send_text", sent), patch.object(whatsapp, "send_text", sent):
             for message_type, extra in messages:
                 await main.handle_wa_message({
                     "from": "user",
@@ -553,9 +567,10 @@ class HostileInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent.await_count, len(messages))
         replies = [call.args[1] for call in sent.await_args_list]
         self.assertEqual(len(set(replies)), len(messages))
-        for reply in replies:
-            self.assertIn("photo of the damaged vehicle", reply)
-            self.assertIn("claim documents", reply)
+        for reply, (message_type, _) in zip(replies, messages):
+            # The type is named, then the START menu (no session yet).
+            self.assertIn("not accepted", reply)
+            self.assertIn(whatsapp.WELCOME, reply)
         self.assertEqual(whatsapp.SESSIONS.get("user", {}).get("photos", []), [])
 
     async def test_redelivered_message_id_does_not_create_a_second_claim(self):
@@ -593,8 +608,10 @@ class HostileInputTests(unittest.IsolatedAsyncioTestCase):
         first = Background()
         second = Background()
         payload = jpeg_bytes(color=(1, 2, 3))
+        guided("user")
         with patch.object(main, "download_media", AsyncMock(return_value=payload)), \
                 patch.object(main, "send_text", AsyncMock()), \
+                patch.object(whatsapp, "send_text", AsyncMock()), stub_slots(), \
                 patch.dict(os.environ, {"WHATSAPP_APP_SECRET": ""}):
             await main.webhook_receive(Request(), first)
             self.assertEqual(len(first.tasks), 1)

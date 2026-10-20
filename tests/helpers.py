@@ -37,7 +37,7 @@ def seed_session(wa_id, photos=0, documents=0, **state):
         media_id = db.media_put(data, "image/jpeg", "photo", None)
         db.add_session_media(
             wa_id, media_id, "photo", hashlib.sha256(data).hexdigest(), 0,
-            len(data), received_at,
+            len(data), received_at, slot="photo",
         )
     for data in page_bytes:
         media_id = db.media_put(data, "image/jpeg", "document_page", None)
@@ -107,5 +107,5 @@ def stub_slots():
     PDFs claim forms."""
     import whatsapp
 
-    return patch.object(whatsapp, "classify_slot",
-                        lambda data, is_pdf, step: "claim_form" if is_pdf else "photo")
+    return patch.object(whatsapp, "classify_pages",
+                        lambda images, is_pdf: ["claim_form" if is_pdf else "photo"] * len(images))

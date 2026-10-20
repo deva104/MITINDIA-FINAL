@@ -87,7 +87,7 @@ class VehicleGroupingTests(unittest.TestCase):
         self.assertEqual(payload["claimable_count"], 1)
         self.assertEqual(len(payload["vehicles"]), 1)
         vehicle = payload["vehicles"][0]
-        self.assertEqual(vehicle["label"], "White Kia Sedan")
+        self.assertEqual(vehicle["label"], "White Sedan")
         self.assertEqual(vehicle["status"], "claimable")
         self.assertEqual(
             {item["source_photo"] for item in vehicle["damage"]},
@@ -141,7 +141,7 @@ class VehicleGroupingTests(unittest.TestCase):
             mismatch["message"],
             "Photos show 2 different vehicles. A claim covers one vehicle.",
         )
-        self.assertEqual(mismatch["evidence"], ["White Kia Sedan", "Black SUV"])
+        self.assertEqual(mismatch["evidence"], ["White Sedan", "Black SUV"])
 
     def test_undamaged_second_car_is_no_damage(self):
         photos = [

@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="styles.css?v=20261020">
 </head>
 <body>
 
@@ -178,6 +178,22 @@
   </main>
 </div>
 
+<div class="modal-backdrop hidden" id="resetModal" role="dialog" aria-modal="true" aria-labelledby="resetModalTitle">
+  <div class="modal">
+    <span class="label">Reset demo</span>
+    <h2 id="resetModalTitle">Delete every claim?</h2>
+    <p>This deletes all claims, photos, documents, timelines and WhatsApp sessions. The registry and assessors stay. Type <b>RESET</b> to confirm.</p>
+    <div class="token-row">
+      <input id="resetInput" type="text" autocomplete="off" aria-label="Type RESET to confirm" placeholder="RESET">
+    </div>
+    <p class="modal-error hidden" id="resetError"></p>
+    <div class="modal-actions">
+      <button class="btn btn-outline" id="resetCancel">Cancel</button>
+      <button class="btn btn-primary" id="resetConfirm" disabled>Delete everything</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-backdrop hidden" id="overrideModal" role="dialog" aria-modal="true" aria-labelledby="overrideModalTitle">
   <div class="modal">
     <span class="label">Operator override</span>
@@ -193,6 +209,6 @@
   </div>
 </div>
 
-<script src="app.js"></script>
+<script src="app.js?v=20261020"></script>
 </body>
 </html>

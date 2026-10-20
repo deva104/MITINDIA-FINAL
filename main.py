@@ -125,6 +125,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 MAX_CLAIM_IMAGES = 8
+# A vehicle make is shown to anyone only at this model confidence or above.
+MAKE_CONFIDENCE = 0.8
 # Analyses run in worker threads so the event loop keeps answering webhooks.
 # This caps how many run at once on a 512 MB instance; the rest queue.
 ANALYSIS_SLOTS = threading.BoundedSemaphore(
@@ -703,6 +705,9 @@ def demo_reset():
         # bytes were just deleted.
         conn.execute("DELETE FROM wa_session_media")
         conn.execute("DELETE FROM wa_sessions")
+        # Timelines belong to the deleted claims, and assessor round robin
+        # counts them; reference data (registry, assessors) stays.
+        conn.execute("DELETE FROM claim_events")
         conn.commit()
     finally:
         conn.close()
@@ -1057,8 +1062,16 @@ def build_vehicle_groups(photos, damage, excluded, photo_urls=None):
             if os.path.basename(str(item.get("source_photo") or "")).lower() in group_lookup
         ]
 
+        # A make the model is not sure of is never shown as fact: colour and
+        # body type only ("White Sedan") unless make_confidence >= 0.8.
+        make_known = any(
+            (reported_confidence({"confidence": photo.get("make_confidence")}) or 0) >= MAKE_CONFIDENCE
+            for photo, _ in entries
+        )
         label_parts = []
         for key in ("colour", "make_model", "body_type"):
+            if key == "make_model" and not make_known:
+                continue
             value = next(
                 (
                     str(photo.get(key)).strip()
@@ -1629,9 +1642,11 @@ def _document_receipt(count, truncated_from=None):
 
 
 async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".jpg",
-                         classify_step=None, on_stored=None):
-    """classify_step: the guided step, to put the item in its slot (photo,
-    rc, driving_licence, claim_form). on_stored(slot) replaces the receipt."""
+                         classify=False, on_stored=None, on_rejected=None, accept=None):
+    """classify: put every image or PDF page in its slot first (positive
+    classification only). An item with no slot is not stored: on_rejected
+    ("screenshot" or None) answers instead. on_stored(slots, is_pdf)
+    replaces the receipt. accept(slots) may refuse slots for the stage."""
     media_obj = media_obj or {}
     session = get_session(wa_id)
     if bucket == "photos" and len(session["photos"]) >= wa.MAX_IMAGES_PER_CLAIM:
@@ -1682,6 +1697,25 @@ async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".j
             for number, page in enumerate(pages, 1)
         ]
 
+    is_pdf = bucket != "photos"
+    page_slots = [None] * len(items)
+    if classify:
+        # Each image, and each page of a PDF, is classified. A slot is filled
+        # only when classification names it; nothing defaults into a step.
+        page_slots = await asyncio.to_thread(
+            wa.classify_pages, [content for content, _, _, _ in items], is_pdf)
+        usable = [slot for slot in page_slots if slot not in (None, "screenshot")]
+        if accept is not None:
+            usable = [slot for slot in usable if accept(slot)]
+        if not usable:
+            kind = "screenshot" if "screenshot" in page_slots else None
+            if on_rejected is not None:
+                await on_rejected(kind)
+            return
+        # A PDF keeps all its pages for extraction; pages that are none of the
+        # documents carry no slot.
+        page_slots = [slot if slot in usable else None for slot in page_slots]
+
     # Blobs are content-addressed and independent of session state, so they
     # can be written off the loop before the session is touched.
     media_ids = await asyncio.to_thread(
@@ -1693,18 +1727,15 @@ async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".j
             wa.UNREADABLE_IMAGE_REPLY if bucket == "photos" else wa.UNREADABLE_PDF_REPLY,
         )
         return
-    slot = None
-    if classify_step is not None:
-        # Whatever step the customer is on, the item goes in its own slot.
-        slot = await asyncio.to_thread(
-            wa.classify_slot, items[0][0], bucket != "photos", classify_step)
+    slot = next((value for value in page_slots if value), None)
 
     # From the inserts to the replies there is no await: appending media and
     # reading the session happen together, so concurrent arrivals cannot
     # interleave, and the unique (wa_id, sha256, page) key absorbs a resend.
     row_ids = [
-        wa.add_session_media(wa_id, media_id, kind, source_sha, page, source_bytes, slot=slot)
-        for media_id, (_, _, kind, page) in zip(media_ids, items)
+        wa.add_session_media(wa_id, media_id, kind, source_sha, page, source_bytes,
+                             slot=page_slot)
+        for media_id, (_, _, kind, page), page_slot in zip(media_ids, items, page_slots)
     ]
     added = any(row_id is not None for row_id in row_ids)
     session = get_session(wa_id)
@@ -1725,7 +1756,7 @@ async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".j
 
     if not added:
         if on_stored is not None:
-            await send_text(wa_id, f"You already sent that {wa.SLOT_LABELS.get(slot, 'file')}.")
+            await wa.restate(wa_id, f"You already sent that {wa.SLOT_LABELS.get(slot, 'file')}.")
         elif bucket == "photos":
             await send_text(wa_id, _photo_receipt(len(session["photos"])))
         else:
@@ -1750,7 +1781,7 @@ async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".j
             return
 
     if on_stored is not None:
-        await on_stored(slot)
+        await on_stored([value for value in page_slots if value], is_pdf)
         return
     if choice_cleared:
         if bucket == "photos":
@@ -1825,45 +1856,81 @@ async def _receive_media(wa_id, message_id, media_obj, bucket, fallback_ext):
     session = get_session(wa_id)
     stage = session.get("stage")
     if wa.is_analysing(wa_id) or session.get("analysing"):
+        if stage in ("collect", "ready"):
+            # Guided: the claim being analysed takes nothing more, and a new
+            # claim starts from the menu, so nothing is kept; the customer is
+            # told once per analysis.
+            if wa.take_busy_notice(wa_id):
+                await send_text(wa_id, wa.GUIDED_BUSY_MEDIA)
+            return
         await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext)
         return
-    if stage == "collect":
-        async def collected(slot):
-            await wa.guided_media_received(wa_id, slot, process_session)
-        await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext,
-                              classify_step=session.get("step") or 1, on_stored=collected)
+    if session.get("exit_pending"):
+        # Sending something after EXIT means carrying on.
+        wa.set_conversation(wa_id, exit_pending=False)
+
+    async def rejected(kind):
+        await wa.media_rejected(wa_id, kind)
+
+    async def once_per_burst(reply):
+        # One reply per burst before step 1: an album is many events.
+        now = time.time()
+        if now - float(get_session(wa_id).get("kept_notice_at") or 0) <= STRAY_EVENT_WINDOW:
+            return
+        wa.set_conversation(wa_id, kept_notice_at=now)
+        await reply()
+
+    if stage in ("collect", "ready"):
+        async def collected(slots, is_pdf):
+            await wa.guided_media_received(wa_id, slots, is_pdf)
+        await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext, classify=True,
+                              on_stored=collected, on_rejected=rejected)
         return
     if stage == "open_claim" and session.get("claim_id"):
         claim_id = session["claim_id"]
 
-        async def attach(slot):
+        async def attach(slots, is_pdf):
             await _attach_pending_documents(wa_id, claim_id)
-        await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext,
-                              classify_step=0, on_stored=attach)
+        await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext, classify=True,
+                              on_stored=attach, on_rejected=rejected)
+        return
+    if stage in ("ask_plate", "confirm_vehicle"):
+        # Kept for the claim: step 1 counts it once the vehicle is confirmed.
+        async def kept_early(slots, is_pdf):
+            await once_per_burst(lambda: wa.media_kept(wa_id))
+        await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext, classify=True,
+                              on_stored=kept_early, on_rejected=rejected)
         return
     if stage == "confirm_attach":
-        async def held(slot):
-            return None
-        await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext,
-                              classify_step=0, on_stored=held)
+        async def held(slots, is_pdf):
+            await wa.restate(wa_id)
+        await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext, classify=True,
+                              on_stored=held, on_rejected=rejected,
+                              accept=lambda slot: slot != "photo")
         return
     claim_id = wa.more_info_claim(wa_id)
     if claim_id:
         wa.set_conversation(wa_id, stage="confirm_attach", attach_claim_id=claim_id)
 
-        async def ask(slot):
-            await send_text(wa_id, f"Add this to *{claim_id}*? Reply *YES* or *NO*.")
-        await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext,
-                              classify_step=0, on_stored=ask)
+        async def ask(slots, is_pdf):
+            await wa.ask(wa_id, f"Add this to *{claim_id}*? Reply *YES* or *NO*.")
+        await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext, classify=True,
+                              on_stored=ask, on_rejected=rejected,
+                              accept=lambda slot: slot != "photo")
         return
-    # START. What was sent is kept for the claim; the menu is shown once.
-    first = stage != "menu"
-    wa.set_conversation(wa_id, stage="menu")
+    # START, the menu or tracking. A recognised photo or document is kept for
+    # the next claim (begin_claim keeps it); the customer is told once per burst.
+    # A refused item leaves tracking where it was; a kept one shows the menu.
+    if stage is None:
+        wa.set_conversation(wa_id, stage="menu")
 
-    async def welcome(slot):
-        if first:
-            await send_text(wa_id, wa.WELCOME)
-    await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext, on_stored=welcome)
+    async def kept(*_):
+        await once_per_burst(lambda: wa.media_kept(wa_id))
+
+    async def refused(kind):
+        await once_per_burst(lambda: wa.media_rejected(wa_id, kind))
+    await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext, classify=True,
+                          on_stored=kept, on_rejected=refused)
 
 
 ATTACH_LOCKS = {}
@@ -1883,10 +1950,17 @@ async def _attach_pending_documents(wa_id, claim_id):
             return row.get("slot") or ("photo" if row["kind"] == "photo" else "claim_form")
         photo_rows = [row for row in rows if slot_of(row) == "photo"]
         doc_rows = [row for row in rows if slot_of(row) != "photo"]
+        known = set(get_session(wa_id).get("claim_shas") or [])
+        repeats = [row for row in doc_rows if row["sha256"] in known]
+        if repeats:
+            await asyncio.to_thread(delete_session_media, wa_id, [row["id"] for row in repeats])
+            label = DOCUMENT_SLOT_LABELS.get(slot_of(repeats[0]), "document")
+            await wa.restate(wa_id, f"That {label} is already on *{claim_id}*.")
+            doc_rows = [row for row in doc_rows if row["sha256"] not in known]
         if photo_rows:
             await asyncio.to_thread(delete_session_media, wa_id, [row["id"] for row in photo_rows])
-            await send_text(wa_id, f"*{claim_id}* has already been assessed, so new damage photos "
-                                   "cannot be added to it. Reply *MENU* to file a new claim.")
+            await wa.restate(wa_id, f"*{claim_id}* has already been assessed, so new damage "
+                                    "photos cannot be added to it. Reply *1* to file a new claim.")
         if not doc_rows:
             return
         try:
@@ -1896,6 +1970,7 @@ async def _attach_pending_documents(wa_id, claim_id):
         if new is None:
             await send_text(wa_id, f"We could not find *{claim_id}*. Reply *MENU* to start again.")
             return
+        wa.set_conversation(wa_id, claim_shas=sorted(known | {row["sha256"] for row in doc_rows}))
         await send_text(wa_id, wa.attach_reply(claim_id, old, new, labels))
 
 
@@ -2033,15 +2108,17 @@ async def handle_wa_message(message):
             text = (message.get("text") or {}).get("body") or ""
             command = wa.command_of(text)
             if wa.is_analysing(wa_id):
-                # DONE (or anything) mid-analysis: one line, never the greeting.
-                await send_text(wa_id, wa.HELP_TEXT if command == "help" else wa.ANALYSIS_BUSY_REPLY)
+                # Mid-analysis: one line, never the greeting, never a cancel.
+                await send_text(wa_id, {
+                    "help": wa.HELP_TEXT, "exit": wa.ANALYSING_EXIT_REPLY,
+                }.get(command, wa.ANALYSIS_BUSY_REPLY))
                 return
             if command not in ("menu", "end", "help") and await wa.handle_pending_choice(wa_id, text):
                 return
             await wa.handle_conversation_text(wa_id, text, process_session,
                                               _attach_pending_documents)
         elif message_type in wa.UNSUPPORTED_REPLIES:
-            await send_text(wa_id, wa.UNSUPPORTED_REPLIES[message_type])
+            await wa.unsupported_reply(wa_id, message_type)
         else:
             await _answer_unhandled(wa_id, message_type, sent_at)
     except Exception:
@@ -2159,4 +2236,15 @@ STATIC_OUTPUT_DIR = os.path.join(BASE_DIR, "static_output")
 os.makedirs(STATIC_OUTPUT_DIR, exist_ok=True)
 app.mount("/static_output", StaticFiles(directory=STATIC_OUTPUT_DIR), name="static_output")
 
-app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+class ConsoleStaticFiles(StaticFiles):
+    """The console is revalidated on every load (a 304 when unchanged), so a
+    deploy never runs a cached old app.js against new HTML: a cached app.js
+    still called confirm() after the in-page Reset dialog shipped."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/", ConsoleStaticFiles(directory=STATIC_DIR, html=True), name="static")

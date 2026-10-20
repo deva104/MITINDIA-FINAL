@@ -407,8 +407,25 @@
       render(normalise([data])[0] || data);
     } catch (e) {
       if (isTokenError(e)) return;
-      alert('Could not load claim ' + id);
+      notify('Could not load claim ' + id + '. Click it again to retry.');
     }
+  }
+
+  /* Embedded browsers suppress alert, confirm and prompt dialogs, so
+     failures are said in the page. */
+  function notify(message) {
+    let el = $('pageNotice');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'pageNotice';
+      el.className = 'page-notice hidden';
+      el.setAttribute('role', 'alert');
+      document.body.appendChild(el);
+    }
+    el.textContent = message;
+    el.classList.remove('hidden');
+    clearTimeout(notify.timer);
+    notify.timer = setTimeout(() => el.classList.add('hidden'), 6000);
   }
   
   /* ---------- claim rendering ---------- */
@@ -1319,18 +1336,41 @@
     show('viewUpload');
     pollClaims();
   };
-  $('btnReset').onclick = async () => {
-    if (!confirm('Clear all claims and stored photo hashes?')) return;
+  /* Reset is confirmed in the page by typing RESET: embedded browsers make
+     confirm() return false without showing anything. */
+  function closeReset() {
+    $('resetModal').classList.add('hidden');
+  }
+  $('btnReset').onclick = () => {
+    $('resetInput').value = '';
+    $('resetConfirm').disabled = true;
+    $('resetError').classList.add('hidden');
+    $('resetModal').classList.remove('hidden');
+    $('resetInput').focus();
+  };
+  $('resetInput').addEventListener('input', event => {
+    $('resetConfirm').disabled = event.target.value.trim() !== 'RESET';
+  });
+  $('resetCancel').onclick = closeReset;
+  $('resetModal').addEventListener('click', event => {
+    if (event.target === $('resetModal')) closeReset();
+  });
+  $('resetConfirm').onclick = async () => {
+    if ($('resetInput').value.trim() !== 'RESET') return;
+    $('resetConfirm').disabled = true;
     try {
       const r = await adminFetch('api/demo/reset', { method: 'POST' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
+      closeReset();
       activeId = null;
       activeClaim = null;
       resetStaged();
       show('viewUpload');
       pollClaims();
     } catch (e) {
-      alert('Reset failed: ' + e.message);
+      $('resetError').textContent = 'Reset failed: ' + (e.message || 'unknown error');
+      $('resetError').classList.remove('hidden');
+      $('resetConfirm').disabled = false;
     }
   };
   

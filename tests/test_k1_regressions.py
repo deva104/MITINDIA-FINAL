@@ -31,8 +31,9 @@ except ImportError:
 
 # Each test enters the guided flow at step 1 (as after MENU, 1, a plate and
 # YES), with steps 2-4 skipped, so photos and DONE analyse as before.
-EXPIRED_PHOTOS = ("Your session timed out after 30 minutes of inactivity. "
-                  "The photos you sent were removed.\n\n" + whatsapp.WELCOME)
+EXPIRED_PHOTOS = whatsapp.with_footer(
+    "Your session timed out after 30 minutes of inactivity. "
+    "The photos you sent were removed.\n\n" + whatsapp.WELCOME)
 
 
 def patterned_jpeg(color, size=(320, 240)):
@@ -94,7 +95,11 @@ class K1RegressionTests(unittest.IsolatedAsyncioTestCase):
             return True
 
         def classify(path):
-            return {"doc_type": "vehicle_photo", "confidence": 0.95, "number_plate": None}
+            # A rendered PDF page (near white) is a claim form; the rest are photos.
+            with Image.open(path) as image:
+                light = min(image.convert("RGB").resize((1, 1)).getpixel((0, 0))) > 200
+            kind = "claim_form" if light else "vehicle_photo"
+            return {"doc_type": kind, "confidence": 0.95, "number_plate": None}
 
         def extract(documents):
             pages = [path for document in documents for path in document["paths"]]
@@ -191,9 +196,11 @@ class K1RegressionTests(unittest.IsolatedAsyncioTestCase):
         guided("910000000001")
         await self.photo("910000000001", "a1", photo)
         await self.text("910000000001", "a2", "Done")
+        await self.text("910000000001", "a2s", "SUBMIT")
         guided("910000000001")  # a second claim: MENU, 1, plate, YES
         await self.photo("910000000001", "a3", photo)
         await self.text("910000000001", "a4", "Done")
+        await self.text("910000000001", "a4s", "SUBMIT")
 
         claims = self.claims_for("910000000001")
         self.assertEqual(len(claims), 2)
@@ -232,10 +239,11 @@ class K1RegressionTests(unittest.IsolatedAsyncioTestCase):
             body for body in self.replies_to("910000000002") if body.startswith("Photo received")
         )
         self.assertEqual(receipts, [
-            "Photo received (1 total). Reply DONE when you are done.",
-            "Photo received (2 total). Reply DONE when you are done.",
+            whatsapp.with_footer("Photo received (1 total). Reply DONE when you are done."),
+            whatsapp.with_footer("Photo received (2 total). Reply DONE when you are done."),
         ])
         await self.text("910000000002", "b3", "Done")
+        await self.text("910000000002", "b3s", "SUBMIT")
         self.assertEqual(len(self.assessed), 1)
         self.assertEqual(sorted(self.assessed[0]), sorted([first, second]))
 
@@ -247,9 +255,10 @@ class K1RegressionTests(unittest.IsolatedAsyncioTestCase):
         await self.photo("910000000003", "c1", photo)
         self.assertEqual(
             self.replies_to("910000000003"),
-            ["Photo received (1 total). Reply DONE when you are done."],
+            [whatsapp.with_footer("Photo received (1 total). Reply DONE when you are done.")],
         )
         await self.text("910000000003", "c2", "Done")
+        await self.text("910000000003", "c2s", "SUBMIT")
         self.assertEqual(len(self.assessed), 1)
         analysed = self.assessed[0][0]
         self.assertLessEqual(len(analysed), db.MAX_MEDIA_BYTES)
@@ -285,12 +294,14 @@ class K1RegressionTests(unittest.IsolatedAsyncioTestCase):
         await self.document("910000000004", "d2", pdf, "claim-form.pdf", "application/pdf")
         # The guided flow names the slot the PDF filled; a resend is noticed.
         self.assertEqual(self.replies_to("910000000004"), [
-            "That looks like your claim form — added to step 4. "
-            "Send more damage photos, or reply *DONE*.",
-            "You already sent that claim form.",
+            whatsapp.with_footer("That looks like your claim form — added to step 4. "
+                                 "Send more damage photos, or reply *DONE*."),
+            whatsapp.with_footer("You already sent that claim form.\n\n"
+                                 + whatsapp.STEP_PROMPTS[1]),
         ])
         await self.photo("910000000004", "d3", patterned_jpeg((90, 90, 30)))
         await self.text("910000000004", "d4", "Done")
+        await self.text("910000000004", "d4s", "SUBMIT")
 
         pipeline_pages = self.extracted[-1]
         self.assertEqual(len(pipeline_pages), 1)
@@ -350,9 +361,10 @@ class K1RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(count("media"), 0)
         self.assertEqual(count("wa_session_media"), 0)
         await self.text("910000000006", "f2", "Done")
+        await self.text("910000000006", "f2s", "SUBMIT")
         self.assertEqual(self.assessed, [])
         # No session left: any message gets the START menu.
-        self.assertEqual(self.replies_to("910000000006")[-1], whatsapp.WELCOME)
+        self.assertEqual(self.replies_to("910000000006")[-1], whatsapp.with_footer(whatsapp.WELCOME))
 
 
 if __name__ == "__main__":

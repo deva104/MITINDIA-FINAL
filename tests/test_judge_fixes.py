@@ -172,8 +172,9 @@ class CustomerActionableTests(unittest.TestCase):
             "Driving licence expiry": "please send a clearer photo of your driving licence",
         })
         internal = {e["item"] for e in entries if e["audience"] == "internal"}
-        self.assertTrue({"Photo capture time and location", "Photo editing",
-                         "AI-generation check", "Driver identity"} <= internal)
+        self.assertTrue({"AI-generation check", "Driver identity"} <= internal)
+        # Stripped metadata and ELA are no longer undetermined items.
+        self.assertFalse({"Photo capture time and location", "Photo editing"} & internal)
 
     def test_whatsapp_shows_only_requests(self):
         entries = main.build_undetermined(self.payload())

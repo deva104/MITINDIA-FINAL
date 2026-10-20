@@ -29,6 +29,7 @@ from db import (
     audit_log_for_claim,
     claim_event_add,
     claim_events_for,
+    claims_for_number,
     current_claim_id,
     database_backend,
     database_ok,
@@ -57,6 +58,7 @@ from gemini import (
 )
 from rules import (
     DOCUMENT_LABELS,
+    add_comparisons,
     assess_confidence,
     build_estimate,
     establish_documents,
@@ -65,10 +67,12 @@ from rules import (
     registry_notes,
     route_classification,
     identity_notes,
+    passed_checks,
     run_rules,
     vehicle_matches_registry,
 )
 import assessors
+import auth
 import registry as vahan
 from vision import (
     provenance,
@@ -94,6 +98,7 @@ try:
         ai_detection_status,
         build_photo_url_map,
         check_duplicates,
+        ela_enabled,
         fit_jpeg,
         prepare_uploaded_image,
         run_deep_forensics,
@@ -117,6 +122,9 @@ except ImportError:
 
     def run_deep_forensics(photo_paths, conn=None, fields=None):
         return []
+
+    def ela_enabled():
+        return False
 
     def warm_up():
         return None
@@ -175,15 +183,51 @@ def required_document_types():
     ]
 
 
-def require_admin(x_admin_token: Optional[str] = Header(default=None)):
-    """Assessor and admin actions need the ADMIN_TOKEN header. Without a
-    configured token every request is refused: the URL is public."""
+MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _token_ok(x_admin_token):
     expected = os.getenv("ADMIN_TOKEN", "").strip()
     supplied = (x_admin_token or "").strip()
-    if not expected or not supplied or not hmac.compare_digest(
-        supplied.encode("utf-8"), expected.encode("utf-8")
-    ):
-        raise HTTPException(status_code=401, detail="admin token required")
+    return bool(expected and supplied and hmac.compare_digest(
+        supplied.encode("utf-8"), expected.encode("utf-8")))
+
+
+def require_admin(request: Request = None, x_admin_token: Optional[str] = Header(default=None)):
+    """Claim data and assessor actions need a signed-in console user (the
+    session cookie) or the ADMIN_TOKEN header (scripts such as seed_demo).
+    A mutating request signed in by cookie must also carry X-Requested-With:
+    InsureIT, which a cross-site form cannot send."""
+    if _token_ok(x_admin_token):
+        if request is not None:
+            request.state.user = None
+        return None
+    user = auth.session_user(request.cookies.get(auth.COOKIE_NAME)) if request is not None else None
+    if user is None:
+        raise HTTPException(status_code=401, detail="sign in required")
+    if (request.method in MUTATING_METHODS
+            and request.headers.get(auth.CSRF_HEADER) != auth.CSRF_VALUE):
+        raise HTTPException(status_code=403, detail="missing X-Requested-With header")
+    request.state.user = user
+    return user
+
+
+def _actor(http, supplied=None):
+    """Who an assessor action is recorded under: the signed-in user always;
+    with the admin token, the actor the script names."""
+    user = getattr(getattr(http, "state", None), "user", None) if http is not None else None
+    if user:
+        return user["username"]
+    return str(supplied or "").strip()
+
+
+def _client_address(request):
+    """Render appends the connecting address to X-Forwarded-For, so the last
+    entry is the client's; a value the client sent sits before it."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded.strip():
+        return forwarded.split(",")[-1].strip()
+    return request.client.host if request.client else "unknown"
 
 
 ADMIN_ONLY = [Depends(require_admin)]
@@ -245,7 +289,11 @@ async def lifespan(app: FastAPI):
     WARM_UP["thread"] = threading.Thread(target=warm_up, name="warm-up", daemon=True)
     WARM_UP["thread"].start()
     if not os.getenv("ADMIN_TOKEN", "").strip():
-        print("[auth] ADMIN_TOKEN is not set: admin endpoints refuse every request", flush=True)
+        print("[auth] ADMIN_TOKEN is not set: only signed-in console users are accepted",
+              flush=True)
+    if not auth.users():
+        print("[auth] WARNING: CONSOLE_USERS has no users: nobody can sign in to the console",
+              flush=True)
     if not os.getenv("WHATSAPP_APP_SECRET", "").strip():
         print("[auth] WARNING: WHATSAPP_APP_SECRET is not set: webhook signatures are "
               "not checked", flush=True)
@@ -274,10 +322,12 @@ def log_provider_chain():
 # the CLM- prefix keep the old name, ClaimPilot.
 SERVICE_NAME = "InsureIT"
 app = FastAPI(title=SERVICE_NAME, lifespan=lifespan)
+# The console is same-origin. Credentials are never allowed cross-origin, so
+# another site cannot ride the session cookie even with a preflight.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -318,6 +368,85 @@ def health():
             "enforced" if os.getenv("WHATSAPP_APP_SECRET", "").strip() else "not_configured"
         ),
     }
+
+
+class LoginRequest(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+
+
+def _too_many(seconds):
+    minutes = max(1, (int(seconds) + 59) // 60)
+    return JSONResponse(
+        {"signed_in": False, "locked": True, "retry_after": int(seconds),
+         "detail": f"Too many failed sign-ins. Try again in {minutes} "
+                   f"minute{'' if minutes == 1 else 's'}."},
+        headers={"Retry-After": str(int(seconds))})
+
+
+@app.post("/api/login")
+async def login(body: LoginRequest, request: Request):
+    """A refused sign-in is a 200 with signed_in false (and locked, retry_after
+    when locked): the console reads the reason, and the browser logs no error
+    for an expected outcome."""
+    if request.headers.get(auth.CSRF_HEADER) != auth.CSRF_VALUE:
+        raise HTTPException(status_code=403, detail="missing X-Requested-With header")
+    address = _client_address(request)
+    wait = auth.locked_for(address)
+    if wait:
+        return _too_many(wait)
+    record = await asyncio.to_thread(auth.authenticate, body.username, body.password)
+    if record is None:
+        locked = auth.record_failure(address)
+        # Never the user name or the password: a password typed into the
+        # user ID box would land in the log.
+        print("[auth] failed sign-in" + (" — address locked for 10 minutes" if locked else ""),
+              flush=True)
+        if locked:
+            return _too_many(locked)
+        return {"signed_in": False, "detail": "User ID or password is incorrect."}
+    value = auth.make_session(record["username"])
+    if value is None:
+        return {"signed_in": False, "detail": "Sign-in is not configured on this server "
+                                              "(set SESSION_SECRET or ADMIN_TOKEN)."}
+    auth.record_success(address)
+    print("[auth] console sign-in", flush=True)
+    response = JSONResponse(dict(auth.public(record), signed_in=True))
+    response.set_cookie(value=value, **auth.cookie_settings())
+    return response
+
+
+@app.get("/api/session")
+def session_status(request: Request):
+    """Who is signed in by cookie, for the console's sign-in screen: never a 401."""
+    user = auth.session_user(request.cookies.get(auth.COOKIE_NAME))
+    if user is None:
+        return {"signed_in": False}
+    decided = sum(1 for summary in list_claims()
+                  if user["username"] in feed_state(summary["claim_id"])["deciders"])
+    return dict(auth.public(user), signed_in=True, decided=decided)
+
+
+@app.post("/api/logout")
+def logout(request: Request):
+    if request.headers.get(auth.CSRF_HEADER) != auth.CSRF_VALUE:
+        raise HTTPException(status_code=403, detail="missing X-Requested-With header")
+    auth.revoke(request.cookies.get(auth.COOKIE_NAME))
+    response = JSONResponse({"signed_out": True})
+    settings = auth.cookie_settings()
+    response.delete_cookie(settings["key"], path=settings["path"], secure=True,
+                           httponly=True, samesite="lax")
+    return response
+
+
+@app.get("/api/me", dependencies=ADMIN_ONLY)
+def me(request: Request):
+    user = getattr(request.state, "user", None)
+    if not user:
+        return {"username": None, "display_name": "Admin token", "city": "", "decided": 0}
+    decided = sum(1 for summary in list_claims()
+                  if user["username"] in feed_state(summary["claim_id"])["deciders"])
+    return dict(auth.public(user), decided=decided)
 
 
 @app.get("/api/storage", dependencies=ADMIN_ONLY)
@@ -422,6 +551,7 @@ def _derive_legacy_damage_ids(payload):
 
 def _public_audit_row(row):
     public = dict(row)
+    public["actor_name"] = auth.display_name(public.get("actor"))
     for source, target in (("before_json", "before"), ("after_json", "after")):
         try:
             public[target] = json.loads(public[source]) if public.get(source) else None
@@ -507,6 +637,7 @@ def build_claim_response(payload):
         response["final_decision"] = {
             "value": after.get("value"),
             "actor": row.get("actor"),
+            "actor_name": row.get("actor_name"),
             "at": row.get("created_at"),
             "reason": row.get("reason"),
         }
@@ -516,12 +647,108 @@ def build_claim_response(payload):
         response["events"] = []
     response["next_step"] = next_step_text(
         response, (response.get("final_decision") or {}).get("value"))
+    response["info_request"] = _info_request(audit_rows, response["events"])
+    # Flags and notes as comparisons; the checks that agreed as MATCH rows.
+    fields = response.get("fields") or []
+    record = response.get("registry")
+    add_comparisons(response.get("flags"), fields, record)
+    add_comparisons(response.get("notes"), fields, record)
+    response["checks"] = (
+        passed_checks(fields, record, response.get("flags"), response.get("notes"),
+                      response.get("photos"))
+        if response.get("status") == "analysed" else [])
+    # ELA (off unless ELA_ENABLED) and stripped EXIF are not shown, also on
+    # claims saved before they were removed.
+    response["forensics"] = [
+        item for item in response.get("forensics") or []
+        if isinstance(item, dict)
+        and not (item.get("check") == "ela" and not ela_enabled())
+        and not (item.get("check") == "exif" and item.get("verdict") == "unverifiable")
+    ]
+    response["undetermined"] = [
+        item for item in response.get("undetermined") or []
+        if not (isinstance(item, dict) and item.get("item") in REMOVED_UNDETERMINED)
+    ]
     return response
+
+
+# Undetermined entries no longer produced: ELA cannot tell recompression from
+# editing, and WhatsApp strips metadata from every photo.
+REMOVED_UNDETERMINED = {"Photo editing", "Photo capture time and location"}
+
+
+def _info_request(audit_rows, events):
+    """The open request for information: the latest decision is more_info
+    with a requested item. received: something of that kind arrived since."""
+    decisions = [row for row in audit_rows if row.get("action") == "set_decision"]
+    if not decisions:
+        return None
+    last = decisions[-1]
+    after = last.get("after") or {}
+    item = after.get("requested")
+    if after.get("value") != "more_info" or item not in wa.REQUEST_ITEMS:
+        return None
+    since = str(last.get("created_at") or "")
+    received = [event for event in events or []
+                if event.get("event") == "documents_received"
+                and str(event.get("created_at") or "") >= since]
+    delivered = any(row.get("action") == "notification_sent"
+                    and str(row.get("created_at") or "") >= since for row in audit_rows)
+    return {
+        "item": item, "label": wa.REQUEST_ITEMS[item][0], "comment": after.get("comment") or "",
+        "by": last.get("actor"), "by_name": last.get("actor_name"), "at": since,
+        "received": bool(received), "received_at": received[-1]["created_at"] if received else None,
+        "delivered": delivered,
+    }
+
+
+# The feed's view of each claim's audit trail (final decision, open request,
+# who decided). It changes only through this process (overrides, requests,
+# received documents; one worker), so it is cached and dropped on change.
+FEED_STATE = {}
+FEED_LOCK = threading.Lock()
+
+
+def _compute_feed_state(claim_id):
+    rows = [_public_audit_row(row) for row in audit_log_for_claim(claim_id)]
+    decisions = [row for row in rows if row.get("action") == "set_decision"]
+    final = None
+    if decisions:
+        last = decisions[-1]
+        final = {"value": (last.get("after") or {}).get("value"), "actor": last.get("actor"),
+                 "actor_name": last.get("actor_name"), "at": last.get("created_at")}
+    request = _info_request(rows, claim_events_for(claim_id)) if decisions else None
+    return {"final_decision": final, "info_request": request,
+            "deciders": sorted({str(row.get("actor")) for row in decisions})}
+
+
+def feed_state(claim_id, fresh=False):
+    with FEED_LOCK:
+        cached = None if fresh else FEED_STATE.get(claim_id)
+    if cached is not None:
+        return cached
+    state = _compute_feed_state(claim_id)
+    with FEED_LOCK:
+        FEED_STATE[claim_id] = state
+    return state
+
+
+def forget_feed_state(claim_id=None):
+    with FEED_LOCK:
+        if claim_id is None:
+            FEED_STATE.clear()
+        else:
+            FEED_STATE.pop(claim_id, None)
 
 
 @app.get("/api/claims", dependencies=ADMIN_ONLY)
 def claims():
-    return sign_media_urls(list_claims())
+    items = list_claims()
+    for item in items:
+        state = feed_state(item["claim_id"])
+        item["final_decision"] = state["final_decision"]
+        item["info_request"] = state["info_request"]
+    return sign_media_urls(items)
 
 
 @app.get("/api/claims/{claim_id}", dependencies=ADMIN_ONLY)
@@ -540,8 +767,11 @@ def _rupees(value):
 
 
 async def _notify_whatsapp_decision(
-    claim_id, payload, actor, decision, reason
+    claim_id, payload, actor, decision, reason, message=None
 ):
+    """Inside the 24h service window the customer is told; outside it the
+    audit trail says it was not sent (a request is then sent the next time
+    the customer writes)."""
     if payload.get("source") != "whatsapp":
         return
     wa_id = payload.get("from_number")
@@ -566,7 +796,9 @@ async def _notify_whatsapp_decision(
 
         current = await asyncio.to_thread(build_claim_response, payload)
         estimate = current.get("effective_estimate") or {}
-        if decision == "approved":
+        if message is not None:
+            pass
+        elif decision == "approved":
             # The estimate is a range from the rate card, not a settled amount.
             cost = (
                 f" — estimated repair cost ₹{_rupees(estimate.get('total_low'))}–"
@@ -586,7 +818,7 @@ async def _notify_whatsapp_decision(
                 "Reply here with the requested photos or documents."
             )
         assessor = payload.get("assessor") or {}
-        if assessor.get("name"):
+        if assessor.get("name") and "Tracking ID" not in message:
             message += f"\nTracking ID: {claim_id} · Assessor: {assessor['name']}"
 
         sent = await send_text(wa_id, message)
@@ -625,8 +857,8 @@ async def _notify_whatsapp_decision(
 
 
 @app.post("/api/claims/{claim_id}/override", dependencies=ADMIN_ONLY)
-async def override_claim(claim_id: str, request: OverrideRequest):
-    actor = str(request.actor or "").strip()
+async def override_claim(claim_id: str, request: OverrideRequest, http: Request = None):
+    actor = _actor(http, request.actor)
     action = str(request.action or "").strip()
     target = str(request.target or "").strip()
     reason = str(request.reason or "").strip()
@@ -676,6 +908,7 @@ async def override_claim(claim_id: str, request: OverrideRequest):
     await asyncio.to_thread(
         audit_log_add, claim_id, actor, action, target, before, after, reason
     )
+    forget_feed_state(claim_id)
     # The customer-facing timeline: decisions by name, other overrides as one kind.
     event = (
         DECISION_EVENTS.get(after["value"], "decision_recorded") if action == "set_decision"
@@ -690,6 +923,52 @@ async def override_claim(claim_id: str, request: OverrideRequest):
         await _notify_whatsapp_decision(
             claim_id, payload, actor, after["value"], reason
         )
+    forget_feed_state(claim_id)
+    return sign_media_urls(await asyncio.to_thread(build_claim_response, payload))
+
+
+class InfoRequest(BaseModel):
+    item: Optional[str] = None
+    comment: Optional[str] = None
+    actor: Optional[str] = None
+
+
+@app.post("/api/claims/{claim_id}/request-info", dependencies=ADMIN_ONLY)
+async def request_info(claim_id: str, body: InfoRequest, http: Request = None):
+    """Ask the customer for one thing (and a comment). It is recorded as the
+    more_info decision with the item, sent on WhatsApp inside the 24h window,
+    and the next matching item the customer sends is attached to the claim."""
+    actor = _actor(http, body.actor)
+    item = str(body.item or "").strip()
+    comment = " ".join(str(body.comment or "").split())[:500]
+    if not actor:
+        raise HTTPException(status_code=400, detail="actor is required")
+    if item not in wa.REQUEST_ITEMS:
+        raise HTTPException(status_code=400, detail="choose what is needed")
+    if item == "other" and not comment:
+        raise HTTPException(status_code=400, detail="describe what is needed in the comment")
+    payload = await asyncio.to_thread(get_claim, claim_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="claim not found")
+    current = await asyncio.to_thread(build_claim_response, payload)
+    before = current.get("final_decision") or {"value": current.get("decision"),
+                                                "source": "system"}
+    label = wa.REQUEST_ITEMS[item][0]
+    after = {"value": "more_info", "requested": item, "comment": comment}
+    reason = comment or f"Requested: {label.lower()}"
+    await asyncio.to_thread(audit_log_add, claim_id, actor, "set_decision", "claim",
+                            before, after, reason)
+    try:
+        await asyncio.to_thread(claim_event_add, claim_id, "more_info_requested",
+                                f"Requested: {label}" + (f" — {comment}" if comment else ""),
+                                actor)
+    except Exception as error:
+        print(f"[case] {claim_id}: timeline event not recorded: {type(error).__name__}",
+              flush=True)
+    forget_feed_state(claim_id)
+    await _notify_whatsapp_decision(claim_id, payload, actor, "more_info", reason,
+                                    message=wa.info_request_text(claim_id, item, comment))
+    forget_feed_state(claim_id)
     return sign_media_urls(await asyncio.to_thread(build_claim_response, payload))
 
 
@@ -711,6 +990,7 @@ def demo_reset():
         conn.commit()
     finally:
         conn.close()
+    forget_feed_state()
     print("[demo] database cleared", flush=True)
     return {"cleared": True}
 
@@ -921,32 +1201,8 @@ def build_undetermined(payload):
             "impact": "vehicle identity not verified from the photographs",
         }, "please send a clear photo of the number plate"))
 
-    if any(
-        isinstance(item, dict)
-        and item.get("check") == "exif"
-        and item.get("verdict") == "unverifiable"
-        for item in (payload.get("forensics") or [])
-    ):
-        entries.append({
-            "item": "Photo capture time and location",
-            "reason": "metadata stripped in transit",
-            "impact": "cannot confirm when or where photos were taken",
-        })
-
-    if any(
-        isinstance(item, dict)
-        and item.get("check") == "ela"
-        and item.get("verdict") == "informational"
-        for item in (payload.get("forensics") or [])
-    ):
-        entries.append({
-            "item": "Photo editing",
-            "reason": (
-                "error-level analysis cannot tell recompression from editing "
-                "on these photos"
-            ),
-            "impact": "editing neither confirmed nor ruled out",
-        })
+    # Stripped EXIF (normal on WhatsApp) and ELA (cannot tell recompression
+    # from editing) are not undetermined items: they said nothing about a claim.
 
     for check in payload.get("forensics") or []:
         if not isinstance(check, dict) or check.get("check") != "ai_generated":
@@ -1781,7 +2037,8 @@ async def _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext=".j
             return
 
     if on_stored is not None:
-        await on_stored([value for value in page_slots if value], is_pdf)
+        await on_stored([value for value in page_slots if value], is_pdf,
+                        [row_id for row_id in row_ids if row_id is not None])
         return
     if choice_cleared:
         if bucket == "photos":
@@ -1881,28 +2138,40 @@ async def _receive_media(wa_id, message_id, media_obj, bucket, fallback_ext):
         await reply()
 
     if stage in ("collect", "ready"):
-        async def collected(slots, is_pdf):
+        async def collected(slots, is_pdf, *_):
             await wa.guided_media_received(wa_id, slots, is_pdf)
         await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext, classify=True,
                               on_stored=collected, on_rejected=rejected)
         return
+    if stage not in ("ask_plate", "confirm_vehicle"):
+        # The assessor asked for something: the next item is checked against it.
+        pending = await asyncio.to_thread(_pending_request, wa_id)
+        if pending and (stage != "open_claim" or session.get("claim_id") == pending["claim_id"]):
+            async def requested(slots, is_pdf, row_ids):
+                await _receive_requested(wa_id, pending, slots, row_ids)
+
+            async def not_requested(kind):
+                await wa.requested_refused(wa_id, pending, kind)
+            await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext,
+                                  classify=True, on_stored=requested, on_rejected=not_requested)
+            return
     if stage == "open_claim" and session.get("claim_id"):
         claim_id = session["claim_id"]
 
-        async def attach(slots, is_pdf):
+        async def attach(slots, is_pdf, *_):
             await _attach_pending_documents(wa_id, claim_id)
         await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext, classify=True,
                               on_stored=attach, on_rejected=rejected)
         return
     if stage in ("ask_plate", "confirm_vehicle"):
         # Kept for the claim: step 1 counts it once the vehicle is confirmed.
-        async def kept_early(slots, is_pdf):
+        async def kept_early(slots, is_pdf, *_):
             await once_per_burst(lambda: wa.media_kept(wa_id))
         await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext, classify=True,
                               on_stored=kept_early, on_rejected=rejected)
         return
     if stage == "confirm_attach":
-        async def held(slots, is_pdf):
+        async def held(slots, is_pdf, *_):
             await wa.restate(wa_id)
         await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext, classify=True,
                               on_stored=held, on_rejected=rejected,
@@ -1912,7 +2181,7 @@ async def _receive_media(wa_id, message_id, media_obj, bucket, fallback_ext):
     if claim_id:
         wa.set_conversation(wa_id, stage="confirm_attach", attach_claim_id=claim_id)
 
-        async def ask(slots, is_pdf):
+        async def ask(slots, is_pdf, *_):
             await wa.ask(wa_id, f"Add this to *{claim_id}*? Reply *YES* or *NO*.")
         await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext, classify=True,
                               on_stored=ask, on_rejected=rejected,
@@ -1931,6 +2200,91 @@ async def _receive_media(wa_id, message_id, media_obj, bucket, fallback_ext):
         await once_per_burst(lambda: wa.media_rejected(wa_id, kind))
     await _store_wa_media(wa_id, message_id, media_obj, bucket, fallback_ext, classify=True,
                           on_stored=kept, on_rejected=refused)
+
+
+def _pending_request(wa_id):
+    """The newest claim from this number with an open request that nothing
+    has answered yet, read fresh: {claim_id, item, label, comment, ...}."""
+    for summary in claims_for_number(wa_id):
+        request = feed_state(summary["claim_id"], fresh=True)["info_request"]
+        if request and not request["received"]:
+            return dict(request, claim_id=summary["claim_id"])
+    return None
+
+
+async def _deliver_pending_request(wa_id):
+    """A request the 24h window kept from being sent goes out the next time
+    the customer writes. True when it was sent now."""
+    pending = await asyncio.to_thread(_pending_request, wa_id)
+    if not pending or pending["delivered"]:
+        return False
+    claim_id = pending["claim_id"]
+    message = wa.info_request_text(claim_id, pending["item"], pending["comment"])
+    if not await send_text(wa_id, message):
+        return False
+    await asyncio.to_thread(audit_log_add, claim_id, pending["by"] or "system",
+                            "notification_sent", "claim", None,
+                            {"channel": "whatsapp", "status": "sent", "message": message},
+                            "request sent when the customer wrote again")
+    forget_feed_state(claim_id)
+    return True
+
+
+async def _receive_requested(wa_id, pending, slots, row_ids):
+    """An item sent while a request is open: attached when it is what the
+    assessor asked for, else the customer is told what is still needed."""
+    claim_id = pending["claim_id"]
+    wanted = wa.REQUEST_ITEMS[pending["item"]][2]
+    rows = [row for row in await asyncio.to_thread(list_session_media, wa_id)
+            if row["id"] in set(row_ids)]
+    if wanted is not None and wanted not in slots:
+        await asyncio.to_thread(delete_session_media, wa_id, [row["id"] for row in rows])
+        await send_text(wa_id, wa.wrong_item_text(slots[0] if slots else None, pending))
+        return
+    lock = ATTACH_LOCKS.setdefault(claim_id, asyncio.Lock())
+    async with lock:
+        try:
+            photo_rows = [row for row in rows if row.get("slot") == "photo"]
+            doc_rows = [row for row in rows if row.get("slot") != "photo"]
+            labels = []
+            if photo_rows:
+                labels += await asyncio.to_thread(
+                    _attach_requested_photos, claim_id, photo_rows, pending["label"])
+            if doc_rows:
+                _, new, doc_labels = await asyncio.to_thread(
+                    _reassess_from_rows, wa_id, claim_id, doc_rows)
+                if new is None:
+                    await send_text(wa_id, f"We could not find *{claim_id}*. "
+                                           "Reply *MENU* to start again.")
+                    return
+                labels += doc_labels
+        finally:
+            await asyncio.to_thread(delete_session_media, wa_id, [row["id"] for row in rows])
+        label = ", ".join(dict.fromkeys(labels)) or pending["label"].lower()
+        await asyncio.to_thread(claim_event_add, claim_id, "documents_received", label,
+                                "customer")
+        forget_feed_state(claim_id)
+    await send_text(wa_id, wa.request_received_text(claim_id, label))
+
+
+def _attach_requested_photos(claim_id, rows, requested):
+    """Photos the assessor asked for, kept on the claim (the claim owns the
+    blobs). Damage grading is not re-run; the assessor reviews them."""
+    payload = get_claim(claim_id)
+    if not payload:
+        return []
+    added = list(payload.get("added_photos") or [])
+    for row in rows:
+        blob = media_get(row["media_id"])
+        if not blob:
+            continue
+        media_id = media_put(blob[0], blob[1], "photo", claim_id)
+        if media_id:
+            added.append({"url": f"/media/{media_id}", "requested": requested,
+                          "received_at": utc_now_iso()})
+    payload["added_photos"] = added
+    save_claim(claim_id, payload)
+    return ["photo" if len(rows) == 1 else f"{len(rows)} photos"]
 
 
 ATTACH_LOCKS = {}
@@ -1985,8 +2339,13 @@ def _reassess_from_rows(wa_id, claim_id, rows):
             documents.append({"name": name, "paths": [path],
                               "doc_type": slot if slot in DOCUMENT_TYPES else None})
             # The customer sent it as this document (its step or its classification).
+            # The claim adopts the image so the console can show it after the
+            # session's copy is deleted.
+            blob = media_get(row["media_id"])
+            adopted = media_put(blob[0], blob[1], row["kind"], claim_id) if blob else None
             classifications.append({"filename": name, "doc_type": slot, "confidence": 0.9,
-                                    "number_plate": None, "url": None})
+                                    "number_plate": None,
+                                    "url": f"/media/{adopted}" if adopted else None})
             labels.append(DOCUMENT_SLOT_LABELS.get(slot, "document"))
         page_slots = [row.get("slot") for row in rows if row["kind"] == "document_page"]
         for document in page_documents:
@@ -2114,6 +2473,9 @@ async def handle_wa_message(message):
                 }.get(command, wa.ANALYSIS_BUSY_REPLY))
                 return
             if command not in ("menu", "end", "help") and await wa.handle_pending_choice(wa_id, text):
+                return
+            if (get_session(wa_id).get("stage") in (None, "menu", "track", "open_claim")
+                    and await _deliver_pending_request(wa_id)):
                 return
             await wa.handle_conversation_text(wa_id, text, process_session,
                                               _attach_pending_documents)

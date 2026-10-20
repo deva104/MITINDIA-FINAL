@@ -9,6 +9,10 @@
   --navy:#172A45;
   --navy-dark:#0F1C30;
   --track:#EEEEEE;
+  /* Faint card tints by verdict; text on them keeps at least 4.5:1. */
+  --tint-bad:#FDF0EE;    --tint-bad-line:#F1D2CD;
+  --tint-good:#EEF6F1;   --tint-good-line:#CFE4D6;
+  --tint-neutral:#F5F5F5;
 
   /* Status colours: verdict pills only. */
   --ok-fg:#1E6B45;     --ok-bg:#EAF4EE;
@@ -74,23 +78,14 @@ button,input,select,textarea{font-family:inherit}
   padding-left:16px;border-left:1px solid var(--line);
 }
 .topbar-actions{display:flex;align-items:center;gap:12px}
-.assessor-field{
-  display:flex;align-items:center;gap:8px;
-  color:var(--muted);font-size:12px;font-weight:600;
-  text-transform:uppercase;letter-spacing:.08em;
-}
-.assessor-field input,
 .token-row input{
   width:160px;border:1px solid var(--line);border-radius:var(--r-btn);
   background:var(--bg);color:var(--ink);padding:9px 12px;
   font:15px var(--sans);letter-spacing:0;text-transform:none;
   transition:border-color var(--ease);
 }
-.assessor-field input::placeholder,
 .token-row input::placeholder{color:var(--muted)}
-.assessor-field input:hover,
 .token-row input:hover{border-color:var(--muted)}
-.assessor-field input:focus,
 .token-row input:focus{outline:none;border-color:var(--navy)}
 .health{
   display:inline-flex;align-items:center;
@@ -489,4 +484,60 @@ button,input,select,textarea{font-family:inherit}
   position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:60;
   max-width:calc(100vw - 32px);background:var(--ink);color:var(--bg);
   border-radius:var(--r);padding:10px 16px;font-size:14px;font-weight:500;
+}
+
+/* ---------- sign-in, profile ---------- */
+.booting .app{visibility:hidden}
+.login{
+  position:fixed;inset:0;z-index:70;background:var(--band);
+  display:flex;padding:24px;overflow-y:auto;
+}
+.login-card{
+  margin:auto;width:min(400px,100%);background:var(--bg);border:1px solid var(--line);
+  border-radius:var(--r);padding:32px;display:flex;flex-direction:column;
+}
+.login-card h1{font-size:26px;margin:14px 0 22px}
+.login-card .modal-label{margin-top:12px}
+.login-card .btn{margin-top:20px}
+.text-input{
+  width:100%;border:1px solid var(--line);border-radius:var(--r-btn);background:var(--bg);
+  color:var(--ink);padding:11px 14px;font:15px var(--sans);transition:border-color var(--ease);
+}
+.text-input:hover{border-color:var(--muted)}
+.text-input:focus{outline:none;border-color:var(--navy)}
+.modal select.text-input{margin-bottom:16px}
+.profile{display:flex;align-items:center;gap:12px}
+.profile-text{display:flex;flex-direction:column;align-items:flex-end;line-height:1.25}
+.profile-name{font-size:15px;font-weight:600;color:var(--ink)}
+.profile-meta{font-size:13px;color:var(--text)}
+
+/* ---------- comparisons and tints ---------- */
+.row.tint-bad{background:var(--tint-bad);border-color:var(--tint-bad-line)}
+.row.tint-good{background:var(--tint-good);border-color:var(--tint-good-line)}
+.row.tint-neutral{background:var(--tint-neutral)}
+.compare{display:grid;grid-template-columns:minmax(150px,auto) 1fr;gap:6px 16px;margin:6px 0 0;font-size:15px}
+.compare dt{color:var(--text)}
+.compare dd{margin:0;color:var(--ink);font-weight:500;overflow-wrap:anywhere}
+.compare-verdict{margin-top:10px;font-size:14px;font-weight:800;letter-spacing:.06em}
+.compare-verdict.is-bad{color:var(--reject-fg)}
+.compare-verdict.is-good{color:var(--ok-fg)}
+.compare-verdict.is-neutral{color:var(--text)}
+.row-note{font-size:13px;color:var(--text);margin:8px 0 0;line-height:1.5}
+.docs-received{margin-top:2px}
+
+/* ---------- could not determine: names, each expanding ---------- */
+.undetermined-list{list-style:none;margin:0;padding:0}
+.undetermined-list li{border-bottom:1px solid var(--line)}
+.undetermined-list li:last-child{border-bottom:0}
+.undetermined-list summary{cursor:pointer;padding:10px 0;font-size:15px;font-weight:600;color:var(--ink)}
+.undetermined-list details p{margin:0 0 6px 16px}
+.undetermined-list details p:last-child{margin-bottom:12px}
+
+/* ---------- evidence ---------- */
+.evidence-item{margin:0}
+.evidence-item figcaption{font-size:13px;color:var(--text);margin-top:4px}
+@media (max-width:640px){
+  .compare{grid-template-columns:1fr;gap:2px}
+  .compare dd{margin-bottom:6px}
+  .profile-text{display:none}
 }

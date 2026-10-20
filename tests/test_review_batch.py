@@ -448,7 +448,8 @@ class ElaCalibrationTests(unittest.TestCase):
         return path
 
     def ela(self, path):
-        with patch.dict(os.environ, {"AI_DETECTION_ENABLED": "false"}), \
+        # ELA is off by default; its calibration is kept behind ELA_ENABLED.
+        with patch.dict(os.environ, {"AI_DETECTION_ENABLED": "false", "ELA_ENABLED": "true"}), \
                 patch.object(forensics, "_store_processed", lambda image, kind: None):
             results = forensics.run_deep_forensics([path])
         return next(item for item in results if item["check"] == "ela")
@@ -472,16 +473,24 @@ class ElaCalibrationTests(unittest.TestCase):
         self.assertEqual(entry["verdict"], "informational")
         self.assertNotIn(entry["verdict"], ("clean", "suspicious"))
 
-    def test_undetermined_says_editing_is_not_ruled_out(self):
+    def test_ela_and_stripped_metadata_are_not_undetermined(self):
         entries = main.build_undetermined({"forensics": [
             {"check": "ela", "verdict": "informational", "detail": "x"},
+            {"check": "exif", "verdict": "unverifiable", "detail": "x"},
         ]})
-        self.assertIn({
-            "item": "Photo editing",
-            "reason": "error-level analysis cannot tell recompression from editing on these photos",
-            "impact": "editing neither confirmed nor ruled out",
-            "audience": "internal",
-        }, entries)
+        items = {entry["item"] for entry in entries}
+        self.assertNotIn("Photo editing", items)
+        self.assertNotIn("Photo capture time and location", items)
+
+    def test_ela_is_off_by_default_and_stripped_exif_gets_no_entry(self):
+        path = self.recompressed("claimed_panel.jpeg", 75)  # no EXIF after re-saving
+        env = {key: value for key, value in os.environ.items() if key != "ELA_ENABLED"}
+        env["AI_DETECTION_ENABLED"] = "false"
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(forensics, "_store_processed", lambda image, kind: None):
+            results = forensics.run_deep_forensics([path])
+        self.assertEqual([item["check"] for item in results
+                          if item["check"] in ("ela", "exif")], [])
 
 
 # Items 1 and 5: console wording -------------------------------------------

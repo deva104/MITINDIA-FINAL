@@ -22,6 +22,12 @@ services:
         sync: false
       - key: ADMIN_TOKEN
         sync: false
+      # Console sign-in: JSON list of users with PBKDF2 hashes
+      # (scripts/hash_password.py --json). SESSION_SECRET signs the cookies.
+      - key: CONSOLE_USERS
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
       - key: GROQ_API_KEY
         sync: false
       - key: GEMINI_API_KEY

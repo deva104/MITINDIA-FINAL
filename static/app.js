@@ -121,132 +121,143 @@
     return Array.isArray(value) ? value : [];
   }
 
-  function assessorName() {
-    return String($('assessorName').value || '').trim();
+  /* ---------- sign-in ----------
+     The session is an HttpOnly cookie the page cannot read. Every request
+     carries X-Requested-With: the server refuses a change without it, and a
+     cross-site form cannot send it. The signed-in user is the actor on every
+     override; the old admin-token and assessor-name keys are cleared. */
+  const REQUEST_HEADERS = { 'X-Requested-With': 'InsureIT' };
+  let currentUser = null;
+  let pollTimer = null;
+
+  try {
+    localStorage.removeItem('claimpilot.adminToken');
+    localStorage.removeItem('claimpilot.assessor');
+  } catch (e) {
+    /* Storage blocked: nothing to clear. */
   }
 
-  function loadAssessorName() {
-    try {
-      return localStorage.getItem('claimpilot.assessor') || '';
-    } catch (e) {
-      return '';
+  class SignedOut extends Error {}
+
+  function isSignedOut(e) {
+    return e instanceof SignedOut;
+  }
+
+  async function api(url, options) {
+    const opts = Object.assign({ credentials: 'same-origin' }, options || {});
+    opts.headers = Object.assign({}, opts.headers || {}, REQUEST_HEADERS);
+    const r = await fetch(url, opts);
+    if (r.status === 401) {
+      signedOut('Your session has ended. Sign in again.');
+      throw new SignedOut('signed out');
     }
-  }
-
-  function saveAssessorName(value) {
-    try {
-      localStorage.setItem('claimpilot.assessor', value);
-    } catch (e) {
-      /* The operator can still work when storage is blocked. */
-    }
-  }
-
-  /* Claims, uploads, overrides and demo reset need the admin token. It is
-     asked for once and kept in localStorage (for this page only if storage is
-     blocked), and asked for again when the server answers 401. */
-  const ADMIN_TOKEN_KEY = 'claimpilot.adminToken';
-  let adminToken = (function () {
-    try {
-      return localStorage.getItem(ADMIN_TOKEN_KEY) || '';
-    } catch (e) {
-      return '';
-    }
-  })();
-
-  function rememberAdminToken(value) {
-    adminToken = value;
-    try {
-      if (value) localStorage.setItem(ADMIN_TOKEN_KEY, value);
-      else localStorage.removeItem(ADMIN_TOKEN_KEY);
-    } catch (e) {
-      /* Kept in memory only. */
-    }
-  }
-
-  /* The token is asked for in the feed panel, not with prompt(): embedded
-     browsers refuse prompt(), and the poll must never wipe what is typed. */
-  let tokenWaiters = [];
-
-  function showTokenForm(note) {
-    $('claimCount').textContent = '–';
-    if ($('tokenForm')) {
-      $('tokenNote').textContent = note;
-      return;
-    }
-    $('feed').innerHTML = `<form class="feed-empty token-form" id="tokenForm" autocomplete="off">
-        <span class="label">Assessor access</span>
-        <span id="tokenNote">${esc(note)}</span>
-        <div class="token-row">
-          <input id="tokenInput" type="password" autocomplete="current-password"
-                 placeholder="Admin token" aria-label="Admin token">
-          <button type="submit" class="btn btn-primary" id="tokenUnlock" disabled>Unlock</button>
-        </div>
-      </form>`;
-    $('tokenInput').oninput = event => {
-      $('tokenUnlock').disabled = !event.target.value.trim();
-    };
-    $('tokenForm').onsubmit = event => {
-      event.preventDefault();
-      const value = String($('tokenInput').value || '').trim();
-      if (!value) return;
-      rememberAdminToken(value);
-      const waiters = tokenWaiters;
-      tokenWaiters = [];
-      waiters.forEach(resolve => resolve());
-      pollClaims().then(claims => {
-        if (claims.length && !activeId) openClaim(claims[0].claim_id);
-      });
-    };
-    $('tokenInput').focus();
-  }
-
-  const TOKEN_ASK = 'Claims are shown to assessors only. Enter the admin token.';
-  const TOKEN_REJECTED = 'That token was not accepted. Enter the admin token.';
-
-  function requestToken(note) {
-    showTokenForm(note);
-    return new Promise(resolve => tokenWaiters.push(resolve));
-  }
-
-  function isTokenError(e) {
-    return /^Admin token/.test(String((e && e.message) || ''));
-  }
-
-  /* interactive = true waits for the operator to enter the token; polling
-     passes false and only shows the form. */
-  /* True from a 401 until a request succeeds, so the poll keeps saying why. */
-  let tokenRejected = false;
-
-  async function adminFetch(url, options, interactive = true) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (!adminToken) {
-        if (!interactive) {
-          throw new Error(tokenRejected ? 'Admin token rejected' : 'Admin token required');
-        }
-        await requestToken(tokenRejected ? TOKEN_REJECTED : TOKEN_ASK);
-      }
-      const sent = adminToken;
-      const headers = Object.assign({}, (options && options.headers) || {}, {
-        'X-Admin-Token': adminToken
-      });
-      const r = await fetch(url, Object.assign({}, options || {}, { headers }));
-      if (r.status !== 401) {
-        tokenRejected = false;
-        return r;
-      }
-      tokenRejected = true;
-      /* A token entered meanwhile by another request is kept. */
-      if (adminToken === sent) rememberAdminToken('');
-    }
-    throw new Error('Admin token rejected');
+    return r;
   }
 
   function updateOverrideControls() {
-    const disabled = !assessorName();
     document.querySelectorAll('.override-control').forEach(control => {
-      control.disabled = disabled;
-      control.title = disabled ? 'Enter an assessor name first' : '';
+      control.disabled = !currentUser;
     });
+  }
+
+  function renderProfile() {
+    const box = $('profile');
+    if (!currentUser) {
+      box.classList.add('hidden');
+      return;
+    }
+    const decided = Number(currentUser.decided) || 0;
+    $('profileName').textContent = currentUser.display_name || currentUser.username;
+    $('profileMeta').textContent = [
+      currentUser.city,
+      `${decided} claim${decided === 1 ? '' : 's'} decided`
+    ].filter(Boolean).join(' · ');
+    box.classList.remove('hidden');
+  }
+
+  /* /api/session never answers 401, so checking costs no console error. */
+  async function refreshProfile() {
+    try {
+      const r = await fetch('api/session', { credentials: 'same-origin', headers: REQUEST_HEADERS });
+      const data = await r.json();
+      currentUser = data && data.signed_in ? data : null;
+    } catch (e) {
+      /* Kept as it was; the next call tries again. */
+    }
+    renderProfile();
+    return currentUser;
+  }
+
+  function showLogin(message) {
+    document.body.classList.remove('booting');
+    $('loginView').classList.remove('hidden');
+    document.querySelector('.app').inert = true;
+    $('loginError').textContent = message || '';
+    $('loginError').classList.toggle('hidden', !message);
+    $('loginPassword').value = '';
+    ($('loginUser').value ? $('loginPassword') : $('loginUser')).focus();
+  }
+
+  function hideLogin() {
+    $('loginView').classList.add('hidden');
+    document.querySelector('.app').inert = false;
+    document.body.classList.remove('booting');
+  }
+
+  /* Signed out (logout, or a 401 when the session ended): no polling, no data. */
+  function signedOut(message) {
+    currentUser = null;
+    clearInterval(pollTimer);
+    pollTimer = null;
+    activeId = null;
+    activeClaim = null;
+    renderProfile();
+    $('feed').innerHTML = '';
+    $('claimCount').textContent = '–';
+    show('viewUpload');
+    ['overrideModal', 'requestModal', 'resetModal'].forEach(id => $(id).classList.add('hidden'));
+    showLogin(message);
+  }
+
+  async function signIn(event) {
+    event.preventDefault();
+    const username = $('loginUser').value.trim();
+    const password = $('loginPassword').value;
+    if (!username || !password) return;
+    $('loginSubmit').disabled = true;
+    try {
+      const r = await fetch('api/login', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, REQUEST_HEADERS),
+        body: JSON.stringify({ username, password })
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || !data.signed_in) {
+        $('loginPassword').value = '';
+        $('loginError').textContent = data.detail || 'Sign-in failed. Try again.';
+        $('loginError').classList.remove('hidden');
+        $('loginPassword').focus();
+        return;
+      }
+      $('loginPassword').value = '';
+      hideLogin();
+      await startConsole();
+    } catch (e) {
+      $('loginError').textContent = 'Cannot reach the claim service. Check the server is running.';
+      $('loginError').classList.remove('hidden');
+    } finally {
+      $('loginSubmit').disabled = false;
+    }
+  }
+
+  async function signOut() {
+    try {
+      await fetch('api/logout', { method: 'POST', credentials: 'same-origin', headers: REQUEST_HEADERS });
+    } catch (e) {
+      /* Offline: the page still forgets the session. */
+    }
+    signedOut('');
   }
 
   function whatsappBadge(p) {
@@ -323,24 +334,21 @@
   
   /* ---------- feed ---------- */
   async function pollClaims() {
+    if (!currentUser) return [];
     try {
-      /* Never waits for the token: the form stays up until it is entered. */
-      const r = await adminFetch('api/claims', null, false);
+      const r = await api('api/claims');
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const claims = normalise(await r.json());
       renderFeed(claims);          /* sorts newest-first in place */
       return claims;
     } catch (e) {
-      if (isTokenError(e)) {
-        showTokenForm(/rejected/.test(e.message) ? TOKEN_REJECTED : TOKEN_ASK);
-        return [];
-      }
+      if (isSignedOut(e)) return [];
       $('feed').innerHTML =
         '<div class="feed-empty">Cannot reach the claim service. Check the server is running.</div>';
       return [];
     }
   }
-  
+
   function summarise(c) {
     if (c.status === 'rejected') {
       return c.stopped_at === 'duplicate'
@@ -364,7 +372,16 @@
     return '<span class="pill pill-mute">' + esc(s || 'unknown') + '</span>';
   }
 
+  /* An assessor's decision outranks the system's. */
+  const FINAL_PILLS = {
+    approved: ['pill-ok', 'approved'],
+    rejected: ['pill-danger', 'rejected'],
+    more_info: ['pill-warn', 'info requested']
+  };
+
   function claimPill(c) {
+    const final = c && c.final_decision && FINAL_PILLS[c.final_decision.value];
+    if (final) return `<span class="pill ${final[0]}">${final[1]}</span>`;
     if (c && c.status === 'error') return statusPill('error');
     if (!c || !c.decision) return statusPill(c && c.status);
     if (c.decision === 'auto_assess') return '<span class="pill pill-ok">auto-assessed</span>';
@@ -391,6 +408,9 @@
         </div>
         <span class="claim-time">${esc(relTime(c.created_at))}${c.plate ? ` · <span class="mono">${esc(c.plate)}</span>` : ''}</span>
         <p class="claim-sum">${esc(summarise(c))}</p>
+        ${c.info_request && c.info_request.received
+          ? '<div class="claim-source"><span class="pill pill-ok docs-received">Documents received</span></div>'
+          : ''}
         ${c.source === 'whatsapp' ? `<div class="claim-source">${whatsappBadge(c)}</div>` : ''}
       </div>`).join('');
   
@@ -401,12 +421,12 @@
   
   async function openClaim(id) {
     try {
-      const r = await adminFetch('api/claims/' + encodeURIComponent(id));
+      const r = await api('api/claims/' + encodeURIComponent(id));
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const data = await r.json();
       render(normalise([data])[0] || data);
     } catch (e) {
-      if (isTokenError(e)) return;
+      if (isSignedOut(e)) return;
       notify('Could not load claim ' + id + '. Click it again to retry.');
     }
   }
@@ -505,7 +525,8 @@
       const timeLabel = at && isFinite(at.getTime())
         ? at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         : '';
-      sub = `System: ${systemTitle}  →  ${finalLabel} by ${finalDecision.actor || 'assessor'}${timeLabel ? ', ' + timeLabel : ''}`;
+      const by = finalDecision.actor_name || finalDecision.actor || 'assessor';
+      sub = `System: ${systemTitle}  →  ${finalLabel} by ${by}${timeLabel ? ', ' + timeLabel : ''}`;
       band.className = 'verdict ' + (
         finalDecision.value === 'approved' ? 'is-ok'
           : finalDecision.value === 'rejected' ? 'is-rejected' : 'is-error'
@@ -541,12 +562,14 @@
       $('undetermined').innerHTML = '';
       return;
     }
-    $('undetermined').innerHTML = items.map(item => `
-      <div class="undetermined-row">
-        <b>${esc(item.item || 'Unknown item')}</b>
-        <span class="undetermined-reason">${esc(item.reason || '')}</span>
-        ${item.impact ? `<span class="undetermined-impact">· ${esc(item.impact)}</span>` : ''}
-      </div>`).join('');
+    $('undeterminedLabel').textContent = `Could not determine (${items.length})`;
+    $('undetermined').innerHTML = items.map(item => `<li>
+        <details>
+          <summary>${esc(item.item || 'Unknown item')}</summary>
+          <p class="undetermined-reason">${esc(item.reason || 'no reason recorded')}</p>
+          ${item.impact ? `<p class="undetermined-impact">Impact: ${esc(item.impact)}</p>` : ''}
+        </details>
+      </li>`).join('');
     card.classList.remove('hidden');
   }
 
@@ -556,6 +579,7 @@
     assessor_assigned: 'Assessor assigned',
     survey_scheduled: 'Survey scheduled',
     documents_added: 'Documents added',
+    documents_received: 'Requested documents received',
     more_info_requested: 'More information requested',
     approved: 'Approved',
     rejected: 'Not approved',
@@ -599,9 +623,18 @@
       $('registry').innerHTML = '<p class="empty">Not checked — no registration number was confirmed or read for this claim.</p>';
     }
     const a = p.assessor || {};
+    const req = p.info_request;
+    const requested = req
+      ? esc(req.label + (req.comment ? ' — ' + req.comment : '')) + ' · ' + (req.received
+        ? '<span class="ok">received</span>'
+        : esc(req.delivered || p.source !== 'whatsapp'
+          ? 'waiting for the customer'
+          : 'not yet sent: outside the 24-hour window, sent when the customer next writes'))
+      : null;
     $('caseDetails').innerHTML = kv([
       ['Tracking ID', `<span class="mono">${esc(p.tracking_id || p.claim_id)}</span>`],
       ['Assessor', a.name ? esc(a.name + (a.city ? ' · ' + a.city : '') + (a.phone ? ' · ' + a.phone : '')) : 'not assigned'],
+      ['Requested', requested],
       ['Next step', esc(p.next_step || '')]
     ]);
     const events = list(p.events);
@@ -869,44 +902,49 @@
   }
   
   function renderEvidence(p) {
-    const f = (p.forensics || []).filter(x => x && x.check === 'ela');
-    const box = $('evidence'), sw = $('imgSwitch');
-    const originals = f.map(x => x.original_url).filter(Boolean);
-    const heats = f.map(x => x.heatmap_url).filter(Boolean);
-  
-    if (!originals.length && !heats.length) {
-      sw.classList.add('hidden');
-      const ran = (p.timings || []).some(t => t && t.stage === 'stage2_deep_forensics');
+    const box = $('evidence');
+    const seen = new Set();
+    const items = [];
+    list(p.classifications).forEach(c => {
+      if (!c || !c.url || seen.has(c.url)) return;
+      seen.add(c.url);
+      items.push({
+        url: c.url,
+        caption: c.doc_type === 'vehicle_photo' || !c.doc_type
+          ? 'Vehicle photo' : (DOCUMENT_LABELS[c.doc_type] || human(c.doc_type))
+      });
+    });
+    list(p.added_photos).forEach(a => {
+      if (a && a.url) items.push({ url: a.url, caption: 'Sent on request · ' + (a.requested || 'photo') });
+    });
+    if (!items.length) {
       const why = stoppedText(p);
-      box.innerHTML = ran
-        ? '<p class="empty">No photo was eligible for error-level analysis (JPEG vehicle photos only).</p>'
-        : `<p class="empty">Image forensics not run${why ? ' — ' + esc(why) : ''}.</p>`;
+      box.innerHTML = `<p class="empty">No images are stored for this claim${why ? ' — ' + esc(why) : ''}.</p>`;
       return;
     }
-  
-    const draw = urls => {
-      box.innerHTML = urls.map(u => `<img src="${esc(u)}" alt="Claim evidence">`).join('');
-    };
-    draw(originals.length ? originals : heats);
-  
-    if (heats.length && originals.length) {
-      sw.classList.remove('hidden');
-      sw.querySelectorAll('button').forEach(b => {
-        b.onclick = () => {
-          sw.querySelectorAll('button').forEach(x => x.classList.remove('is-active'));
-          b.classList.add('is-active');
-          draw(b.dataset.mode === 'heatmap' ? heats : originals);
-        };
-      });
-    } else {
-      sw.classList.add('hidden');
-    }
+    box.innerHTML = items.map(item => `<figure class="evidence-item">
+        <img src="${esc(item.url)}" alt="${esc(item.caption)}">
+        <figcaption>${esc(item.caption)}</figcaption>
+      </figure>`).join('');
   }
-  
+
+  /* Faint backgrounds by verdict: red for a problem, green for agreement,
+     grey for information. */
+  function tone(verdict) {
+    const v = String(verdict || '').toLowerCase();
+    if (['high', 'medium', 'suspicious'].includes(v)) return 'bad';
+    if (['match', 'clean', 'pass'].includes(v)) return 'good';
+    return 'neutral';
+  }
+
   function renderForensics(p) {
     const items = Array.isArray(p.forensics) ? p.forensics : [];
     if (!items.length) {
-      $('forensics').innerHTML = '<p class="empty">No forensic checks were run.</p>';
+      const ran = (p.timings || []).some(t => t && t.stage === 'stage2_deep_forensics');
+      const why = stoppedText(p);
+      $('forensics').innerHTML = ran
+        ? '<p class="empty">No forensic findings: no photo carried capture metadata, and no other check reported.</p>'
+        : `<p class="empty">Image forensics not run${why ? ' — ' + esc(why) : ''}.</p>`;
       return;
     }
     $('forensics').innerHTML = items.map(f => {
@@ -919,7 +957,7 @@
       const score = typeof f.score === 'number' && isFinite(f.score)
         ? `<span class="forensic-score">score ${f.score.toFixed(2)}</span>`
         : '';
-      return `<div class="row">
+      return `<div class="row tint-${tone(f.verdict)}">
         <div class="row-top"><span class="row-title">${esc(human(f.check))}</span>
           <span class="forensic-verdict">${score}${verdictPill(f.verdict)}</span></div>
         <p class="row-text">${esc(f.detail || '')}</p>${geo}</div>`;
@@ -942,12 +980,35 @@
     return '';
   }
 
-  /* Information about the claim that is never a flag (e.g. the driver is
-     not the registered owner, which is normal). */
+  /* Each flag, note and passed check as rows of {source, value} and a
+     verdict; the one-line explanation stays beneath in small text. */
+  function comparisonHtml(item, toneName) {
+    const c = item && item.comparison;
+    if (!c || !list(c.rows).length) return '';
+    return `<dl class="compare">${list(c.rows).map(row =>
+        `<dt>${esc(row.source)}</dt><dd>${esc(row.value)}</dd>`).join('')}</dl>
+      <div class="compare-verdict is-${toneName}">${esc(c.verdict || '')}</div>`;
+  }
+
+  function checkRow(item, kind) {
+    const severity = String(item.severity || '').toLowerCase();
+    const toneName = kind === 'pass' ? 'good' : kind === 'note' ? 'neutral' : tone(severity);
+    const pill = kind === 'pass' ? ''
+      : kind === 'note' ? '<span class="pill pill-mute">info</span>' : sevPill(item.severity);
+    const compare = comparisonHtml(item, toneName);
+    const explanation = item.message
+      ? `<p class="${compare ? 'row-note' : 'row-text'}">${esc(item.message)}</p>` : '';
+    return `<div class="row check tint-${toneName}">
+      <div class="row-top"><span class="row-title">${esc(item.title || human(item.rule))}</span>${pill}</div>
+      ${compare}${explanation}</div>`;
+  }
+
   function notesHtml(p) {
-    return list(p.notes).filter(n => n && typeof n === 'object').map(n => `<div class="row">
-        <div class="row-top"><span class="row-title">${esc(human(n.rule))}</span><span class="pill pill-mute">info</span></div>
-        <p class="row-text">${esc(n.message || '')}</p></div>`).join('');
+    return list(p.notes).filter(n => n && typeof n === 'object').map(n => checkRow(n, 'note')).join('');
+  }
+
+  function checksHtml(p) {
+    return list(p.checks).filter(c => c && typeof c === 'object').map(c => checkRow(c, 'pass')).join('');
   }
 
   function renderFlags(p) {
@@ -967,20 +1028,13 @@
             : 'No cross-document checks — no document fields were read.';
         }
       }
-      $('flags').innerHTML = `<p class="empty">${esc(text)}</p>` + notesHtml(p);
+      $('flags').innerHTML = `<p class="empty">${esc(text)}</p>` + notesHtml(p) + checksHtml(p);
       return;
     }
-    $('flags').innerHTML = (notice ? `<p class="empty">${esc(notice)}</p>` : '') + notesHtml(p) + flags.map(f => {
-      const ev = Array.isArray(f.evidence) ? f.evidence : [];
-      const chips = ev.length
-        ? `<div class="chips">${ev.map(e => `<span class="chip">${esc(human(e))}</span>`).join('')}</div>`
-        : '';
-      return `<div class="row">
-        <div class="row-top"><span class="row-title">${esc(human(f.rule))}</span>${sevPill(f.severity)}</div>
-        <p class="row-text">${esc(f.message || '')}</p>${chips}</div>`;
-    }).join('');
+    $('flags').innerHTML = (notice ? `<p class="empty">${esc(notice)}</p>` : '')
+      + flags.map(f => checkRow(f, 'flag')).join('') + notesHtml(p) + checksHtml(p);
   }
-  
+
   function fieldsNotice(p) {
     const ex = extractionOf(p);
     if (!ex) return '';
@@ -1132,7 +1186,7 @@
       return `<div class="audit-row">
         <span class="audit-time">${esc(timestamp)}</span>
         <div class="audit-main">
-          <b>${esc(row.actor || 'System')}</b>
+          <b>${esc(row.actor_name || row.actor || 'System')}</b>
           <span class="audit-action">${esc(human(row.action))} · ${esc(row.target || 'claim')}</span>
           <span class="audit-change">${esc(auditState(row, row.before))} → ${esc(auditState(row, row.after))}</span>
           <span class="audit-reason">${esc(row.reason || '')}</span>
@@ -1143,7 +1197,11 @@
   }
 
   function openOverride(action, target, value) {
-    if (!activeClaim || !assessorName()) return;
+    if (!activeClaim || !currentUser) return;
+    if (action === 'set_decision' && value === 'more_info') {
+      openRequest();
+      return;
+    }
     const labels = {
       confirm_damage: 'Confirm damage finding',
       reject_damage: 'Reject damage finding',
@@ -1179,13 +1237,12 @@
     button.disabled = true;
     $('overrideError').classList.add('hidden');
     try {
-      const r = await adminFetch(
+      const r = await api(
         'api/claims/' + encodeURIComponent(activeClaim.claim_id) + '/override',
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            actor: assessorName(),
             action: pendingOverride.action,
             target: pendingOverride.target,
             value: pendingOverride.value,
@@ -1203,14 +1260,66 @@
       }
       const updated = await r.json();
       closeOverride();
-      render(updated);
+      render(updated);          /* re-polls the feed, so its card changes now */
+      refreshProfile();
     } catch (e) {
+      if (isSignedOut(e)) return;
       $('overrideError').textContent = e.message || 'Override failed';
       $('overrideError').classList.remove('hidden');
       button.disabled = false;
     }
   }
   
+  /* ---------- request information ---------- */
+  function openRequest() {
+    if (!activeClaim || !currentUser) return;
+    $('requestModalSummary').textContent = activeClaim.source === 'whatsapp'
+      ? `Sent to the customer on WhatsApp for ${activeClaim.claim_id}. Outside the 24-hour window it is sent the next time they write.`
+      : `${activeClaim.claim_id} was uploaded in the console, so nothing is sent; the request is recorded on the claim.`;
+    $('requestItem').value = '';
+    $('requestComment').value = '';
+    $('requestError').classList.add('hidden');
+    $('requestSubmit').disabled = true;
+    $('requestModal').classList.remove('hidden');
+    $('requestItem').focus();
+  }
+
+  function closeRequest() {
+    $('requestModal').classList.add('hidden');
+  }
+
+  function requestReady() {
+    const item = $('requestItem').value;
+    return Boolean(item) && (item !== 'other' || Boolean($('requestComment').value.trim()));
+  }
+
+  async function submitRequest() {
+    if (!activeClaim || !requestReady()) return;
+    $('requestSubmit').disabled = true;
+    $('requestError').classList.add('hidden');
+    try {
+      const r = await api('api/claims/' + encodeURIComponent(activeClaim.claim_id) + '/request-info', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ item: $('requestItem').value, comment: $('requestComment').value.trim() })
+      });
+      if (!r.ok) {
+        let message = 'HTTP ' + r.status;
+        try { message = (await r.json()).detail || message; } catch (e) {}
+        throw new Error(message);
+      }
+      const updated = await r.json();
+      closeRequest();
+      render(updated);
+      refreshProfile();
+    } catch (e) {
+      if (isSignedOut(e)) return;
+      $('requestError').textContent = e.message || 'Request failed';
+      $('requestError').classList.remove('hidden');
+      $('requestSubmit').disabled = !requestReady();
+    }
+  }
+
   /* ---------- upload ---------- */
   function wireDrop(el) {
     const kind = el.dataset.kind;
@@ -1281,7 +1390,7 @@
     staged.photos.forEach(f => fd.append('photos', f, f.name));
     startWorking();
     try {
-      const r = await adminFetch('api/analyze', { method: 'POST', body: fd });
+      const r = await api('api/analyze', { method: 'POST', body: fd });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const p = await r.json();
       clearInterval(stageTimer);
@@ -1290,18 +1399,25 @@
     } catch (e) {
       clearInterval(stageTimer);
       show('viewUpload');
-      $('uploadNote').textContent = isTokenError(e)
-        ? 'Analysis needs a valid admin token. Enter it in the claim feed panel.'
-        : 'Analysis failed: ' + e.message + '. Check the server and try again.';
+      if (isSignedOut(e)) return;
+      $('uploadNote').textContent = 'Analysis failed: ' + e.message + '. Check the server and try again.';
     }
   }
   
   /* ---------- boot ---------- */
   document.querySelectorAll('.drop').forEach(wireDrop);
-  $('assessorName').value = loadAssessorName();
-  $('assessorName').addEventListener('input', event => {
-    saveAssessorName(event.target.value);
-    updateOverrideControls();
+  $('loginForm').addEventListener('submit', signIn);
+  $('btnLogout').onclick = signOut;
+  $('requestItem').addEventListener('change', () => {
+    $('requestSubmit').disabled = !requestReady();
+  });
+  $('requestComment').addEventListener('input', () => {
+    $('requestSubmit').disabled = !requestReady();
+  });
+  $('requestCancel').onclick = closeRequest;
+  $('requestSubmit').onclick = submitRequest;
+  $('requestModal').addEventListener('click', event => {
+    if (event.target === $('requestModal')) closeRequest();
   });
   document.addEventListener('click', event => {
     const control = event.target.closest('button[data-action]');
@@ -1359,7 +1475,7 @@
     if ($('resetInput').value.trim() !== 'RESET') return;
     $('resetConfirm').disabled = true;
     try {
-      const r = await adminFetch('api/demo/reset', { method: 'POST' });
+      const r = await api('api/demo/reset', { method: 'POST' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       closeReset();
       activeId = null;
@@ -1367,7 +1483,9 @@
       resetStaged();
       show('viewUpload');
       pollClaims();
+      refreshProfile();
     } catch (e) {
+      if (isSignedOut(e)) return;
       $('resetError').textContent = 'Reset failed: ' + (e.message || 'unknown error');
       $('resetError').classList.remove('hidden');
       $('resetConfirm').disabled = false;
@@ -1377,10 +1495,20 @@
   health();
   setInterval(health, 15000);
   
-  /* Open on the newest claim if one exists. Only the first poll auto-opens —
-     the interval below must never steal focus from a claim being read. */
-  (async () => {
-    const claims = await pollClaims();   /* shows the token form when there is none */
-    if (claims.length) openClaim(claims[0].claim_id);
-    setInterval(() => pollClaims(), 3000);
-  })();
+  /* Signed in: the profile, then the feed, opening the newest claim. Only the
+     first poll auto-opens — the interval must never steal focus from a claim
+     being read. Signed out: the sign-in screen, and no request is made. */
+  async function startConsole() {
+    if (!await refreshProfile()) {
+      showLogin('');
+      return;
+    }
+    hideLogin();
+    updateOverrideControls();
+    const claims = await pollClaims();
+    if (claims.length && !activeId) openClaim(claims[0].claim_id);
+    clearInterval(pollTimer);
+    pollTimer = setInterval(() => pollClaims(), 3000);
+  }
+
+  startConsole();

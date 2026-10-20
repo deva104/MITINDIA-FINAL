@@ -613,16 +613,25 @@ def check_duplicates(photo_paths, conn, claim_id=None):
     return results
 
 
+def ela_enabled():
+    """ELA is off unless ELA_ENABLED=true: calibration found no threshold that
+    separates edited photos from genuine ones, so it only added noise."""
+    return os.getenv("ELA_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
+
 def run_deep_forensics(photo_paths, conn=None, fields=None):
-    """ELA + EXIF + AI-generation signal. No duplicate check."""
+    """EXIF + AI-generation signal (+ ELA when ELA_ENABLED). No duplicate check.
+    A photo with no EXIF gets no EXIF entry: stripped metadata is normal on
+    WhatsApp and says nothing about the claim."""
     results = []
+    run_ela_check = ela_enabled()
     try:
         for path in photo_paths or []:
             name = os.path.basename(path)
             try:
                 data, image, unique_id = _open_image(path)
             except Exception as e:
-                for check in ("ela", "exif"):
+                for check in ("ela", "exif") if run_ela_check else ("exif",):
                     results.append(_result(check, "fail", f"{name}: could not open image - {e}"))
                 results.append(_result(
                     "ai_generated",
@@ -633,6 +642,8 @@ def run_deep_forensics(photo_paths, conn=None, fields=None):
 
             # 1. ELA - only meaningful on JPEG, which carries compression history
             try:
+                if not run_ela_check:
+                    raise _Skipped()
                 original_url = None
                 try:
                     original_url = _save_original(image, unique_id)
@@ -664,6 +675,8 @@ def run_deep_forensics(photo_paths, conn=None, fields=None):
                 entry["original_url"] = original_url
                 entry["source_photo"] = name
                 results.append(entry)
+            except _Skipped:
+                pass
             except Exception as e:
                 results.append(_result("ela", "fail", f"{name}: ELA failed - {e}"))
 
@@ -671,8 +684,7 @@ def run_deep_forensics(photo_paths, conn=None, fields=None):
             try:
                 exif_data, notes, lat, lon = extract_exif(image)
                 if not exif_data:
-                    verdict = "unverifiable"
-                    detail = MISSING_EXIF_DETAIL
+                    raise _Skipped()
                 else:
                     accident_date, _ = parse_date(_field_value(fields, "accident_date"))
                     capture_date = _capture_date(exif_data)
@@ -712,6 +724,8 @@ def run_deep_forensics(photo_paths, conn=None, fields=None):
                 entry["lat"] = lat
                 entry["lon"] = lon
                 results.append(entry)
+            except _Skipped:
+                pass
             except Exception as e:
                 results.append(_result("exif", "fail", f"{name}: EXIF check failed - {e}"))
 
@@ -734,8 +748,12 @@ def run_deep_forensics(photo_paths, conn=None, fields=None):
                 entry["source_photo"] = name
                 results.append(entry)
     except Exception as e:
-        results.append(_result("ela", "fail", f"forensics aborted - {e}"))
+        results.append(_result("forensics", "fail", f"forensics aborted - {e}"))
     return results
+
+
+class _Skipped(Exception):
+    """A check that does not apply to this photo: no entry at all."""
 
 
 def run_forensics(photo_paths, conn):

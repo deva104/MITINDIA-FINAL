@@ -137,7 +137,10 @@ token; see its docstring.
 | Name | What it does |
 |---|---|
 | `DATABASE_URL` | Postgres connection string (Neon in production). Unset: local SQLite. |
-| `ADMIN_TOKEN` | Required by the console and every claim, upload, override, reset and admin endpoint, and the key for signed media links. Unset: all of them refuse. |
+| `CONSOLE_USERS` | Console sign-in: a JSON list of `{username, display_name, city, password_hash}`. Make an entry with `python scripts/hash_password.py --json <user> "<name>" <city>`. Without it nobody can sign in. |
+| `SESSION_SECRET` | Signs console session cookies. Unset: derived from `ADMIN_TOKEN`. |
+| `ADMIN_TOKEN` | For scripts (seed_demo): accepted by every claim, upload, override, reset and admin endpoint in place of a session. Also the key for signed media links. |
+| `ELA_ENABLED` | `true` turns error-level analysis back on. Default `false`. |
 | `GROQ_API_KEY`, `GROQ_API_KEY_<suffix>` | Groq keys; the bare name is used first, then suffixes alphabetically. |
 | `GEMINI_API_KEY`, `GEMINI_API_KEY_<suffix>` | Gemini keys, pooled the same way. |
 | `OPENROUTER_API_KEY`, `OPENROUTER_API_KEY_<suffix>` | OpenRouter keys, pooled the same way. |

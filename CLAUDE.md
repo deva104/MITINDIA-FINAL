@@ -53,9 +53,11 @@ Pipeline (`main.analyse_claim`, shared by `/api/analyze` and WhatsApp):
      defaulted**. When the model omits it, the finding is kept as
      unconfirmed and listed under undetermined.
 4. **Stage 2: forensics.**
-   - ELA is **informational only**. Calibration found no threshold that
-     separates genuine from edited photos; see `forensics.py`.
-   - EXIF verdicts, including "unverifiable".
+   - ELA is **off** (`ELA_ENABLED=false`): calibration found no threshold
+     that separates genuine from edited photos. The code and its calibration
+     tests stay behind the flag; the console shows no ELA card or heatmap.
+   - EXIF only for a photo that carried metadata: stripped metadata (normal
+     on WhatsApp) gets no entry and no undetermined item.
    - The Sightengine AI-generation check, a signal only, cached.
 5. **Stage 3: rules.**
    - `rules.run_rules` runs the cross-document checks.
@@ -178,20 +180,37 @@ Runtime:
     limited it sleeps until the soonest one returns (at most 60 s a step).
 - **Access.** Claim data is personal data: names, licence and chassis
   numbers, phone numbers, document photos.
-  - These require the `X-Admin-Token` header to equal `ADMIN_TOKEN` (401
-    otherwise, and always when `ADMIN_TOKEN` is unset): `/api/claims`,
-    `/api/claims/{id}`, `/api/analyze`, `/api/storage`, `/api/demo/reset`,
-    `/api/claims/{id}/override`, `/api/whatsapp/subscribe`,
-    `/api/whatsapp/status`.
+  - These require a signed-in console user (session cookie) or the
+    `X-Admin-Token` header equal to `ADMIN_TOKEN` (401 otherwise):
+    `/api/claims`, `/api/claims/{id}`, `/api/analyze`, `/api/storage`,
+    `/api/demo/reset`, `/api/claims/{id}/override`,
+    `/api/claims/{id}/request-info`, `/api/me`, `/api/whatsapp/subscribe`,
+    `/api/whatsapp/status`. Scripts (seed_demo) use the token and name the
+    actor; a signed-in user is always the actor, whatever the body says.
+  - **Console sign-in** (`auth.py`). Users come from `CONSOLE_USERS`, a JSON
+    list of `{username, display_name, city, password_hash}`; hashes are
+    PBKDF2-SHA256 with a salt per user (`python scripts/hash_password.py`,
+    or `--json <user> <name> <city>` for a whole entry; it reads the password
+    without echo). The session cookie `claimpilot_session` is signed with
+    `SESSION_SECRET` (else derived from `ADMIN_TOKEN`), HttpOnly, Secure,
+    SameSite=Lax, 12 hours. A mutating request signed in by cookie must carry
+    `X-Requested-With: InsureIT` (403 otherwise). CORS never allows
+    credentials. Five failed sign-ins from one address in 10 minutes lock it
+    for 10 minutes (in memory; the last `X-Forwarded-For` entry is the
+    address). Logout clears the cookie and this process refuses it until it
+    expires. `/api/login` and `/api/session` answer 200 with `signed_in`
+    (and `locked`, `retry_after`), so the browser logs no error for a wrong
+    password. Passwords, hashes, cookies and user names are never logged.
   - `/media/{id}` needs a signature, not the header, because `<img>` cannot
     send one. Claim responses carry `?exp=…&sig=…` (HMAC from `ADMIN_TOKEN`,
     valid 6–7 h, `main.sign_media_urls`); anything else gets a 403. The cache
     header is `private`.
   - Open by design: `/api/health` (configuration and labels only) and
     `/webhook`.
-  - The console asks for the token once at load, again after a 401, and
-    keeps it in localStorage. A dismissed prompt is not repeated by the
-    3-second poll; the feed shows an "Enter admin token" button instead.
+  - The console shows a sign-in screen until `/api/session` says signed
+    in, then the profile (display name, city, claims decided) and Sign out.
+    It stops polling when signed out or on a 401. There is no token form
+    and no free-text assessor name.
 - **Webhook signature.** With `WHATSAPP_APP_SECRET` set (Meta app settings,
   App secret), `POST /webhook` must carry a valid `X-Hub-Signature-256`
   (HMAC-SHA256 of the raw body) or it gets a 403. Unset: a WARNING per
@@ -243,6 +262,18 @@ Runtime:
     assessment reused, a `documents_added` event).
   - A document already on the claim (by sha256, `claim_shas` in the session)
     is not attached again.
+  - **Request info** (`/api/claims/{id}/request-info`, console dialog): one
+    item (`whatsapp.REQUEST_ITEMS`: RC, licence, claim form, clearer damage
+    photos, number plate photo, other) and a comment. It is recorded as the
+    `more_info` decision with `requested` and `comment`, a
+    `more_info_requested` event, and sent inside the 24h window; outside it
+    the audit says not sent and the request goes out the next time the
+    customer writes. The next item the customer sends is classified: the
+    requested kind is attached (documents: extraction and rules again;
+    photos: kept on the claim as `added_photos`, damage grading not re-run),
+    with a `documents_received` event and "Documents received" on the feed
+    card; anything else gets "That looks like a <type>, but your assessor
+    asked for <requested>. Please send <requested>."
   - A document for a claim in `more_info` asks "Add this to CLM-…?" first.
 - **Track:** a tracking ID (any case, spaces allowed) or ALL, only this
   number's claims; a tracking ID at the menu or on an open claim is answered
@@ -264,6 +295,16 @@ Runtime:
   in the photos, the one matching the registration is chosen
   (`selected_vehicle_group`); the customer is asked only when none clearly
   matches.
+- **Feed.** `/api/claims` adds each claim's `final_decision` and
+  `info_request` from its audit trail (cached in `main.FEED_STATE`, dropped on
+  every override, request and received document; one worker), so a card
+  shows the assessor's decision as soon as the override returns.
+- **Console checks.** Every flag and note carries `comparison`: rows of
+  `{source, value}` and a verdict (MISMATCH, EXPIRED, OUTSIDE POLICY, …;
+  `rules.comparison`, also filled for claims saved earlier). Checks that ran
+  and agreed come back as `checks` (MATCH, VALID, COVERED;
+  `rules.passed_checks`). Cards are tinted faint red (HIGH, MEDIUM,
+  suspicious), green (match, clean) or grey (information).
 - **Assessors and timeline.** Six mock assessors (`assessors.py`), assigned
   by registry city, round robin, phone `ASSESSOR_CONTACT`. `claim_events`
   holds the timeline (submitted, assessor_assigned, survey_scheduled,

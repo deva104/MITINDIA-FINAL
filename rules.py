@@ -454,9 +454,20 @@ def registry_flags(fields, registry, seen=None, accident_date=None):
     mismatch = appearance_mismatch(registry, seen)
     if mismatch:
         severity, message = mismatch
+        shown = " ".join(str(part) for part in (
+            (seen or {}).get("colour"), (seen or {}).get("make_model"),
+            (seen or {}).get("body_type")) if part)
+        on_record = " ".join(str(part) for part in (
+            registry.get("colour"), registry.get("make"), registry.get("model"),
+            registry.get("body_type")) if part)
         flags.append({
             "rule": "registry_vehicle_mismatch", "severity": severity, "message": message,
             "evidence": ["photos", "registry.make", "registry.colour", "registry.body_type"],
+            "comparison": {
+                "rows": [{"source": "Photos show", "value": shown or "not described"},
+                         {"source": "Registered vehicle (VAHAN)", "value": on_record}],
+                "verdict": "MISMATCH" if severity == "HIGH" else "NOT CONFIRMED",
+            },
         })
     if registry.get("policy_type") == "third_party_only":
         flags.append({
@@ -721,7 +732,7 @@ def run_rules(fields, damage, photo_count: int = 0, is_vehicle=None, photos=None
             "evidence": [photo, score],
         })
 
-    return flags
+    return add_comparisons(flags, fields, registry)
 
 
 def reported_confidence(item):
@@ -780,6 +791,194 @@ def identity_notes(fields):
             "evidence": ["holder_name_dl", "owner_name_rc"],
         })
     return notes
+
+
+# --- comparisons: every flag and note as {source, value} rows plus a verdict --
+
+SOURCE_LABELS = {
+    "insured_name_claim_form": "Claim form name",
+    "driver_name_claim_form": "Claim form driver",
+    "owner_name_rc": "RC owner",
+    "holder_name_dl": "Licence holder",
+    "registration_number_claim_form": "Claim form registration",
+    "registration_number_rc": "RC registration",
+    "dl_expiry_date": "Licence valid until",
+    "accident_date": "Accident date",
+    "policy_start_date": "Policy start (documents)",
+    "policy_end_date": "Policy end (documents)",
+    "accident_description": "Accident description",
+    "registry.plate": "Registered plate (VAHAN)",
+    "registry.owner_name": "Registered owner (VAHAN)",
+}
+# The verdict a flag's rule stands for; anything else is MISMATCH.
+RULE_VERDICTS = {
+    "dl_expired_at_loss": "EXPIRED",
+    "policy_not_active": "OUTSIDE POLICY",
+    "policy_third_party_only": "NOT COVERED",
+    "date_undetermined": "UNREADABLE",
+    "no_damage_detected": "NO DAMAGE FOUND",
+    "not_a_vehicle": "NOT A VEHICLE",
+    "vehicle_mismatch": "DIFFERENT VEHICLES",
+    "ai_generated_photo": "SUSPICIOUS",
+    "duplicate_photo_in_bundle": "ALREADY CLAIMED",
+    "other_vehicle_in_photos": "NOTE",
+    "driver_not_owner": "DIFFERENT (ALLOWED)",
+}
+
+
+def _value(fields, registry, key):
+    if key.startswith("registry."):
+        return (registry or {}).get(key.split(".", 1)[1])
+    return get_field(fields, key)
+
+
+def _rows(fields, registry, keys):
+    return [{"source": SOURCE_LABELS.get(key, key), "value": _value(fields, registry, key)}
+            for key in keys]
+
+
+def _period(start, end, insurer=None):
+    text = f"{start or '?'} to {end or '?'}"
+    return f"{text} · {insurer}" if insurer else text
+
+
+def comparison(item, fields, registry=None):
+    """{rows: [{source, value}], verdict} for a flag or note, from its rule,
+    its evidence and the fields; None when nothing can be compared."""
+    rule = item.get("rule")
+    evidence = [str(value) for value in item.get("evidence") or []]
+    verdict = RULE_VERDICTS.get(rule)
+    if verdict is None:
+        verdict = "PARTIAL MATCH" if str(rule or "").endswith("_partial_match") else "MISMATCH"
+    registry = registry or {}
+    rows = None
+    if rule in ("policy_not_active",):
+        if "registry.policy_start" in evidence:
+            period = _period(registry.get("policy_start"), registry.get("policy_end"),
+                             registry.get("insurer"))
+            rows = [{"source": "Accident date", "value": get_field(fields, "accident_date")},
+                    {"source": "Registered policy period (VAHAN)", "value": period}]
+        else:
+            rows = [{"source": "Accident date", "value": get_field(fields, "accident_date")},
+                    {"source": "Policy period (documents)", "value": _period(
+                        get_field(fields, "policy_start_date"),
+                        get_field(fields, "policy_end_date"))}]
+    elif rule == "policy_third_party_only":
+        rows = [{"source": "Registered policy (VAHAN)", "value": "Third party only"},
+                {"source": "This claim", "value": "Own damage"}]
+    elif rule == "vehicle_identity_mismatch" and len(evidence) >= 3:
+        photo = evidence[0].replace("\\", "/").rsplit("/", 1)[-1]
+        rows = [{"source": f"Plate in {photo}", "value": evidence[1]},
+                {"source": "RC registration", "value": evidence[2]}]
+    elif rule == "ai_generated_photo" and len(evidence) >= 2:
+        rows = [{"source": "Photo", "value": evidence[0]},
+                {"source": "AI-generation score", "value": evidence[1]}]
+    elif rule in ("vehicle_mismatch", "other_vehicle_in_photos"):
+        rows = [{"source": f"Vehicle {index}", "value": label}
+                for index, label in enumerate(evidence, 1)]
+    elif rule == "duplicate_photo_in_bundle":
+        rows = [{"source": "Excluded photo", "value": name} for name in evidence]
+    elif rule == "damage_narrative_mismatch":
+        parts = [value for value in evidence if value != "accident_description"]
+        rows = [{"source": "Accident description",
+                 "value": get_field(fields, "accident_description")},
+                {"source": "Damage found", "value": ", ".join(parts)}]
+    elif rule == "no_damage_detected":
+        rows = [{"source": "Visible damage in photos", "value": "none found"}]
+    elif rule == "not_a_vehicle":
+        rows = [{"source": "Vehicle in photos", "value": "none"}]
+    elif evidence and all(key in SOURCE_LABELS or key.startswith("registry.")
+                          for key in evidence):
+        rows = _rows(fields, registry, [key for key in evidence if key in SOURCE_LABELS])
+    if not rows:
+        return None
+    for row in rows:
+        row["value"] = "not read" if row["value"] in (None, "") else str(row["value"])
+    return {"rows": rows, "verdict": verdict}
+
+
+def add_comparisons(items, fields, registry=None):
+    """Each flag or note carries its comparison; one made at creation is kept."""
+    for item in items or []:
+        if isinstance(item, dict) and not item.get("comparison"):
+            built = comparison(item, fields, registry)
+            if built:
+                item["comparison"] = built
+    return items
+
+
+PASSED_TITLES = {
+    "insured_owner_mismatch": "Insured is the registered owner",
+    "driver_licence_mismatch": "Driver is the licence holder",
+}
+
+
+def passed_checks(fields, registry=None, flags=(), notes=(), photos=()):
+    """The cross-checks that ran and agreed, as MATCH rows, so the console
+    shows what was compared and found consistent, not only what failed."""
+    raised = {item.get("rule") for item in list(flags or []) + list(notes or [])
+              if isinstance(item, dict)}
+    registry = registry or {}
+    checks = []
+
+    def add(rule, title, keys=None, rows=None, verdict="MATCH"):
+        rows = rows or _rows(fields, registry, keys)
+        checks.append({"rule": rule, "title": title, "severity": "PASS",
+                       "comparison": {"rows": rows, "verdict": verdict}})
+
+    for rule, field_a, field_b, _ in NAME_CHECKS:
+        a_value, b_value = get_field(fields, field_a), get_field(fields, field_b)
+        if a_value and b_value and name_match(a_value, b_value) == "match":
+            add(rule.replace("_mismatch", "_match"), PASSED_TITLES[rule], [field_a, field_b])
+    reg_form = get_field(fields, "registration_number_claim_form")
+    reg_rc = get_field(fields, "registration_number_rc")
+    if reg_form and reg_rc and _norm_reg(reg_form) == _norm_reg(reg_rc):
+        add("registration_match", "Registration number agrees",
+            ["registration_number_claim_form", "registration_number_rc"])
+    if registry.get("plate") and reg_rc and _norm_reg(reg_rc) == _norm_reg(registry["plate"]):
+        add("registry_rc_match", "RC matches the registry",
+            ["registration_number_rc", "registry.plate"])
+    owner_rc = get_field(fields, "owner_name_rc")
+    if owner_rc and registry.get("owner_name") and name_match(
+            owner_rc, registry["owner_name"]) == "match":
+        add("registry_owner_match", "RC owner is the registered owner",
+            ["owner_name_rc", "registry.owner_name"])
+    if reg_rc:
+        plates = sorted({str(photo["number_plate"]) for photo in photos or []
+                         if isinstance(photo, dict) and photo.get("number_plate")
+                         and _norm_reg(photo["number_plate"]) == _norm_reg(reg_rc)})
+        if plates and "vehicle_identity_mismatch" not in raised:
+            add("vehicle_identity_match", "Plate in the photos matches the RC", rows=[
+                {"source": "Plate in photos", "value": ", ".join(plates)},
+                {"source": "RC registration", "value": str(reg_rc)}])
+    dl_expiry = parse_date(get_field(fields, "dl_expiry_date"))[0]
+    accident = parse_date(get_field(fields, "accident_date"))[0]
+    if dl_expiry and accident and dl_expiry >= accident:
+        add("dl_valid_at_loss", "Licence valid on the accident date",
+            ["dl_expiry_date", "accident_date"], verdict="VALID")
+    if accident and "policy_not_active" not in raised:
+        if registry.get("policy_start") and registry.get("policy_end"):
+            start = parse_date(registry["policy_start"])[0]
+            end = parse_date(registry["policy_end"])[0]
+            if start and end and start <= accident <= end:
+                add("policy_active", "Accident inside the policy period", rows=[
+                    {"source": "Accident date", "value": str(get_field(fields, "accident_date"))},
+                    {"source": "Registered policy period (VAHAN)", "value": _period(
+                        registry["policy_start"], registry["policy_end"],
+                        registry.get("insurer"))}], verdict="COVERED")
+        else:
+            start = parse_date(get_field(fields, "policy_start_date"))[0]
+            end = parse_date(get_field(fields, "policy_end_date"))[0]
+            if start and end and start <= accident <= end:
+                add("policy_active", "Accident inside the policy period", rows=[
+                    {"source": "Accident date", "value": str(get_field(fields, "accident_date"))},
+                    {"source": "Policy period (documents)", "value": _period(
+                        get_field(fields, "policy_start_date"),
+                        get_field(fields, "policy_end_date"))}], verdict="COVERED")
+    for check in checks:
+        for row in check["comparison"]["rows"]:
+            row["value"] = "not read" if row["value"] in (None, "") else str(row["value"])
+    return checks
 
 
 def _damage_confidence(item):

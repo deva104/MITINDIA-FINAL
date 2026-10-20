@@ -8,9 +8,9 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css?v=20261020">
+<link rel="stylesheet" href="styles.css?v=20261021">
 </head>
-<body>
+<body class="booting">
 
 <div class="app">
 
@@ -20,10 +20,13 @@
       <span class="brand-tag">Motor claim assessment</span>
     </div>
     <div class="topbar-actions">
-      <label class="assessor-field">
-        <span>Assessor</span>
-        <input id="assessorName" type="text" maxlength="80" placeholder="Your name">
-      </label>
+      <div class="profile hidden" id="profile">
+        <div class="profile-text">
+          <span class="profile-name" id="profileName"></span>
+          <span class="profile-meta" id="profileMeta"></span>
+        </div>
+        <button class="btn btn-outline btn-sm" id="btnLogout" type="button">Sign out</button>
+      </div>
       <span class="health" id="health"><i></i><span>Checking</span></span>
       <button class="btn btn-outline" id="btnReset">Reset demo</button>
       <button class="btn btn-primary" id="btnNew">New claim</button>
@@ -101,11 +104,6 @@
       </div>
 
       <div class="gutter">
-        <div class="card undetermined-card hidden" id="undeterminedCard">
-          <span class="label">Could not determine</span>
-          <div class="stack" id="undetermined"></div>
-        </div>
-
         <div class="card documents-card hidden" id="documentsCard">
           <span class="label">Documents</span>
           <div class="document-checklist" id="documentChecklist"></div>
@@ -137,10 +135,6 @@
           <div class="col-left">
             <div class="card">
               <span class="label">Source evidence</span>
-              <div class="imgswitch hidden" id="imgSwitch">
-                <button class="btn btn-sm btn-outline is-active" data-mode="original">Original</button>
-                <button class="btn btn-sm btn-outline" data-mode="heatmap">ELA heatmap</button>
-              </div>
               <div class="evidence" id="evidence"></div>
             </div>
             <div class="card">
@@ -168,6 +162,11 @@
             </div>
           </div>
         </div>
+        <div class="card undetermined-card hidden" id="undeterminedCard">
+          <span class="label" id="undeterminedLabel">Could not determine</span>
+          <ul class="undetermined-list" id="undetermined"></ul>
+        </div>
+
         <div class="card audit-card hidden" id="auditCard">
           <span class="label">Audit trail</span>
           <div class="audit-trail" id="auditTrail"></div>
@@ -176,6 +175,46 @@
     </section>
 
   </main>
+</div>
+
+<div class="login hidden" id="loginView">
+  <form class="login-card" id="loginForm" autocomplete="on" aria-labelledby="loginTitle">
+    <span class="brand-name">InsureIT</span>
+    <h1 id="loginTitle">Assessor sign-in</h1>
+    <label class="modal-label" for="loginUser">User ID</label>
+    <input class="text-input" id="loginUser" name="username" autocomplete="username"
+           autocapitalize="none" spellcheck="false" required>
+    <label class="modal-label" for="loginPassword">Password</label>
+    <input class="text-input" id="loginPassword" name="password" type="password"
+           autocomplete="current-password" required>
+    <p class="modal-error hidden" id="loginError" role="alert"></p>
+    <button class="btn btn-primary btn-lg" id="loginSubmit" type="submit">Sign in</button>
+  </form>
+</div>
+
+<div class="modal-backdrop hidden" id="requestModal" role="dialog" aria-modal="true" aria-labelledby="requestModalTitle">
+  <div class="modal">
+    <span class="label">Request information</span>
+    <h2 id="requestModalTitle">What does the customer need to send?</h2>
+    <p id="requestModalSummary"></p>
+    <label class="modal-label" for="requestItem">Needed</label>
+    <select class="text-input" id="requestItem">
+      <option value="">Choose…</option>
+      <option value="rc">Registration certificate</option>
+      <option value="driving_licence">Driving licence</option>
+      <option value="claim_form">Claim form</option>
+      <option value="damage_photos">Clearer damage photos</option>
+      <option value="number_plate">Number plate photo</option>
+      <option value="other">Other (describe below)</option>
+    </select>
+    <label class="modal-label" for="requestComment">Comment to the customer</label>
+    <textarea id="requestComment" rows="3" maxlength="500" placeholder="Optional — sent with the request on WhatsApp"></textarea>
+    <p class="modal-error hidden" id="requestError"></p>
+    <div class="modal-actions">
+      <button class="btn btn-outline" id="requestCancel" type="button">Cancel</button>
+      <button class="btn btn-primary" id="requestSubmit" type="button" disabled>Send request</button>
+    </div>
+  </div>
 </div>
 
 <div class="modal-backdrop hidden" id="resetModal" role="dialog" aria-modal="true" aria-labelledby="resetModalTitle">
@@ -209,6 +248,6 @@
   </div>
 </div>
 
-<script src="app.js?v=20261020"></script>
+<script src="app.js?v=20261021"></script>
 </body>
 </html>

@@ -101,22 +101,27 @@ class AdminAuthTests(unittest.TestCase):
         with patch.dict(os.environ, {"ADMIN_TOKEN": ""}):
             self.assertEqual(main.sign_media_urls({"url": media})["url"], media)
 
-    def test_console_asks_in_page_and_polls_without_waiting(self):
+    def test_console_signs_in_by_session_not_token(self):
+        # The console uses the session cookie; the token form and the
+        # free-text assessor name are gone (the signed-in user is the actor).
         source = Path(main.STATIC_DIR, "app.js").read_text(encoding="utf-8")
-        self.assertIn("adminFetch('api/claims', null, false)", source)
-        self.assertIn("adminFetch('api/claims/' + encodeURIComponent(id))", source)
-        self.assertIn("adminFetch('api/analyze'", source)
-        self.assertIn('id="tokenForm"', source)
-        self.assertNotIn("fetch('api/claims')", source)
-        # Embedded browsers refuse prompt(): the token is asked for in the page.
-        self.assertNotIn("prompt(", source.replace("not with prompt()", "").replace("refuse prompt()", ""))
-
-    def test_console_sends_the_token_and_never_hardcodes_it(self):
-        source = Path(main.STATIC_DIR, "app.js").read_text(encoding="utf-8")
-        self.assertIn("'X-Admin-Token': adminToken", source)
-        self.assertIn("adminFetch('api/demo/reset'", source)
-        self.assertIn("await adminFetch(\n        'api/claims/'", source)
+        page = Path(main.STATIC_DIR, "index.html").read_text(encoding="utf-8")
+        self.assertIn("const r = await api('api/claims')", source)
+        self.assertIn("api('api/claims/' + encodeURIComponent(id))", source)
+        self.assertIn("api('api/analyze'", source)
+        self.assertIn("api('api/demo/reset'", source)
+        self.assertIn("'X-Requested-With': 'InsureIT'", source)
+        self.assertIn("credentials: 'same-origin'", source)
+        for gone in ("X-Admin-Token", "tokenForm", "assessorName", "adminFetch"):
+            self.assertNotIn(gone, source)
+            self.assertNotIn(gone, page)
+        self.assertIn('id="loginForm"', page)
         self.assertNotIn(TOKEN, source)
+
+    def test_overrides_send_no_actor_from_the_page(self):
+        source = Path(main.STATIC_DIR, "app.js").read_text(encoding="utf-8")
+        body = source[source.index("'/override',"):source.index("reason\n", source.index("'/override',"))]
+        self.assertNotIn("actor", body)
 
 
 if __name__ == "__main__":

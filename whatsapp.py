@@ -1495,6 +1495,22 @@ EVENT_LABELS = {
     "survey_scheduled": "Survey scheduled", "documents_added": "Documents added",
     "more_info_requested": "More information requested", "approved": "Approved",
     "rejected": "Not approved", "assessment_updated": "Assessment updated",
+    "documents_received": "Requested documents received",
+}
+# What an assessor can ask for: (console label, what the customer is asked to
+# send, the slot that answers it; None = anything recognised).
+REQUEST_ITEMS = {
+    "rc": ("Registration certificate", "the registration certificate", "rc"),
+    "driving_licence": ("Driving licence", "the driving licence", "driving_licence"),
+    "claim_form": ("Claim form", "the claim form", "claim_form"),
+    "damage_photos": ("Clearer damage photos", "clearer photos of the damage", "photo"),
+    "number_plate": ("Number plate photo", "a clear photo of the number plate", "photo"),
+    "other": ("Other", None, None),
+}
+ITEM_NOUNS = {
+    "photo": "a damage photo", "rc": "a registration certificate",
+    "driving_licence": "a driving licence", "claim_form": "a claim form",
+    "policy": "a policy document",
 }
 POSITIVE_TYPES = {"vehicle_photo": "photo", "rc": "rc", "driving_licence": "driving_licence",
                   "claim_form": "claim_form", "policy": "policy"}
@@ -1916,6 +1932,9 @@ def tracking_text(response):
         last = events[-1]
         lines.append(f"Last update: {EVENT_LABELS.get(last['event'], last['event'])} · "
                      f"{_ist(last['created_at'])}")
+    request = response.get("info_request")
+    if request and not request.get("received"):
+        lines.append(f"Requested: {requested_phrase(request['item'], request.get('comment'))}")
     if response.get("next_step"):
         lines.append(f"Next: {response['next_step']}")
     return "\n".join(lines)
@@ -2034,6 +2053,43 @@ async def on_exit_answer(wa_id, command):
         await restate(wa_id)
         return
     await send_text(wa_id, "Reply *YES* to exit or *NO* to continue.")
+
+
+def requested_phrase(item, comment=""):
+    """What the customer is asked to send, in a sentence."""
+    phrase = REQUEST_ITEMS.get(item, (None, None, None))[1]
+    return phrase or (comment or "the document your assessor described")
+
+
+def info_request_text(claim_id, item, comment=""):
+    phrase = requested_phrase(item, comment)
+    lines = [f"*More information needed for {claim_id}*",
+             f"Your assessor asked for {phrase}."]
+    if comment and REQUEST_ITEMS.get(item, (None, None, None))[1]:
+        lines.append(f"Note from your assessor: {comment}")
+    lines.append("Send it here as a photo or PDF.")
+    return "\n".join(lines)
+
+
+def wrong_item_text(slot, request):
+    phrase = requested_phrase(request["item"], request.get("comment"))
+    seen = ITEM_NOUNS.get(slot, "a different document")
+    return (f"That looks like {seen}, but your assessor asked for {phrase}. "
+            f"Please send {phrase}.")
+
+
+async def requested_refused(wa_id, request, kind):
+    """A screenshot or an unrecognised image while a request is open."""
+    phrase = requested_phrase(request["item"], request.get("comment"))
+    if kind == "screenshot":
+        await send_text(wa_id, f"{SCREENSHOT_REPLY} Your assessor asked for {phrase}.")
+        return
+    await send_text(wa_id, f"That does not look like {phrase}. Please send {phrase}.")
+
+
+def request_received_text(claim_id, label):
+    return (f"Thank you — your {label} has been added to *{claim_id}*. Your assessor "
+            "will review it and reply here.")
 
 
 def more_info_claim(wa_id):
